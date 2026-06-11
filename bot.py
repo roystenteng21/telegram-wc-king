@@ -388,8 +388,8 @@ async def cmd_mybets(update: Update, context: ContextTypes.DEFAULT_TYPE):
             outcome_label = format_outcome_label(bet["outcome"], match)
             if bet["outcome"] in ("home", "away"):
                 team = match["home"] if bet["outcome"] == "home" else match["away"]
-                flag_code = format_team(team)
-                label = f"{flag_code} — {outcome_label}"
+                flag = TEAM_DISPLAY[team][1] if team in TEAM_DISPLAY else ""
+                label = f"{flag} {outcome_label}"
             else:
                 home = format_team(match["home"])
                 away = format_team(match["away"])
@@ -568,19 +568,18 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 outcome_label = format_outcome_label(bet["outcome"], match)
                 if bet["outcome"] in ("home", "away"):
                     team = match["home"] if bet["outcome"] == "home" else match["away"]
-                    flag_code = format_team(team)
-                    match_line = f"{flag_code}"
+                    flag = TEAM_DISPLAY[team][1] if team in TEAM_DISPLAY else ""
+                    match_line = f"{flag} {outcome_label}"
                 else:
                     home = format_team(match["home"])
                     away = format_team(match["away"])
-                    match_line = f"{home} vs {away}"
+                    match_line = f"{home} vs {away} — {outcome_label}"
             else:
                 outcome_label = bet["outcome"].capitalize()
-                match_line = f"Match {bet['match_id']}"
+                match_line = f"Match {bet['match_id']} — {outcome_label}"
             await update.message.reply_text(
                 f"✅ Bet cancelled.\n"
-                f"{match_line}\n"
-                f"{outcome_label} — {bet['amount']}c refunded.\n"
+                f"{match_line} — {bet['amount']}c refunded.\n"
                 f"Balance: {new_balance}c"
             )
         except Exception as e:
@@ -596,8 +595,8 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             outcome_label = format_outcome_label(bet["outcome"], match)
             if bet["outcome"] in ("home", "away"):
                 team = match["home"] if bet["outcome"] == "home" else match["away"]
-                flag_code = format_team(team)
-                label = f"{flag_code} — {outcome_label}"
+                flag = TEAM_DISPLAY[team][1] if team in TEAM_DISPLAY else ""
+                label = f"{flag} {outcome_label}"
             else:
                 home = format_team(match["home"])
                 away = format_team(match["away"])
