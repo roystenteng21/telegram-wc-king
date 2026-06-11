@@ -1033,6 +1033,15 @@ def setup_handlers():
 
 async def post_init(app):
     """Runs after bot starts — triggers startup sequence."""
+    await app.bot.set_my_commands([
+        ("matches", "Today's matches + kickoff times"),
+        ("bet", "Place a bet"),
+        ("mybets", "Your open bets"),
+        ("cancel", "Cancel an open bet"),
+        ("balance", "Your current credits"),
+        ("leaderboard", "Full standings"),
+        ("help", "Help"),
+    ])
     await sched.on_startup(notify_fn=dm_admin)
 
 
