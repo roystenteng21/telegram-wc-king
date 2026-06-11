@@ -12,7 +12,7 @@ from config import (
     MORNING_CATCHUP_HOUR, MORNING_CATCHUP_MINUTE,
     PREMATCH_SUMMARY_MINUTES, POLL_START_OFFSET, POLL_INTERVAL,
     GROUP_STAGE_DURATION, KNOCKOUT_DURATION,
-    ADMIN_TELEGRAM_ID, BOT_VERSION
+    ADMIN_TELEGRAM_ID, BOT_VERSION, TEAM_DISPLAY
 )
 import sheet
 import api
@@ -24,6 +24,17 @@ scheduler = AsyncIOScheduler(timezone=UTC)
 # Will be set by bot.py on startup
 _bot = None
 _group_chat_id = None
+
+
+def format_team(name: str) -> str:
+    if name in TEAM_DISPLAY:
+        code, flag = TEAM_DISPLAY[name]
+        return f"{flag} {code}"
+    return name[:3].upper()
+
+
+def format_match_teams(home: str, away: str) -> str:
+    return f"{format_team(home)} vs {format_team(away)}"
 
 def init(bot, group_chat_id):
     global _bot, _group_chat_id
@@ -59,12 +70,10 @@ def is_silent_hours() -> bool:
 
 # ── Format helpers ────────────────────────────────────────────────────────────
 def format_match_line(match: dict) -> str:
-    home = match["home"][:3].upper()
-    away = match["away"][:3].upper()
     kickoff_utc = datetime.strptime(match["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
     kickoff_sgt = kickoff_utc.astimezone(SGT)
     time_str = kickoff_sgt.strftime("%I:%M %p SGT").lstrip("0")
-    return f"{home} vs {away} — {time_str}"
+    return f"{format_match_teams(match['home'], match['away'])} — {time_str}"
 
 
 def format_standings(match_ids: list = None) -> str:
@@ -87,18 +96,20 @@ def format_standings(match_ids: list = None) -> str:
 
 
 def format_result_message(match: dict, settlements: list) -> str:
-    home = match["home"][:3].upper()
-    away = match["away"][:3].upper()
+    home = match["home"]
+    away = match["away"]
+    home_display = format_team(home)
+    away_display = format_team(away)
     home_score = match["home_score"]
     away_score = match["away_score"]
     result = match["result"]
     ou_result = match["ou_result"]
 
-    result_label = "Draw" if result == "draw" else (f"{home} Win" if result == "home" else f"{away} Win")
+    result_label = "Draw" if result == "draw" else (f"{home_display} Win" if result == "home" else f"{away_display} Win")
     ou_label = "Over 2.5" if ou_result == "over" else "Under 2.5"
 
     lines = [
-        f"🏁 FT: {home} vs {away} — {home_score}–{away_score}",
+        f"🏁 FT: {home_display} vs {away_display} — {home_score}–{away_score}",
         f"Result: {result_label} · {ou_label}",
         ""
     ]
@@ -171,13 +182,13 @@ async def job_morning_catchup():
 
         lines = ["☀️ Good morning! Overnight results:\n"]
         for m in sorted(overnight_finished, key=lambda x: x["kickoff_utc"]):
-            home = m["home"][:3].upper()
-            away = m["away"][:3].upper()
+            home_d = format_team(m["home"])
+            away_d = format_team(m["away"])
             result_label = "Draw" if m["result"] == "draw" else (
-                f"{home} Win" if m["result"] == "home" else f"{away} Win"
+                f"{home_d} Win" if m["result"] == "home" else f"{away_d} Win"
             )
             ou_label = "Over 2.5" if m["ou_result"] == "over" else "Under 2.5"
-            lines.append(f"🏁 {home} vs {away} — {m['home_score']}–{m['away_score']} | {result_label} · {ou_label}")
+            lines.append(f"🏁 {home_d} vs {away_d} — {m['home_score']}–{m['away_score']} | {result_label} · {ou_label}")
 
         await send_group("\n".join(lines))
         logger.info("Morning catchup sent")
@@ -197,8 +208,7 @@ async def job_prematch_summary(match_id: str):
         bets = await sheet.get_bets_for_match(match_id)
         open_bets = [b for b in bets if b["status"] == "open"]
 
-        home = match["home"][:3].upper()
-        away = match["away"][:3].upper()
+        match_label = format_match_teams(match["home"], match["away"])
 
         if not open_bets:
             logger.info(f"Pre-match summary: no bets for {match_id}, skipping")
@@ -211,7 +221,7 @@ async def job_prematch_summary(match_id: str):
 
         sorted_bets = sorted(open_bets, key=get_name)
 
-        lines = [f"⚽ {home} vs {away} kicks off in 15 mins!\n"]
+        lines = [f"⚽ {match_label} kicks off in 15 mins!\n"]
         lines.append(f"{'Player':<12} {'Pick':<8} {'Amt':>5}")
         lines.append("─" * 28)
 
@@ -329,13 +339,13 @@ async def job_post_standings(match_ids: list):
         result_lines = ["📅 End of Day Results\n"]
         for m in sorted(today_matches, key=lambda x: x["kickoff_utc"]):
             if m["status"] == "FINISHED":
-                home = m["home"][:3].upper()
-                away = m["away"][:3].upper()
+                home_d = format_team(m["home"])
+                away_d = format_team(m["away"])
                 result_label = "Draw" if m["result"] == "draw" else (
-                    f"{home} Win" if m["result"] == "home" else f"{away} Win"
+                    f"{home_d} Win" if m["result"] == "home" else f"{away_d} Win"
                 )
                 ou_label = "Over 2.5" if m["ou_result"] == "over" else "Under 2.5"
-                result_lines.append(f"🏁 {home} vs {away} — {m['home_score']}–{m['away_score']} | {result_label} · {ou_label}")
+                result_lines.append(f"🏁 {home_d} vs {away_d} — {m['home_score']}–{m['away_score']} | {result_label} · {ou_label}")
 
         # Build standings block
         result_lines.append("\n🏆 Standings")

@@ -11,7 +11,7 @@ from rapidfuzz import process, fuzz
 
 from config import (
     BOT_TOKEN, ADMIN_TELEGRAM_ID, BOT_VERSION,
-    TEAM_ALIASES, FUZZY_THRESHOLD,
+    TEAM_ALIASES, FUZZY_THRESHOLD, TEAM_DISPLAY,
     RESULT_OUTCOMES, OU_OUTCOMES, ALL_OUTCOMES,
     SESSION_EXPIRY, SGT, UTC,
     DAILY_CREDITS, BET_LOCK_BUFFER
@@ -65,6 +65,19 @@ def is_group_message(update: Update) -> bool:
 def get_display_name(user) -> str:
     name = user.first_name or user.username or "Unknown"
     return name[:10]
+
+
+def format_team(name: str) -> str:
+    """Returns 'FLAG CODE' e.g. '🇲🇽 MEX' for display."""
+    if name in TEAM_DISPLAY:
+        code, flag = TEAM_DISPLAY[name]
+        return f"{flag} {code}"
+    return name[:3].upper()
+
+
+def format_match_teams(home: str, away: str) -> str:
+    """Returns 'FLAG CODE vs FLAG CODE' e.g. '🇲🇽 MEX vs 🇿🇦 RSA'."""
+    return f"{format_team(home)} vs {format_team(away)}"
 
 
 def truncate(name: str, length: int = 10) -> str:
@@ -298,12 +311,10 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["📅 Today's matches:\n"]
     for m in sorted(upcoming, key=lambda x: x["kickoff_utc"]):
-        home = m["home"][:3].upper()
-        away = m["away"][:3].upper()
         kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
         kickoff_sgt = kickoff_utc_dt.astimezone(SGT)
         time_str = kickoff_sgt.strftime("%I:%M %p SGT").lstrip("0")
-        lines.append(f"  {home} vs {away} — {time_str}")
+        lines.append(f"  {format_match_teams(m['home'], m['away'])} — {time_str}")
 
     await update.message.reply_text("\n".join(lines))
 
@@ -347,8 +358,8 @@ async def cmd_mybets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, bet in enumerate(open_bets, 1):
         match = await sheet.get_match_by_id(bet["match_id"])
         if match:
-            home = match["home"][:3].upper()
-            away = match["away"][:3].upper()
+            home = format_team(match["home"])
+            away = format_team(match["away"])
             match_label = f"{home} vs {away}"
         else:
             match_label = f"Match {bet['match_id']}"
@@ -444,8 +455,8 @@ async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             notify_fn=dm_admin
         )
 
-        home = match["home"][:3].upper()
-        away = match["away"][:3].upper()
+        home = format_team(match["home"])
+        away = format_team(match["away"])
         outcome_label = outcome_input.capitalize()
         new_balance = sheet.cache["users"][user.id]["credits"]
 
@@ -520,8 +531,8 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await sheet.cancel_bet(bet["bet_id"], user_id, notify_fn=dm_admin)
             new_balance = sheet.cache["users"][user_id]["credits"]
-            home = match["home"][:3].upper() if match else "?"
-            away = match["away"][:3].upper() if match else "?"
+            home = format_team(match["home"]) if match else "?"
+            away = format_team(match["away"]) if match else "?"
             outcome_label = bet["outcome"].capitalize()
             await update.message.reply_text(
                 f"✅ Bet cancelled.\n"
@@ -538,8 +549,8 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, bet in enumerate(open_bets, 1):
         match = await sheet.get_match_by_id(bet["match_id"])
         if match:
-            home = match["home"][:3].upper()
-            away = match["away"][:3].upper()
+            home = format_team(match["home"])
+            away = format_team(match["away"])
             match_label = f"{home} vs {away}"
         else:
             match_label = f"Match {bet['match_id']}"
@@ -615,8 +626,8 @@ async def cmd_admin_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         lines = ["Which match to update?\n"]
         for i, m in enumerate(pending, 1):
-            home = m["home"][:3].upper()
-            away = m["away"][:3].upper()
+            home = format_team(m["home"])
+            away = format_team(m["away"])
             lines.append(f"{i}. {home} vs {away} — {m['status']}")
         lines.append("\nReply /admin_result [number]")
 
@@ -638,8 +649,8 @@ async def cmd_admin_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Invalid number.")
                 return
             selected = matches[index]
-            home = selected["home"][:3].upper()
-            away = selected["away"][:3].upper()
+            home = format_team(selected["home"])
+            away = format_team(selected["away"])
             _admin_pending[ADMIN_TELEGRAM_ID] = {
                 "action": "result_score",
                 "data": {"match": selected},
@@ -666,8 +677,8 @@ async def cmd_admin_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         match = pending["data"]["match"]
-        home = match["home"][:3].upper()
-        away = match["away"][:3].upper()
+        home = format_team(match["home"])
+        away = format_team(match["away"])
 
         total = home_score + away_score
         if home_score > away_score:
@@ -714,8 +725,8 @@ async def cmd_admin_cancel_match(update: Update, context: ContextTypes.DEFAULT_T
 
         lines = ["Which match to cancel/postpone?\n"]
         for i, m in enumerate(active, 1):
-            home = m["home"][:3].upper()
-            away = m["away"][:3].upper()
+            home = format_team(m["home"])
+            away = format_team(m["away"])
             lines.append(f"{i}. {home} vs {away}")
         lines.append("\nReply /admin_cancel_match [number]")
 
@@ -736,8 +747,8 @@ async def cmd_admin_cancel_match(update: Update, context: ContextTypes.DEFAULT_T
                 await update.message.reply_text("Invalid number.")
                 return
             selected = matches[index]
-            home = selected["home"][:3].upper()
-            away = selected["away"][:3].upper()
+            home = format_team(selected["home"])
+            away = format_team(selected["away"])
 
             _admin_pending[ADMIN_TELEGRAM_ID] = {
                 "action": "cancel_confirm",
@@ -860,8 +871,8 @@ async def cmd_confirm_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         match = data["match"]
         try:
             count = await sheet.void_all_bets_for_match(match["match_id"], notify_fn=dm_admin)
-            home = match["home"][:3].upper()
-            away = match["away"][:3].upper()
+            home = format_team(match["home"])
+            away = format_team(match["away"])
             await sched.send_group(f"⚠️ {home} vs {away} has been cancelled. All bets refunded.")
             await update.message.reply_text(f"✅ Done. {count} bets voided, credits refunded.")
         except Exception as e:
