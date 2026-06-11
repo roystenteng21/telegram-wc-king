@@ -80,6 +80,26 @@ def format_match_teams(home: str, away: str) -> str:
     return f"{format_team(home)} vs {format_team(away)}"
 
 
+def format_outcome_label(outcome: str, match: dict) -> str:
+    """Convert internal outcome to display label e.g. 'MEX Win', 'Draw', 'Over 2.5'."""
+    if outcome == "draw":
+        return "Draw"
+    if outcome == "over":
+        return "Over 2.5"
+    if outcome == "under":
+        return "Under 2.5"
+    if outcome == "home":
+        team = match["home"]
+    elif outcome == "away":
+        team = match["away"]
+    else:
+        return outcome.capitalize()
+    if team in TEAM_DISPLAY:
+        code, _ = TEAM_DISPLAY[team]
+        return f"{code} Win"
+    return f"{team[:3].upper()} Win"
+
+
 def truncate(name: str, length: int = 10) -> str:
     return name[:length]
 
@@ -260,9 +280,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         notify_fn=dm_admin
     )
     await update.message.reply_text(
-        f"👋 Hey {truncate(user.first_name or user.username or 'there')}! "
-        f"Private chat activated. I'll send you bet confirmations here during quiet hours. "
-        f"Head to the group to place your bets. Good luck! 🍀"
+        f"👋 Hey {truncate(user.first_name or user.username or 'there')}! Private chat activated.\n\n"
+        f"How to bet:\n"
+        f"/bet [team] [outcome] [amount]\n\n"
+        f"Outcomes:\n"
+        f"• win / loss / draw\n"
+        f"• over / under (2.5 goals)\n\n"
+        f"Example: /bet mexico win 50\n\n"
+        f"Payouts are 1:1. Win 50c, get 100c back.\n\n"
+        f"During quiet hours (12AM–7:30AM SGT), I'll send your bet confirmations here instead of the group.\n\n"
+        f"Good luck! 🍀"
     )
 
 
@@ -273,7 +300,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/matches — Today's matches + kickoff times\n"
         "/bet [team] [win|loss|draw|over|under] [amount] — Place a bet\n"
         "/mybets — Your open bets\n"
-        "/cancelbet — Cancel an open bet\n"
+        "/cancel — Cancel an open bet\n"
         "/balance — Your current credits\n"
         "/leaderboard — Full standings\n"
         "/help — This message\n\n"
@@ -358,15 +385,20 @@ async def cmd_mybets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, bet in enumerate(open_bets, 1):
         match = await sheet.get_match_by_id(bet["match_id"])
         if match:
-            home = format_team(match["home"])
-            away = format_team(match["away"])
-            match_label = f"{home} vs {away}"
+            outcome_label = format_outcome_label(bet["outcome"], match)
+            if bet["outcome"] in ("home", "away"):
+                team = match["home"] if bet["outcome"] == "home" else match["away"]
+                flag_code = format_team(team)
+                label = f"{flag_code} — {outcome_label}"
+            else:
+                home = format_team(match["home"])
+                away = format_team(match["away"])
+                label = f"{home} vs {away} — {outcome_label}"
         else:
-            match_label = f"Match {bet['match_id']}"
-        outcome = bet["outcome"].capitalize()
-        lines.append(f"{i}. {match_label} — {outcome} — {bet['amount']}c")
+            label = f"Match {bet['match_id']} — {bet['outcome'].capitalize()}"
+        lines.append(f"{i}. {label} — {bet['amount']}c")
 
-    lines.append("\nUse /cancelbet to cancel a bet.")
+    lines.append("\nUse /cancel to cancel a bet.")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -462,8 +494,9 @@ async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         confirm_msg = (
             f"✅ Bet placed!\n"
-            f"{home} vs {away} — {outcome_label} — {amount}c\n"
-            f"Remaining balance: {new_balance}c"
+            f"{home} vs {away}\n"
+            f"{outcome_label} — {amount}c\n"
+            f"Balance: {new_balance}c"
         )
 
         # During silent hours — DM only
@@ -495,12 +528,12 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("You have no open bets to cancel.")
         return
 
-    # /cancelbet [number] — cancel specific bet
+    # /cancel [number] — cancel specific bet
     if args:
         # Check for existing session
         session = _sessions.get(user_id)
         if not session or session_expired(session) or session.get("action") != "cancelbet":
-            await update.message.reply_text("Please run /cancelbet first to see your bets.")
+            await update.message.reply_text("Please run /cancel first to see your bets.")
             return
 
         clear_session(user_id)
@@ -508,10 +541,10 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             index = int(args[0]) - 1
             if index < 0 or index >= len(session["data"]["bets"]):
-                await update.message.reply_text("Invalid number. Run /cancelbet to see your bets.")
+                await update.message.reply_text("Invalid number. Run /cancel to see your bets.")
                 return
         except ValueError:
-            await update.message.reply_text("Usage: /cancelbet [number]")
+            await update.message.reply_text("Usage: /cancel [number]")
             return
 
         bet = session["data"]["bets"][index]
@@ -531,12 +564,23 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await sheet.cancel_bet(bet["bet_id"], user_id, notify_fn=dm_admin)
             new_balance = sheet.cache["users"][user_id]["credits"]
-            home = format_team(match["home"]) if match else "?"
-            away = format_team(match["away"]) if match else "?"
-            outcome_label = bet["outcome"].capitalize()
+            if match:
+                outcome_label = format_outcome_label(bet["outcome"], match)
+                if bet["outcome"] in ("home", "away"):
+                    team = match["home"] if bet["outcome"] == "home" else match["away"]
+                    flag_code = format_team(team)
+                    match_line = f"{flag_code}"
+                else:
+                    home = format_team(match["home"])
+                    away = format_team(match["away"])
+                    match_line = f"{home} vs {away}"
+            else:
+                outcome_label = bet["outcome"].capitalize()
+                match_line = f"Match {bet['match_id']}"
             await update.message.reply_text(
                 f"✅ Bet cancelled.\n"
-                f"{home} vs {away} — {outcome_label} — {bet['amount']}c refunded.\n"
+                f"{match_line}\n"
+                f"{outcome_label} — {bet['amount']}c refunded.\n"
                 f"Balance: {new_balance}c"
             )
         except Exception as e:
@@ -544,20 +588,25 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await dm_admin(f"⚠️ Cancel bet failed for user {user_id}: {e}")
         return
 
-    # /cancelbet with no args — list open bets
+    # /cancel with no args — list open bets
     lines = ["📋 Your open bets:\n"]
     for i, bet in enumerate(open_bets, 1):
         match = await sheet.get_match_by_id(bet["match_id"])
         if match:
-            home = format_team(match["home"])
-            away = format_team(match["away"])
-            match_label = f"{home} vs {away}"
+            outcome_label = format_outcome_label(bet["outcome"], match)
+            if bet["outcome"] in ("home", "away"):
+                team = match["home"] if bet["outcome"] == "home" else match["away"]
+                flag_code = format_team(team)
+                label = f"{flag_code} — {outcome_label}"
+            else:
+                home = format_team(match["home"])
+                away = format_team(match["away"])
+                label = f"{home} vs {away} — {outcome_label}"
         else:
-            match_label = f"Match {bet['match_id']}"
-        outcome = bet["outcome"].capitalize()
-        lines.append(f"{i}. {match_label} — {outcome} — {bet['amount']}c")
+            label = f"Match {bet['match_id']} — {bet['outcome'].capitalize()}"
+        lines.append(f"{i}. {label} — {bet['amount']}c")
 
-    lines.append("\nReply /cancelbet [number] to cancel.")
+    lines.append("\nReply /cancel [number] to cancel.")
 
     # Store session
     _sessions[user_id] = {
@@ -969,7 +1018,7 @@ def setup_handlers():
     application.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
     application.add_handler(CommandHandler("mybets", cmd_mybets))
     application.add_handler(CommandHandler("bet", cmd_bet))
-    application.add_handler(CommandHandler("cancelbet", cmd_cancelbet))
+    application.add_handler(CommandHandler("cancel", cmd_cancelbet))
 
     # Admin commands
     application.add_handler(CommandHandler("admin_status", cmd_admin_status))
