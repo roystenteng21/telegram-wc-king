@@ -1,4 +1,4 @@
-python-telegram-bot==20.7
+python-telegram-bot[webhooks]==20.7
 gspread==6.0.2
 google-auth==2.27.0
 rapidfuzz==3.6.1
