@@ -7,7 +7,7 @@ from telegram.ext import (
     ChatMemberHandler, ContextTypes, filters
 )
 from rapidfuzz import process, fuzz
-
+ 
 from config import (
     BOT_TOKEN, ADMIN_TELEGRAM_ID, BOT_VERSION,
     TEAM_ALIASES, FUZZY_THRESHOLD,
@@ -18,74 +18,74 @@ from config import (
 import sheet
 import scheduler as sched
 import api
-
+ 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
+ 
 # ── State ─────────────────────────────────────────────────────────────────────
 # Group chat ID — auto-locked on first message
 _group_chat_id: int | None = None
-
+ 
 # Per-user session state for multi-step flows
 # { user_id: { "action": str, "data": dict, "expires": datetime } }
 _sessions: dict[int, dict] = {}
-
+ 
 # Pending fuzzy confirmations
 # { user_id: { "team": str, "outcome": str, "amount": int, "expires": datetime } }
 _pending_bets: dict[int, dict] = {}
-
+ 
 # Admin confirmation state
 # { admin_id: { "action": str, "data": dict, "expires": datetime } }
 _admin_pending: dict[int, dict] = {}
-
-
+ 
+ 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 async def dm_admin(message: str):
     try:
         await application.bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message)
     except Exception as e:
         logger.error(f"Failed to DM admin: {e}")
-
-
+ 
+ 
 def is_silent_hours() -> bool:
     now_sgt = datetime.now(SGT)
     start = now_sgt.replace(hour=0, minute=0, second=0, microsecond=0)
     end = now_sgt.replace(hour=7, minute=30, second=0, microsecond=0)
     return start <= now_sgt < end
-
-
+ 
+ 
 def is_group_message(update: Update) -> bool:
     return update.effective_chat.type in ("group", "supergroup")
-
-
+ 
+ 
 def get_display_name(user) -> str:
     name = user.first_name or user.username or "Unknown"
     return name[:10]
-
-
+ 
+ 
 def truncate(name: str, length: int = 10) -> str:
     return name[:length]
-
-
+ 
+ 
 def session_expired(session: dict) -> bool:
     return datetime.now(UTC) > session["expires"]
-
-
+ 
+ 
 def clear_session(user_id: int):
     _sessions.pop(user_id, None)
-
-
+ 
+ 
 def clear_pending_bet(user_id: int):
     _pending_bets.pop(user_id, None)
-
-
+ 
+ 
 def clear_admin_pending():
     _admin_pending.pop(ADMIN_TELEGRAM_ID, None)
-
-
+ 
+ 
 async def ensure_registered(update: Update) -> dict | None:
     """Register user if not exists. Returns user dict."""
     user = update.effective_user
@@ -99,8 +99,8 @@ async def ensure_registered(update: Update) -> dict | None:
     else:
         await sheet.refresh_display_name(user.id, user.username or "", user.first_name or "", notify_fn=dm_admin)
     return existing
-
-
+ 
+ 
 def resolve_team(team_input: str) -> tuple[str | None, bool]:
     """
     Resolve team name from input.
@@ -109,14 +109,14 @@ def resolve_team(team_input: str) -> tuple[str | None, bool]:
     is_ambiguous is True if hardcoded alias is ambiguous.
     """
     normalised = team_input.lower().strip()
-
+ 
     # Check hardcoded aliases first
     if normalised in TEAM_ALIASES:
         resolved = TEAM_ALIASES[normalised]
         if resolved is None:
             return None, True  # ambiguous (Guinea / Congo)
         return resolved, False
-
+ 
     # Get all known team names from today's matches
     known_teams = list(set(
         name
@@ -124,18 +124,18 @@ def resolve_team(team_input: str) -> tuple[str | None, bool]:
         for name in [m["home"], m["away"]]
         if name
     ))
-
+ 
     if not known_teams:
         return None, False
-
+ 
     # Fuzzy match
     result = process.extractOne(team_input, known_teams, scorer=fuzz.WRatio)
     if result and result[1] >= FUZZY_THRESHOLD:
         return result[0], False
-
+ 
     return None, False
-
-
+ 
+ 
 def find_match_for_team(team_name: str) -> dict | None:
     """Find the upcoming/active match for a given team name."""
     now_utc = datetime.now(UTC)
@@ -150,8 +150,8 @@ def find_match_for_team(team_name: str) -> dict | None:
             if now_utc < lock_time and m["status"] == "SCHEDULED":
                 return m
     return None
-
-
+ 
+ 
 def map_outcome_to_result(outcome: str, match: dict, team_name: str) -> str | None:
     """
     Map user-facing outcome (win/loss/draw/over/under) to internal outcome.
@@ -164,24 +164,24 @@ def map_outcome_to_result(outcome: str, match: dict, team_name: str) -> str | No
         return "over"
     if outcome == "under":
         return "under"
-
+ 
     home_team = match["home"].lower()
     named_team = team_name.lower()
-
+ 
     if outcome == "win":
         return "home" if named_team == home_team else "away"
     if outcome == "loss":
         return "away" if named_team == home_team else "home"
-
+ 
     return None
-
-
+ 
+ 
 def get_market_for_outcome(outcome: str) -> str:
     if outcome in ("over", "under"):
         return "ou"
     return "result"
-
-
+ 
+ 
 # ── Auto-lock group chat ID ───────────────────────────────────────────────────
 async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global _group_chat_id
@@ -200,19 +200,19 @@ async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 pass
         elif update.effective_chat.id != _group_chat_id:
             return  # ignore other chats
-
-
+ 
+ 
 # ── Welcome new members ───────────────────────────────────────────────────────
 async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != _group_chat_id:
         return
-
+ 
     result = update.chat_member
     new_member = result.new_chat_member.user
-
+ 
     if new_member.is_bot:
         return
-
+ 
     await sheet.register_user(
         new_member.id,
         new_member.username or "",
@@ -220,7 +220,7 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_admin=(new_member.id == ADMIN_TELEGRAM_ID),
         notify_fn=dm_admin
     )
-
+ 
     name = truncate(new_member.first_name or new_member.username or "there")
     welcome = (
         f"👋 Welcome to WC Kings 2026, {name}!\n\n"
@@ -231,14 +231,14 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Good luck! 🍀"
     )
     await context.bot.send_message(chat_id=_group_chat_id, text=welcome)
-
-
+ 
+ 
 # ── /start ────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if is_group_message(update):
         return  # ignore /start in group
-
+ 
     # Register user if not exists (handles case where they DM before joining group)
     await sheet.register_user(
         user.id, user.username or "", user.first_name or "",
@@ -250,8 +250,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Private chat activated. I'll send you bet confirmations here during quiet hours. "
         f"Head to the group to place your bets. Good luck! 🍀"
     )
-
-
+ 
+ 
 # ── /help ─────────────────────────────────────────────────────────────────────
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
@@ -266,19 +266,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Bets lock at kickoff. All times in SGT."
     )
     await update.message.reply_text(text)
-
-
+ 
+ 
 # ── /matches ──────────────────────────────────────────────────────────────────
 async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_registered(update)
     today = datetime.now(UTC).strftime("%Y-%m-%d")
     matches = await sheet.get_matches_for_date(today)
-
+ 
     upcoming = [m for m in matches if m["status"] == "SCHEDULED"]
     if not upcoming:
         await update.message.reply_text("No upcoming matches today.")
         return
-
+ 
     lines = ["📅 Today's matches:\n"]
     for m in sorted(upcoming, key=lambda x: x["kickoff_utc"]):
         home = m["home"][:3].upper()
@@ -287,18 +287,18 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kickoff_sgt = kickoff_utc.astimezone(SGT)
         time_str = kickoff_sgt.strftime("%I:%M %p SGT").lstrip("0")
         lines.append(f"  {home} vs {away} — {time_str}")
-
+ 
     await update.message.reply_text("\n".join(lines))
-
-
+ 
+ 
 # ── /balance ──────────────────────────────────────────────────────────────────
 async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data = await ensure_registered(update)
     credits = user_data["credits"]
     name = truncate(update.effective_user.first_name or "")
     await update.message.reply_text(f"💰 {name}, your balance: {credits} credits")
-
-
+ 
+ 
 # ── /leaderboard ──────────────────────────────────────────────────────────────
 async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_registered(update)
@@ -306,26 +306,26 @@ async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not standings:
         await update.message.reply_text("No players yet.")
         return
-
+ 
     lines = ["🏆 Leaderboard\n"]
     for i, user in enumerate(standings, 1):
         name = truncate(user.get("first_name") or user.get("username") or "Unknown")
         badge = " 🏆" if i == 1 else ""
         lines.append(f"{i}. {name}{badge} — {user['credits']}c")
-
+ 
     await update.message.reply_text("\n".join(lines))
-
-
+ 
+ 
 # ── /mybets ───────────────────────────────────────────────────────────────────
 async def cmd_mybets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_registered(update)
     user_id = update.effective_user.id
     open_bets = await sheet.get_user_open_bets(user_id)
-
+ 
     if not open_bets:
         await update.message.reply_text("You have no open bets.")
         return
-
+ 
     lines = ["📋 Your open bets:\n"]
     for i, bet in enumerate(open_bets, 1):
         match = await sheet.get_match_by_id(bet["match_id"])
@@ -337,36 +337,36 @@ async def cmd_mybets(update: Update, context: ContextTypes.DEFAULT_TYPE):
             match_label = f"Match {bet['match_id']}"
         outcome = bet["outcome"].capitalize()
         lines.append(f"{i}. {match_label} — {outcome} — {bet['amount']}c")
-
+ 
     lines.append("\nUse /cancelbet to cancel a bet.")
     await update.message.reply_text("\n".join(lines))
-
-
+ 
+ 
 # ── /bet ──────────────────────────────────────────────────────────────────────
 async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_group_message(update):
         await update.message.reply_text("Please use this command in the group.")
         return
-
+ 
     user = update.effective_user
     user_data = await ensure_registered(update)
     args = context.args
-
+ 
     if len(args) < 3:
         await update.message.reply_text("Usage: /bet [team] [win|loss|draw|over|under] [amount]")
         return
-
+ 
     team_input = args[0]
     outcome_input = args[1].lower()
     amount_input = args[2].lower().replace("c", "")
-
+ 
     # Validate outcome
     if outcome_input not in ALL_OUTCOMES:
         await update.message.reply_text(
             f"Invalid outcome. Use: win, loss, draw, over, under"
         )
         return
-
+ 
     # Validate amount
     try:
         amount = int(float(amount_input))  # int(float()) handles "50.7" → 50
@@ -375,29 +375,29 @@ async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Please enter a valid amount (e.g. /bet brazil win 50)")
         return
-
+ 
     # Check credits
     if user_data["credits"] < amount:
         await update.message.reply_text(
             f"Insufficient credits. Your balance: {user_data['credits']}c"
         )
         return
-
+ 
     # Resolve team
     team_name, is_ambiguous = resolve_team(team_input)
-
+ 
     if is_ambiguous:
         await update.message.reply_text(
             f"'{team_input}' could be multiple teams. Please be more specific (e.g. 'Guinea-Bissau' or 'Guinea')."
         )
         return
-
+ 
     if not team_name:
         await update.message.reply_text(
             f"Couldn't find '{team_input}'. Check /matches for today's teams."
         )
         return
-
+ 
     # Find match
     match = find_match_for_team(team_name)
     if not match:
@@ -405,15 +405,15 @@ async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"No upcoming match found for {team_name}, or betting is already closed."
         )
         return
-
+ 
     # Map outcome to internal value
     internal_outcome = map_outcome_to_result(outcome_input, match, team_name)
     if not internal_outcome:
         await update.message.reply_text("Invalid outcome for this match.")
         return
-
+ 
     market = get_market_for_outcome(internal_outcome)
-
+ 
     # Check if team name was fuzzy matched (below exact) — no extra confirm needed above threshold
     # Already confirmed by resolve_team returning a value above FUZZY_THRESHOLD
     # Place bet
@@ -426,18 +426,18 @@ async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             amount=amount,
             notify_fn=dm_admin
         )
-
+ 
         home = match["home"][:3].upper()
         away = match["away"][:3].upper()
         outcome_label = outcome_input.capitalize()
         new_balance = sheet.cache["users"][user.id]["credits"]
-
+ 
         confirm_msg = (
             f"✅ Bet placed!\n"
             f"{home} vs {away} — {outcome_label} — {amount}c\n"
             f"Remaining balance: {new_balance}c"
         )
-
+ 
         # During silent hours — DM only
         if is_silent_hours():
             try:
@@ -447,26 +447,26 @@ async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(confirm_msg)
         else:
             await update.message.reply_text(confirm_msg)
-
+ 
     except ValueError as e:
         await update.message.reply_text(str(e))
     except Exception as e:
         logger.error(f"Bet placement failed for {user.id}: {e}")
         await update.message.reply_text("Something went wrong placing your bet. Please try again.")
         await dm_admin(f"⚠️ Bet placement failed for user {user.id}: {e}")
-
-
+ 
+ 
 # ── /cancelbet ────────────────────────────────────────────────────────────────
 async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_registered(update)
     user_id = update.effective_user.id
     args = context.args
-
+ 
     open_bets = await sheet.get_user_open_bets(user_id)
     if not open_bets:
         await update.message.reply_text("You have no open bets to cancel.")
         return
-
+ 
     # /cancelbet [number] — cancel specific bet
     if args:
         # Check for existing session
@@ -474,9 +474,9 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not session or session_expired(session) or session.get("action") != "cancelbet":
             await update.message.reply_text("Please run /cancelbet first to see your bets.")
             return
-
+ 
         clear_session(user_id)
-
+ 
         try:
             index = int(args[0]) - 1
             if index < 0 or index >= len(session["data"]["bets"]):
@@ -485,9 +485,9 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("Usage: /cancelbet [number]")
             return
-
+ 
         bet = session["data"]["bets"][index]
-
+ 
         # Check bet still open and match not locked
         match = await sheet.get_match_by_id(bet["match_id"])
         if match:
@@ -499,7 +499,7 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
             except Exception:
                 pass
-
+ 
         try:
             await sheet.cancel_bet(bet["bet_id"], user_id, notify_fn=dm_admin)
             new_balance = sheet.cache["users"][user_id]["credits"]
@@ -515,7 +515,7 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Failed to cancel bet. Please try again.")
             await dm_admin(f"⚠️ Cancel bet failed for user {user_id}: {e}")
         return
-
+ 
     # /cancelbet with no args — list open bets
     lines = ["📋 Your open bets:\n"]
     for i, bet in enumerate(open_bets, 1):
@@ -528,28 +528,28 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             match_label = f"Match {bet['match_id']}"
         outcome = bet["outcome"].capitalize()
         lines.append(f"{i}. {match_label} — {outcome} — {bet['amount']}c")
-
+ 
     lines.append("\nReply /cancelbet [number] to cancel.")
-
+ 
     # Store session
     _sessions[user_id] = {
         "action": "cancelbet",
         "data": {"bets": open_bets},
         "expires": datetime.now(UTC) + timedelta(seconds=SESSION_EXPIRY)
     }
-
+ 
     await update.message.reply_text("\n".join(lines))
-
-
+ 
+ 
 # ── Admin: /admin_status ──────────────────────────────────────────────────────
 async def cmd_admin_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
-
+ 
     jobs = sched.scheduler.get_jobs()
     last_refresh = sheet.cache.get("last_refresh")
     refresh_str = last_refresh.strftime("%H:%M:%S UTC") if last_refresh else "Never"
-
+ 
     text = (
         f"✅ Degen v{BOT_VERSION} is running\n"
         f"Sheet: Connected\n"
@@ -561,13 +561,13 @@ async def cmd_admin_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Group chat ID: {_group_chat_id}"
     )
     await update.message.reply_text(text)
-
-
+ 
+ 
 # ── Admin: /admin_refresh ─────────────────────────────────────────────────────
 async def cmd_admin_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
-
+ 
     await update.message.reply_text("Refreshing fixtures from API...")
     try:
         matches = api.fetch_today_matches()
@@ -578,15 +578,15 @@ async def cmd_admin_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Done. {len(matches)} matches loaded.")
     except RuntimeError as e:
         await update.message.reply_text(f"⚠️ API error: {e}")
-
-
+ 
+ 
 # ── Admin: /admin_result ──────────────────────────────────────────────────────
 async def cmd_admin_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
-
+ 
     args = context.args
-
+ 
     # Step 1: /admin_result — list pending matches
     if not args:
         today = datetime.now(UTC).strftime("%Y-%m-%d")
@@ -595,14 +595,14 @@ async def cmd_admin_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not pending:
             await update.message.reply_text("No pending matches today.")
             return
-
+ 
         lines = ["Which match to update?\n"]
         for i, m in enumerate(pending, 1):
             home = m["home"][:3].upper()
             away = m["away"][:3].upper()
             lines.append(f"{i}. {home} vs {away} — {m['status']}")
         lines.append("\nReply /admin_result [number]")
-
+ 
         _admin_pending[ADMIN_TELEGRAM_ID] = {
             "action": "result_select",
             "data": {"matches": pending},
@@ -610,7 +610,7 @@ async def cmd_admin_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         await update.message.reply_text("\n".join(lines))
         return
-
+ 
     # Step 2: /admin_result [number] — select match
     pending = _admin_pending.get(ADMIN_TELEGRAM_ID)
     if pending and pending["action"] == "result_select" and not session_expired(pending):
@@ -636,7 +636,7 @@ async def cmd_admin_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         except ValueError:
             pass
-
+ 
     # Step 3: /admin_result [home] [away] — enter score
     if pending and pending["action"] == "result_score" and not session_expired(pending):
         try:
@@ -647,11 +647,11 @@ async def cmd_admin_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except (ValueError, IndexError):
             await update.message.reply_text("Invalid scores. Format: /admin_result [home_score] [away_score]")
             return
-
+ 
         match = pending["data"]["match"]
         home = match["home"][:3].upper()
         away = match["away"][:3].upper()
-
+ 
         total = home_score + away_score
         if home_score > away_score:
             result_label = f"{home} Win"
@@ -660,7 +660,7 @@ async def cmd_admin_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             result_label = "Draw"
         ou_label = "Over 2.5" if total > 2 else "Under 2.5"
-
+ 
         _admin_pending[ADMIN_TELEGRAM_ID] = {
             "action": "result_confirm",
             "data": {
@@ -676,17 +676,17 @@ async def cmd_admin_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Settle all bets? /confirm_admin or /cancel_admin"
         )
         return
-
+ 
     await update.message.reply_text("Run /admin_result to start.")
-
-
+ 
+ 
 # ── Admin: /admin_cancel_match ────────────────────────────────────────────────
 async def cmd_admin_cancel_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
-
+ 
     args = context.args
-
+ 
     if not args:
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         matches = await sheet.get_matches_for_date(today)
@@ -694,14 +694,14 @@ async def cmd_admin_cancel_match(update: Update, context: ContextTypes.DEFAULT_T
         if not active:
             await update.message.reply_text("No scheduled matches to cancel.")
             return
-
+ 
         lines = ["Which match to cancel/postpone?\n"]
         for i, m in enumerate(active, 1):
             home = m["home"][:3].upper()
             away = m["away"][:3].upper()
             lines.append(f"{i}. {home} vs {away}")
         lines.append("\nReply /admin_cancel_match [number]")
-
+ 
         _admin_pending[ADMIN_TELEGRAM_ID] = {
             "action": "cancel_select",
             "data": {"matches": active},
@@ -709,7 +709,7 @@ async def cmd_admin_cancel_match(update: Update, context: ContextTypes.DEFAULT_T
         }
         await update.message.reply_text("\n".join(lines))
         return
-
+ 
     pending = _admin_pending.get(ADMIN_TELEGRAM_ID)
     if pending and pending["action"] == "cancel_select" and not session_expired(pending):
         try:
@@ -721,7 +721,7 @@ async def cmd_admin_cancel_match(update: Update, context: ContextTypes.DEFAULT_T
             selected = matches[index]
             home = selected["home"][:3].upper()
             away = selected["away"][:3].upper()
-
+ 
             _admin_pending[ADMIN_TELEGRAM_ID] = {
                 "action": "cancel_confirm",
                 "data": {"match": selected},
@@ -736,27 +736,27 @@ async def cmd_admin_cancel_match(update: Update, context: ContextTypes.DEFAULT_T
             await update.message.reply_text("Invalid number.")
     else:
         await update.message.reply_text("Run /admin_cancel_match to start.")
-
-
+ 
+ 
 # ── Admin: /admin_credits ─────────────────────────────────────────────────────
 async def cmd_admin_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
-
+ 
     args = context.args
-
+ 
     if not args:
         standings = sheet.get_standings()
         if not standings:
             await update.message.reply_text("No players registered.")
             return
-
+ 
         lines = ["Which player to adjust?\n"]
         for i, user in enumerate(standings, 1):
             name = truncate(user.get("first_name") or user.get("username") or "Unknown")
             lines.append(f"{i}. {name} — {user['credits']}c")
         lines.append("\nReply /admin_credits [number] [amount]\nPositive to add, negative to deduct.")
-
+ 
         _admin_pending[ADMIN_TELEGRAM_ID] = {
             "action": "credits_select",
             "data": {"users": standings},
@@ -764,7 +764,7 @@ async def cmd_admin_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         await update.message.reply_text("\n".join(lines))
         return
-
+ 
     pending = _admin_pending.get(ADMIN_TELEGRAM_ID)
     if pending and pending["action"] == "credits_select" and not session_expired(pending):
         try:
@@ -781,7 +781,7 @@ async def cmd_admin_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
             old = selected_user["credits"]
             new = max(0, old + amount)
             direction = "Add" if amount >= 0 else "Deduct"
-
+ 
             _admin_pending[ADMIN_TELEGRAM_ID] = {
                 "action": "credits_confirm",
                 "data": {
@@ -799,22 +799,22 @@ async def cmd_admin_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Format: /admin_credits [number] [amount]")
     else:
         await update.message.reply_text("Run /admin_credits to start.")
-
-
+ 
+ 
 # ── Admin: /confirm_admin ─────────────────────────────────────────────────────
 async def cmd_confirm_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
-
+ 
     pending = _admin_pending.get(ADMIN_TELEGRAM_ID)
     if not pending or session_expired(pending):
         await update.message.reply_text("No pending admin action. Session may have expired.")
         return
-
+ 
     action = pending["action"]
     data = pending["data"]
     clear_admin_pending()
-
+ 
     # Settle match result
     if action == "result_confirm":
         match = data["match"]
@@ -829,15 +829,15 @@ async def cmd_confirm_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             updated_match = await sheet.get_match_by_id(match["match_id"])
             result_msg = sched.format_result_message(updated_match, settlements)
-
+ 
             if not sched.is_silent_hours():
                 await sched.send_group(result_msg)
-
+ 
             await update.message.reply_text(f"✅ Done. {len(settlements)} bets settled.")
             await sched.check_all_matches_done()
         except Exception as e:
             await update.message.reply_text(f"⚠️ Failed to settle: {e}")
-
+ 
     # Cancel match
     elif action == "cancel_confirm":
         match = data["match"]
@@ -849,7 +849,7 @@ async def cmd_confirm_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ Done. {count} bets voided, credits refunded.")
         except Exception as e:
             await update.message.reply_text(f"⚠️ Failed to cancel match: {e}")
-
+ 
     # Adjust credits
     elif action == "credits_confirm":
         user = data["user"]
@@ -865,24 +865,24 @@ async def cmd_confirm_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ Done. {name}: {new_credits}c")
         except Exception as e:
             await update.message.reply_text(f"⚠️ Failed to adjust credits: {e}")
-
+ 
     else:
         await update.message.reply_text("Unknown pending action.")
-
-
+ 
+ 
 # ── Admin: /cancel_admin ──────────────────────────────────────────────────────
 async def cmd_cancel_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
     clear_admin_pending()
     await update.message.reply_text("Admin action cancelled.")
-
-
+ 
+ 
 # ── Admin: /admin_endtournament ───────────────────────────────────────────────
 async def cmd_admin_endtournament(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
-
+ 
     pending = _admin_pending.get(ADMIN_TELEGRAM_ID)
     if not pending or pending.get("action") != "endtournament_confirm":
         _admin_pending[ADMIN_TELEGRAM_ID] = {
@@ -895,44 +895,45 @@ async def cmd_admin_endtournament(update: Update, context: ContextTypes.DEFAULT_
             "/confirm_admin or /cancel_admin"
         )
         return
-
+ 
     if session_expired(pending):
         await update.message.reply_text("Session expired. Run /admin_endtournament again.")
         return
-
+ 
     clear_admin_pending()
     standings = sheet.get_standings()
     if not standings:
         await update.message.reply_text("No players found.")
         return
-
+ 
     lines = ["🏆 WC Kings 2026 — Final Standings\n"]
     medals = ["🥇", "🥈", "🥉"]
     for i, user in enumerate(standings, 1):
         name = truncate(user.get("first_name") or user.get("username") or "Unknown")
         medal = medals[i - 1] if i <= 3 else f"{i}."
         lines.append(f"{medal} {name} — {user['credits']}c")
-
+ 
     winner = truncate(standings[0].get("first_name") or standings[0].get("username") or "Unknown")
     lines.append(f"\nCongratulations {winner}! 🎉")
     lines.append("Thanks for playing WC Kings 2026! ⚽")
-
+ 
     await sched.send_group("\n".join(lines))
     await update.message.reply_text("✅ Final standings posted.")
-
-
+ 
+ 
 # ── Application setup ─────────────────────────────────────────────────────────
 application = Application.builder().token(BOT_TOKEN).build()
-
-
+ 
+ 
 def setup_handlers():
     # Group message listener (for chat ID lock)
-    application.add_handler(MessageHandler(filters.ALL, handle_any_message), group=0)
-
+    # Group chat ID lock — runs in parallel group so it never blocks commands
+    application.add_handler(MessageHandler(filters.ALL, handle_any_message), group=1)
+ 
     # New member
     application.add_handler(ChatMemberHandler(handle_new_member, ChatMemberHandler.CHAT_MEMBER))
-
-    # Commands
+ 
+    # Commands — group 0 (default, higher priority)
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("matches", cmd_matches))
@@ -941,7 +942,7 @@ def setup_handlers():
     application.add_handler(CommandHandler("mybets", cmd_mybets))
     application.add_handler(CommandHandler("bet", cmd_bet))
     application.add_handler(CommandHandler("cancelbet", cmd_cancelbet))
-
+ 
     # Admin commands
     application.add_handler(CommandHandler("admin_status", cmd_admin_status))
     application.add_handler(CommandHandler("admin_refresh", cmd_admin_refresh))
@@ -951,14 +952,15 @@ def setup_handlers():
     application.add_handler(CommandHandler("admin_endtournament", cmd_admin_endtournament))
     application.add_handler(CommandHandler("confirm_admin", cmd_confirm_admin))
     application.add_handler(CommandHandler("cancel_admin", cmd_cancel_admin))
-
-
+ 
+ 
 async def post_init(app):
     """Runs after bot starts — triggers startup sequence."""
     await sched.on_startup(notify_fn=dm_admin)
-
-
+ 
+ 
 if __name__ == "__main__":
     setup_handlers()
     application.post_init = post_init
     application.run_polling(allowed_updates=Update.ALL_TYPES)
+ 
