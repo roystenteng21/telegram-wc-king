@@ -415,7 +415,7 @@ def register_match_jobs(matches: list):
         match_id = str(m["match_id"])
         status = m.get("status", "")
 
-        if status in ("FINISHED", "CANCELLED", "POSTPONED"):
+        if status in ("FINISHED", "CANCELLED", "POSTPONED", "IN_PLAY", "PAUSED"):
             continue
 
         try:
