@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import pytz
 from datetime import datetime, timedelta
 from telegram import Update, Bot
 from telegram.ext import (
@@ -271,10 +272,26 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /matches ──────────────────────────────────────────────────────────────────
 async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_registered(update)
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
-    matches = await sheet.get_matches_for_date(today)
+    CT = pytz.timezone("America/Chicago")
+    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
 
-    upcoming = [m for m in matches if m["status"] in ("SCHEDULED", "TIMED")]
+    # Fetch today and tomorrow in UTC to capture late US kickoffs crossing UTC midnight
+    today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
+    tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
+    all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
+
+    # Filter by CT date
+    upcoming = []
+    for m in all_matches:
+        if m["status"] not in ("SCHEDULED", "TIMED"):
+            continue
+        try:
+            kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+            if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct:
+                upcoming.append(m)
+        except Exception:
+            continue
+
     if not upcoming:
         await update.message.reply_text("No upcoming matches today.")
         return
@@ -283,8 +300,8 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for m in sorted(upcoming, key=lambda x: x["kickoff_utc"]):
         home = m["home"][:3].upper()
         away = m["away"][:3].upper()
-        kickoff_utc = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-        kickoff_sgt = kickoff_utc.astimezone(SGT)
+        kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+        kickoff_sgt = kickoff_utc_dt.astimezone(SGT)
         time_str = kickoff_sgt.strftime("%I:%M %p SGT").lstrip("0")
         lines.append(f"  {home} vs {away} — {time_str}")
 

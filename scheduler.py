@@ -467,9 +467,11 @@ async def on_startup(notify_fn=None):
         await sheet.refresh_cache(notify_fn=dm_admin)
 
         today = datetime.now(UTC).strftime("%Y-%m-%d")
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
         try:
             matches = api.fetch_today_matches()
-            for m in matches:
+            tomorrow_matches = api.fetch_matches_for_date(tomorrow)
+            for m in matches + tomorrow_matches:
                 await sheet.upsert_match(m, notify_fn=dm_admin)
             await sheet.refresh_cache(notify_fn=dm_admin)
         except RuntimeError as e:
@@ -478,14 +480,16 @@ async def on_startup(notify_fn=None):
         register_static_jobs()
 
         today_matches = await sheet.get_matches_for_date(today)
-        register_match_jobs(today_matches)
+        tomorrow_matches_cached = await sheet.get_matches_for_date(tomorrow)
+        all_today_matches = today_matches + tomorrow_matches_cached
+        register_match_jobs(all_today_matches)
 
         scheduler.start()
 
         await dm_admin(
             f"✅ Degen v{BOT_VERSION} is up and running\n"
             f"Sheet: Connected\n"
-            f"Matches today: {len(today_matches)}\n"
+            f"Matches today: {len(all_today_matches)}\n"
             f"Scheduler: {len(scheduler.get_jobs())} jobs active"
         )
 
