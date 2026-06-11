@@ -1039,4 +1039,9 @@ async def post_init(app):
 if __name__ == "__main__":
     setup_handlers()
     application.post_init = post_init
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=8080,
+        webhook_url="https://telegram-wc-king-production.up.railway.app",
+        allowed_updates=Update.ALL_TYPES
+    )
