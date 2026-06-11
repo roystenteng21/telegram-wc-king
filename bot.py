@@ -287,7 +287,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• win / loss / draw\n"
         f"• over / under (2.5 goals)\n\n"
         f"Example: /bet mexico win 50\n\n"
-        f"Payouts are 1:1. Win 50c, get 100c back.\n\n"
+        f"Payouts are 1:1. Win 50c, get 100c back.\n"
+        f"You start with 100 credits, and get 100 more every day after the last match. Unused credits roll over.\n\n"
         f"During quiet hours (12AM–7:30AM SGT), I'll send your bet confirmations here instead of the group.\n\n"
         f"Good luck! 🍀"
     )
