@@ -59,6 +59,7 @@ SHEET_USERS = "users"
 SHEET_MATCHES = "matches"
 SHEET_BETS = "bets"
 SHEET_LEDGER = "ledger"
+SHEET_EVENTS = "events"
 
 # Team aliases — hardcoded lookup before fuzzy matching
 # Value of None means ambiguous — bot will ask for clarification

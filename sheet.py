@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from google.oauth2.service_account import Credentials
 from config import (
     SPREADSHEET_ID, GOOGLE_CREDENTIALS_JSON,
-    SHEET_USERS, SHEET_MATCHES, SHEET_BETS, SHEET_LEDGER,
+    SHEET_USERS, SHEET_MATCHES, SHEET_BETS, SHEET_LEDGER, SHEET_EVENTS,
     STARTING_CREDITS, UTC
 )
 
@@ -19,10 +19,12 @@ SCOPES = [
 
 # ── In-memory cache ──────────────────────────────────────────────────────────
 cache = {
-    "users": {},        # keyed by user_id (int)
-    "matches": {},      # keyed by match_id (str)
-    "bets": [],         # list of bet dicts
-    "last_refresh": None
+    "users": {},
+    "matches": {},
+    "bets": [],
+    "events": {},       # keyed by event_id
+    "last_refresh": None,
+    "daily_credits_date": None
 }
 
 # Row index cache — tracks sheet row numbers to avoid re-reading
@@ -133,6 +135,30 @@ async def refresh_cache(notify_fn=None):
 
         cache["last_refresh"] = datetime.now(UTC)
         logger.info("Cache refreshed successfully")
+
+        # Load events
+        try:
+            events_ws = spreadsheet.worksheet(SHEET_EVENTS)
+            events_data = events_ws.get_all_records()
+            cache["events"] = {}
+            for row in events_data:
+                if not row.get("event_id"):
+                    continue
+                eid = str(row["event_id"])
+                cache["events"][eid] = {
+                    "event_id": eid,
+                    "question": row["question"],
+                    "options": [o.strip() for o in str(row["options"]).split(",") if o.strip()],
+                    "multiplier": float(row.get("multiplier", 1)),
+                    "is_free": str(row.get("is_free", "false")).lower() == "true",
+                    "reward": int(row.get("reward", 0)),
+                    "status": row.get("status", "draft"),
+                    "winner": row.get("winner", ""),
+                    "created_at": row.get("created_at", "")
+                }
+        except Exception as e:
+            logger.warning(f"Could not load events tab: {e}")
+            cache["events"] = {}
 
     except Exception as e:
         logger.error(f"Cache refresh failed: {e}")
@@ -448,7 +474,14 @@ async def append_ledger(user_id: int, type_: str, amount: int, balance_after: in
 
 # ── Daily credits ────────────────────────────────────────────────────────────
 async def add_daily_credits(daily_amount: int, notify_fn=None):
-    """Add daily credits to all users using cached row numbers."""
+    """Add daily credits to all users. Skips if already credited today (in-memory check)."""
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    if cache.get("daily_credits_date") == today:
+        logger.info(f"Daily credits already added today ({today}), skipping.")
+        if notify_fn:
+            await notify_fn("⚠️ Daily credits already added today — skipped.")
+        return
+
     try:
         ws = get_sheet(SHEET_USERS)
         for user_id, user in cache["users"].items():
@@ -459,6 +492,7 @@ async def add_daily_credits(daily_amount: int, notify_fn=None):
             ws.update_cell(row_num, 4, new_credits)
             cache["users"][user_id]["credits"] = new_credits
             await append_ledger(user_id, "daily_credit", daily_amount, new_credits, "Daily top-up", notify_fn)
+        cache["daily_credits_date"] = today
         logger.info("Daily credits added to all users")
     except Exception as e:
         logger.error(f"Failed to add daily credits: {e}")
@@ -486,3 +520,200 @@ def get_daily_pl(match_ids: list) -> dict:
             pl[uid] = 0
         pl[uid] += bet["amount"] if bet["status"] == "won" else -bet["amount"]
     return pl
+
+# ── Event row cache ───────────────────────────────────────────────────────────
+_event_rows: dict[str, int] = {}  # event_id -> sheet row
+
+
+# ── Auto-create events tab if missing ────────────────────────────────────────
+def ensure_events_tab():
+    """Create events tab with headers if it doesn't exist."""
+    try:
+        client = get_client()
+        spreadsheet = client.open_by_key(SPREADSHEET_ID)
+        try:
+            spreadsheet.worksheet(SHEET_EVENTS)
+        except Exception:
+            ws = spreadsheet.add_worksheet(title=SHEET_EVENTS, rows=100, cols=10)
+            ws.append_row(["event_id", "question", "options", "multiplier", "is_free", "reward", "status", "winner", "created_at"])
+            logger.info("Created events tab")
+    except Exception as e:
+        logger.error(f"Failed to ensure events tab: {e}")
+
+
+# ── Event operations ──────────────────────────────────────────────────────────
+def get_next_event_id() -> str:
+    existing = [int(k.replace("event", "")) for k in cache["events"] if k.startswith("event") and k[5:].isdigit()]
+    next_num = max(existing, default=0) + 1
+    return f"event{next_num}"
+
+
+async def create_event(question: str, options: list, multiplier: float, is_free: bool, reward: int, notify_fn=None) -> str:
+    """Create a new event in draft status. Returns event_id."""
+    event_id = get_next_event_id()
+    created_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+    row = [
+        event_id, question, ",".join(options),
+        multiplier, str(is_free).lower(), reward,
+        "draft", "", created_at
+    ]
+    try:
+        ws = get_sheet(SHEET_EVENTS)
+        await with_retry(ws.append_row, row)
+        new_row_num = len(cache["events"]) + 2
+        _event_rows[event_id] = new_row_num
+        cache["events"][event_id] = {
+            "event_id": event_id, "question": question,
+            "options": options, "multiplier": multiplier,
+            "is_free": is_free, "reward": reward,
+            "status": "draft", "winner": "", "created_at": created_at
+        }
+        return event_id
+    except Exception as e:
+        logger.error(f"Failed to create event: {e}")
+        if notify_fn:
+            await notify_fn(f"⚠️ Failed to create event: {e}")
+        raise
+
+
+async def update_event_status(event_id: str, status: str, winner: str = "", notify_fn=None):
+    """Update event status and optionally set winner."""
+    try:
+        row_num = _event_rows.get(event_id)
+        if not row_num:
+            # Fallback: refresh to find row
+            await refresh_cache()
+        row_num = _event_rows.get(event_id)
+        if not row_num:
+            raise ValueError(f"Event {event_id} row not in cache")
+        ws = get_sheet(SHEET_EVENTS)
+        ws.update_cell(row_num, 7, status)   # col 7 = status
+        if winner:
+            ws.update_cell(row_num, 8, winner)  # col 8 = winner
+        cache["events"][event_id]["status"] = status
+        if winner:
+            cache["events"][event_id]["winner"] = winner
+    except Exception as e:
+        logger.error(f"Failed to update event {event_id}: {e}")
+        if notify_fn:
+            await notify_fn(f"⚠️ Failed to update event {event_id}: {e}")
+        raise
+
+
+async def update_event_fields(event_id: str, question: str, options: list, multiplier: float, is_free: bool, reward: int, notify_fn=None):
+    """Edit event fields (only valid in draft status)."""
+    try:
+        row_num = _event_rows.get(event_id)
+        if not row_num:
+            raise ValueError(f"Event {event_id} row not in cache")
+        ws = get_sheet(SHEET_EVENTS)
+        ws.update(f"B{row_num}:G{row_num}", [[question, ",".join(options), multiplier, str(is_free).lower(), reward, "draft"]])
+        event = cache["events"][event_id]
+        event.update({"question": question, "options": options, "multiplier": multiplier, "is_free": is_free, "reward": reward})
+    except Exception as e:
+        logger.error(f"Failed to edit event {event_id}: {e}")
+        if notify_fn:
+            await notify_fn(f"⚠️ Failed to edit event {event_id}: {e}")
+        raise
+
+
+async def settle_event_bets(event_id: str, winner_option: str, notify_fn=None) -> list:
+    """Settle all bets for an event. winner_option is the option string e.g. 'MEX'."""
+    event = cache["events"].get(event_id)
+    if not event:
+        raise ValueError(f"Event {event_id} not found")
+
+    # Find winner index (1-based)
+    try:
+        winner_idx = str(event["options"].index(winner_option) + 1)
+    except ValueError:
+        raise ValueError(f"Option {winner_option} not in event options")
+
+    event_bets = [b for b in cache["bets"] if b["match_id"] == event_id and b["status"] == "open"]
+    settlements = []
+
+    try:
+        ws = get_sheet(SHEET_BETS)
+        for bet in event_bets:
+            won = bet["outcome"] == winner_idx
+            if event["is_free"]:
+                payout = event["reward"] if won else 0
+            else:
+                payout = int(bet["amount"] * event["multiplier"]) if won else 0
+            status = "won" if won else "lost"
+
+            row_num = _bet_rows.get(bet["bet_id"])
+            if row_num:
+                ws.update_cell(row_num, 7, status)
+                ws.update_cell(row_num, 8, payout)
+            bet["status"] = status
+            bet["payout"] = payout
+
+            if won and payout > 0:
+                async with get_user_lock(bet["user_id"]):
+                    user = cache["users"].get(bet["user_id"])
+                    if user:
+                        new_credits = user["credits"] + payout
+                        await update_user_credits(bet["user_id"], new_credits, notify_fn)
+                        await append_ledger(bet["user_id"], "payout", payout, new_credits, f"Won event {event_id}", notify_fn)
+
+            settlements.append({
+                "user_id": bet["user_id"],
+                "outcome": bet["outcome"],
+                "amount": bet["amount"],
+                "status": status,
+                "payout": payout
+            })
+
+        return settlements
+    except Exception as e:
+        logger.error(f"Failed to settle event {event_id}: {e}")
+        if notify_fn:
+            await notify_fn(f"⚠️ Failed to settle event {event_id}: {e}")
+        raise
+
+
+def get_event_bets(event_id: str) -> list:
+    return [b for b in cache["bets"] if b["match_id"] == event_id and b["status"] in ("open", "won", "lost")]
+
+
+async def place_event_bet(user_id: int, event_id: str, option_idx: str, amount: int, notify_fn=None) -> str:
+    """Place a bet on an event. For free events amount=0."""
+    async with get_user_lock(user_id):
+        user = cache["users"].get(user_id)
+        if not user:
+            raise ValueError("User not found")
+
+        event = cache["events"].get(event_id)
+        if not event:
+            raise ValueError("Event not found")
+
+        if not event["is_free"] and user["credits"] < amount:
+            raise ValueError("Insufficient credits")
+
+        bet_id = f"{user_id}_{event_id}_{option_idx}_{datetime.now(UTC).strftime('%H%M%S%f')}"
+        placed_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+        row = [bet_id, user_id, event_id, "event", option_idx, amount, "open", "", placed_at]
+
+        try:
+            ws = get_sheet(SHEET_BETS)
+            await with_retry(ws.append_row, row)
+            new_row_num = len(cache["bets"]) + 2
+            _bet_rows[bet_id] = new_row_num
+
+            if not event["is_free"] and amount > 0:
+                new_credits = user["credits"] - amount
+                await update_user_credits(user_id, new_credits, notify_fn)
+                await append_ledger(user_id, "bet", -amount, new_credits, f"Event bet {event_id} option {option_idx}", notify_fn)
+
+            cache["bets"].append({
+                "bet_id": bet_id, "user_id": user_id, "match_id": event_id,
+                "market": "event", "outcome": option_idx, "amount": amount,
+                "status": "open", "payout": "", "placed_at": placed_at
+            })
+            return bet_id
+        except Exception as e:
+            logger.error(f"Failed to place event bet: {e}")
+            if notify_fn:
+                await notify_fn(f"⚠️ Failed to place event bet: {e}")
+            raise

@@ -394,6 +394,55 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"💰 {name}, your balance: {credits} credits")
 
 
+# ── /groups ───────────────────────────────────────────────────────────────────
+async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_registered(update)
+    try:
+        CT = pytz.timezone("America/Chicago")
+        today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+        today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
+        tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
+        all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
+
+        today_teams = set()
+        for m in all_matches:
+            try:
+                kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct:
+                    today_teams.add(m["home"])
+                    today_teams.add(m["away"])
+            except Exception:
+                continue
+
+        all_standings = api.fetch_standings()
+        if not all_standings:
+            await update.message.reply_text("No standings available yet.")
+            return
+
+        lines = ["📊 Group Standings\n"]
+        for group in all_standings:
+            group_teams = {row["team"] for row in group["table"]}
+            if today_teams and not today_teams.intersection(group_teams):
+                continue
+            group_name = group["group"].replace("GROUP_", "Group ")
+            lines.append(f"── {group_name} ──")
+            for row in group["table"]:
+                team = row["team"]
+                if team in TEAM_DISPLAY:
+                    code, flag = TEAM_DISPLAY[team]
+                    flag_code = f"{flag} {code}"
+                else:
+                    flag_code = team[:3].upper()
+                w, d, l = row["won"], row["draw"], row["lost"]
+                pts = row["points"]
+                lines.append(f"{row['position']}. {flag_code} — {pts}pts ({w}W {d}D {l}L)")
+            lines.append("")
+
+        await update.message.reply_text("\n".join(lines))
+    except RuntimeError as e:
+        await update.message.reply_text(f"⚠️ Could not fetch standings: {e}")
+
+
 # ── /leaderboard ──────────────────────────────────────────────────────────────
 async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_registered(update)
@@ -452,13 +501,80 @@ async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data = await ensure_registered(update)
     args = context.args
 
-    if len(args) < 3:
+    if len(args) < 2:
         await update.message.reply_text("Usage: /bet [team] [win|loss|draw|over|under] [amount]")
         return
 
+    first_arg = args[0].lower()
+
+    # ── Event bet: /bet event1 [option_number] [amount] ──
+    if first_arg in sheet.cache["events"]:
+        event_id = first_arg
+        event = sheet.cache["events"][event_id]
+
+        if event["status"] != "open":
+            await update.message.reply_text(f"Event {event_id} is not open for betting.")
+            return
+        if event["is_free"]:
+            await update.message.reply_text(f"This is a free prediction event. Use /predict {event_id} [number].")
+            return
+        if len(args) < 3:
+            await update.message.reply_text(f"Usage: /bet {event_id} [option number] [amount]")
+            return
+
+        try:
+            option_idx = int(args[1])
+            if option_idx < 1 or option_idx > len(event["options"]):
+                await update.message.reply_text(f"Invalid option. Choose 1–{len(event['options'])}.")
+                return
+        except ValueError:
+            await update.message.reply_text(f"Usage: /bet {event_id} [option number] [amount]")
+            return
+
+        amount_input = args[2].lower().replace("c", "")
+        try:
+            amount = int(float(amount_input))
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Please enter a valid amount.")
+            return
+
+        if user_data["credits"] < amount:
+            await update.message.reply_text(f"Insufficient credits. Balance: {user_data['credits']}c")
+            return
+
+        option_str = event["options"][option_idx - 1]
+        flag_code = ""
+        for k, (code, flag) in TEAM_DISPLAY.items():
+            if code == option_str:
+                flag_code = f"{flag} {code}"
+                break
+        if not flag_code:
+            flag_code = option_str
+
+        try:
+            await sheet.place_event_bet(user.id, event_id, str(option_idx), amount, notify_fn=dm_admin)
+            new_balance = sheet.cache["users"][user.id]["credits"]
+            confirm_msg = (
+                f"✅ Bet placed!\n"
+                f"{event['question']}\n"
+                f"{flag_code} — {amount}c\n"
+                f"Balance: {new_balance}c"
+            )
+            await send_confirmation(update, confirm_msg)
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Failed to place bet: {e}")
+        return
+
+    # ── Regular match bet ──
     team_input = args[0]
-    outcome_input = args[1].lower()
-    amount_input = args[2].lower().replace("c", "")
+    outcome_input = args[1].lower() if len(args) > 1 else ""
+    amount_input = args[2].lower().replace("c", "") if len(args) > 2 else ""
+
+    if len(args) < 3:
+        await update.message.reply_text("Usage: /bet [team] [win|loss|draw|over|under] [amount]")
+        return
 
     # Validate outcome
     if outcome_input not in ALL_OUTCOMES:
@@ -803,6 +919,24 @@ async def cmd_admin_eod_push(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
 
+    args = context.args
+
+    # Step 2: confirmed
+    if args and args[0] == "confirm":
+        session = _admin_pending.get(ADMIN_TELEGRAM_ID)
+        if not session or session_expired(session) or session.get("action") != "eod_push":
+            await update.message.reply_text("Session expired. Run /admin_eod_push again.")
+            return
+        match_ids = session["data"]["match_ids"]
+        del _admin_pending[ADMIN_TELEGRAM_ID]
+        try:
+            await sched.job_post_standings(match_ids)
+            await update.message.reply_text("✅ End of day message pushed to group.")
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Failed: {e}")
+        return
+
+    # Step 1: preview and ask for confirmation
     try:
         CT = pytz.timezone("America/Chicago")
         today_ct = datetime.now(CT).strftime("%Y-%m-%d")
@@ -819,10 +953,324 @@ async def cmd_admin_eod_push(update: Update, context: ContextTypes.DEFAULT_TYPE)
             except Exception:
                 continue
 
-        await sched.job_post_standings(match_ids)
-        await update.message.reply_text("✅ End of day message pushed to group.")
+        _admin_pending[ADMIN_TELEGRAM_ID] = {
+            "action": "eod_push",
+            "data": {"match_ids": match_ids},
+            "expires": datetime.now(UTC) + timedelta(seconds=120)
+        }
+        await update.message.reply_text(
+            f"About to push EOD message for {len(match_ids)} match(es) + add daily credits.\n\n"
+            f"Run /admin_eod_push confirm to proceed."
+        )
     except Exception as e:
         await update.message.reply_text(f"⚠️ Failed: {e}")
+
+
+# ── /predict ──────────────────────────────────────────────────────────────────
+async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_registered(update)
+    user_id = update.effective_user.id
+    args = context.args
+
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /predict [event_id] [option number]")
+        return
+
+    event_id = args[0].lower()
+    option_input = args[1]
+
+    event = sheet.cache["events"].get(event_id)
+    if not event:
+        await update.message.reply_text(f"Event {event_id} not found.")
+        return
+    if event["status"] != "open":
+        await update.message.reply_text(f"Event {event_id} is not open for predictions.")
+        return
+    if not event["is_free"]:
+        await update.message.reply_text(f"This is a paid event. Use /bet {event_id} [option] [amount].")
+        return
+
+    try:
+        option_idx = int(option_input)
+        if option_idx < 1 or option_idx > len(event["options"]):
+            await update.message.reply_text(f"Invalid option. Choose 1–{len(event['options'])}.")
+            return
+    except ValueError:
+        await update.message.reply_text("Usage: /predict [event_id] [option number]")
+        return
+
+    # Check for existing prediction
+    existing = [b for b in sheet.cache["bets"] if b["user_id"] == user_id and b["match_id"] == event_id and b["status"] == "open"]
+    if existing:
+        await update.message.reply_text(f"You already have a prediction on this event.")
+        return
+
+    option_str = event["options"][option_idx - 1]
+    flag_code = format_team(option_str) if option_str in TEAM_DISPLAY else option_str
+
+    try:
+        await sheet.place_event_bet(user_id, event_id, str(option_idx), 0, notify_fn=dm_admin)
+        await update.message.reply_text(
+            f"✅ Prediction locked!\n"
+            f"{event['question']}\n"
+            f"{flag_code}\n"
+            f"No credits deducted. +{event['reward']}c if correct!"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Failed to place prediction: {e}")
+
+
+# ── Admin: /admin_event ───────────────────────────────────────────────────────
+async def cmd_admin_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Admin event commands:\n"
+            "/admin_event create\n"
+            "/admin_event open [event_id]\n"
+            "/admin_event edit [event_id]\n"
+            "/admin_event resolve [event_id] [option]\n"
+            "/admin_event cancel [event_id]"
+        )
+        return
+
+    subcommand = args[0].lower()
+
+    # ── create ──
+    if subcommand == "create":
+        # Parse: /admin_event create "question" team1 team2 ... [2x] [free 100]
+        raw = " ".join(args[1:])
+
+        # Extract question from quotes
+        import re
+        q_match = re.match(r'"([^"]+)"(.*)', raw)
+        if not q_match:
+            await update.message.reply_text('Usage: /admin_event create "Question?" team1 team2 [2x] [free 100]')
+            return
+
+        question = q_match.group(1)
+        rest = q_match.group(2).strip().split()
+
+        # Parse teams, multiplier, free/reward
+        teams = []
+        multiplier = 1.0
+        is_free = False
+        reward = 0
+        i = 0
+        while i < len(rest):
+            token = rest[i].lower()
+            if re.match(r'^\d+(\.\d+)?x$', token):
+                multiplier = float(token[:-1])
+            elif token == "free" and i + 1 < len(rest) and rest[i+1].isdigit():
+                is_free = True
+                reward = int(rest[i+1])
+                i += 1
+            else:
+                # Resolve team alias
+                resolved = TEAM_ALIASES.get(token)
+                if resolved and resolved in TEAM_DISPLAY:
+                    teams.append(TEAM_DISPLAY[resolved][0])
+                elif token.upper() in [v[0] for v in TEAM_DISPLAY.values()]:
+                    teams.append(token.upper())
+                else:
+                    teams.append(token.upper())
+            i += 1
+
+        if len(teams) < 2:
+            await update.message.reply_text("Need at least 2 options.")
+            return
+
+        try:
+            event_id = await sheet.create_event(question, teams, multiplier, is_free, reward, notify_fn=dm_admin)
+            event = sheet.cache["events"][event_id]
+
+            lines = [f"✅ Event created! ID: {event_id}\n", f"{question}\n"]
+            for i, opt in enumerate(teams, 1):
+                flag = TEAM_DISPLAY.get(
+                    next((k for k, v in TEAM_DISPLAY.items() if v[0] == opt), None),
+                    ("", "")
+                )[1] if opt in [v[0] for v in TEAM_DISPLAY.values()] else ""
+                lines.append(f"{i}. {flag} {opt}")
+
+            if is_free:
+                lines.append(f"\nFree prediction — +{reward}c for correct answer")
+            else:
+                lines.append(f"\nPayout: {multiplier}x")
+
+            lines.append(f"\nRun /admin_event open {event_id} when ready.")
+            await update.message.reply_text("\n".join(lines))
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Failed to create event: {e}")
+
+    # ── open ──
+    elif subcommand == "open" and len(args) >= 2:
+        event_id = args[1].lower()
+        event = sheet.cache["events"].get(event_id)
+        if not event:
+            await update.message.reply_text(f"Event {event_id} not found.")
+            return
+        if event["status"] not in ("draft",):
+            await update.message.reply_text(f"Event is already {event['status']}.")
+            return
+
+        await sheet.update_event_status(event_id, "open", notify_fn=dm_admin)
+
+        lines = [f"🎯 Special Event!\n{event['question']}\n"]
+        for i, opt in enumerate(event["options"], 1):
+            flag_code = ""
+            for k, (code, flag) in TEAM_DISPLAY.items():
+                if code == opt:
+                    flag_code = f"{flag} {code}"
+                    break
+            if not flag_code:
+                flag_code = opt
+            lines.append(f"{i}. {flag_code}")
+
+        if event["is_free"]:
+            lines.append(f"\nPredict: /predict {event_id} [number]")
+            lines.append(f"Correct answer wins +{event['reward']}c!")
+        else:
+            lines.append(f"\nBet: /bet {event_id} [number] [amount]")
+            lines.append(f"Payout: {event['multiplier']}x")
+
+        await sched.send_group("\n".join(lines))
+        await update.message.reply_text(f"✅ Event {event_id} is now open.")
+
+    # ── edit ──
+    elif subcommand == "edit" and len(args) >= 2:
+        event_id = args[1].lower()
+        event = sheet.cache["events"].get(event_id)
+        if not event:
+            await update.message.reply_text(f"Event {event_id} not found.")
+            return
+        if event["status"] != "draft":
+            await update.message.reply_text("Can only edit events in draft status.")
+            return
+
+        # Store edit session
+        _admin_pending[ADMIN_TELEGRAM_ID] = {
+            "action": "event_edit",
+            "data": {"event_id": event_id},
+            "expires": datetime.now(UTC) + timedelta(seconds=300)
+        }
+        await update.message.reply_text(
+            f"Editing {event_id}. Send new command:\n"
+            f"/admin_event create \"New question?\" team1 team2 [multiplier] [free reward]\n\n"
+            f"Current:\n"
+            f"Q: {event['question']}\n"
+            f"Options: {', '.join(event['options'])}\n"
+            f"Multiplier: {event['multiplier']}x | Free: {event['is_free']} | Reward: {event['reward']}"
+        )
+
+    # ── resolve ──
+    elif subcommand == "resolve" and len(args) >= 3:
+        event_id = args[1].lower()
+        winner_input = args[2].upper()
+        confirmed = len(args) >= 4 and args[3].lower() == "confirm"
+
+        event = sheet.cache["events"].get(event_id)
+        if not event:
+            await update.message.reply_text(f"Event {event_id} not found.")
+            return
+        if event["status"] != "open":
+            await update.message.reply_text(f"Event {event_id} is not open.")
+            return
+
+        # Resolve winner option
+        winner_opt = None
+        for opt in event["options"]:
+            if opt.upper() == winner_input or TEAM_ALIASES.get(winner_input.lower()) == next((k for k, v in TEAM_DISPLAY.items() if v[0] == opt), None):
+                winner_opt = opt
+                break
+        if not winner_opt:
+            # Try fuzzy
+            from rapidfuzz import process
+            match = process.extractOne(winner_input, event["options"])
+            if match and match[1] >= 70:
+                winner_opt = match[0]
+        if not winner_opt:
+            await update.message.reply_text(f"Could not match '{winner_input}' to any option: {', '.join(event['options'])}")
+            return
+
+        winner_idx = str(event["options"].index(winner_opt) + 1)
+        event_bets = sheet.get_event_bets(event_id)
+        winners = [b for b in event_bets if b["outcome"] == winner_idx and b["status"] == "open"]
+        losers = [b for b in event_bets if b["outcome"] != winner_idx and b["status"] == "open"]
+
+        if not confirmed:
+            lines = [
+                f"Confirm resolution:\n{event['question']}",
+                f"Winner: {winner_opt}\n",
+                "Winners:"
+            ]
+            for b in winners:
+                user = sheet.cache["users"].get(b["user_id"], {})
+                name = (user.get("first_name") or user.get("username") or "?")[:10]
+                payout = event["reward"] if event["is_free"] else int(b["amount"] * event["multiplier"])
+                lines.append(f"• {name} → +{payout}c")
+            lines.append("\nLosers:")
+            for b in losers:
+                user = sheet.cache["users"].get(b["user_id"], {})
+                name = (user.get("first_name") or user.get("username") or "?")[:10]
+                lines.append(f"• {name} ❌")
+            lines.append(f"\n/admin_event resolve {event_id} {winner_input} confirm")
+            await update.message.reply_text("\n".join(lines))
+            return
+
+        # Confirmed — settle
+        try:
+            settlements = await sheet.settle_event_bets(event_id, winner_opt, notify_fn=dm_admin)
+            await sheet.update_event_status(event_id, "resolved", winner=winner_opt, notify_fn=dm_admin)
+
+            lines = [f"🎯 {event['question']}\n{winner_opt} wins!\n"]
+            def get_sort_name(s):
+                user = sheet.cache["users"].get(s["user_id"], {})
+                return (user.get("first_name") or user.get("username") or "").lower()
+            for s in sorted(settlements, key=get_sort_name):
+                user = sheet.cache["users"].get(s["user_id"], {})
+                name = (user.get("first_name") or user.get("username") or "?")[:10]
+                icon = "✅" if s["status"] == "won" else "❌"
+                option_str = event["options"][int(s["outcome"]) - 1] if s["outcome"].isdigit() else s["outcome"]
+                lines.append(f"{name} — {option_str} {icon}")
+
+            await sched.send_group("\n".join(lines))
+            await update.message.reply_text(f"✅ Event {event_id} resolved. {len(winners)} winners paid out.")
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Failed to resolve event: {e}")
+
+    # ── cancel ──
+    elif subcommand == "cancel" and len(args) >= 2:
+        event_id = args[1].lower()
+        event = sheet.cache["events"].get(event_id)
+        if not event:
+            await update.message.reply_text(f"Event {event_id} not found.")
+            return
+        if event["status"] == "resolved":
+            await update.message.reply_text("Cannot cancel a resolved event.")
+            return
+
+        # Refund all open bets
+        open_bets = [b for b in sheet.cache["bets"] if b["match_id"] == event_id and b["status"] == "open"]
+        for b in open_bets:
+            if b["amount"] > 0:
+                await sheet.cancel_bet(b["bet_id"], b["user_id"], notify_fn=dm_admin)
+
+        await sheet.update_event_status(event_id, "cancelled", notify_fn=dm_admin)
+        await sched.send_group(f"🎯 Event cancelled: {event['question']}\nAll bets refunded.")
+        await update.message.reply_text(f"✅ Event {event_id} cancelled. {len(open_bets)} bets refunded.")
+
+    else:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/admin_event create \"Question?\" team1 team2 [2x] [free 100]\n"
+            "/admin_event open [event_id]\n"
+            "/admin_event edit [event_id]\n"
+            "/admin_event resolve [event_id] [winner]\n"
+            "/admin_event cancel [event_id]"
+        )
 
 
 # ── Admin: /admin_simulate_eod ────────────────────────────────────────────────
@@ -830,12 +1278,10 @@ async def cmd_admin_simulate_eod(update: Update, context: ContextTypes.DEFAULT_T
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
 
-    # Build a sample end of day message and send to admin DM
     standings = sheet.get_standings()
-
-    lines = ["📅 End of Day Results (SIMULATION)\n"]
-    lines.append("🏁 🇲🇽 MEX 2–0 🇿🇦 RSA | MEX Win · Under 2.5")
-    lines.append("🏁 🇰🇷 KOR 1–1 🇨🇿 CZE | Draw · Under 2.5")
+    lines = ["📅 End of Day\n"]
+    lines.append("🇲🇽 MEX 2–0 🇿🇦 RSA · Under 2.5")
+    lines.append("🇰🇷 KOR 2–1 🇨🇿 CZE · Over 2.5")
     lines.append("\n🏆 Standings")
 
     for i, user in enumerate(standings, 1):
@@ -844,15 +1290,287 @@ async def cmd_admin_simulate_eod(update: Update, context: ContextTypes.DEFAULT_T
         badge = " 🏆" if i == 1 else ""
         lines.append(f"{i}. {name}{badge} — {credits}c (+50c today)")
 
-    lines.append("\n+100c daily credits added. Good luck tomorrow! 🍀")
-    lines.append("\n📊 Group Standings\n")
-    lines.append("── Group A ──")
-    lines.append("1. 🇲🇽 MEX — 4pts (1W 1D 0L)")
-    lines.append("2. 🇰🇷 KOR — 2pts (0W 2D 0L)")
-    lines.append("3. 🇨🇿 CZE — 2pts (0W 2D 0L)")
-    lines.append("4. 🇿🇦 RSA — 0pts (0W 0D 1L)")
+    lines.append("\n🎉 Peng had the biggest win today with +200c!")
+    lines.append("📈 Calvin overtook Roysten 🤡 today.")
+    lines.append("⚠️ Shunnnnnn is 80c behind Peng. Watch out!")
+    lines.append("\nDaily credits added, good luck tomorrow! 🍀")
+    lines.append("Use /groups for today's group tables.")
 
     await update.message.reply_text("\n".join(lines))
+
+
+# ── Admin: /admin_sim_night ────────────────────────────────────────────────────
+async def cmd_admin_sim_night(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+
+    CT = pytz.timezone("America/Chicago")
+    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+    today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
+    tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
+    all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
+
+    upcoming = []
+    for m in all_matches:
+        try:
+            kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+            if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct and m["status"] in ("SCHEDULED", "TIMED"):
+                upcoming.append(m)
+        except Exception:
+            continue
+
+    if not upcoming:
+        await update.message.reply_text("No upcoming matches to simulate.")
+        return
+
+    lines = ["🌙 Good evening gents! Matches later:\n"]
+    for m in sorted(upcoming, key=lambda x: x["kickoff_utc"]):
+        lines.append(f"  {sched.format_match_line(m)}")
+    lines.append("\nGet your bets in before kickoff. Good night! 🌛")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ── Admin: /admin_sim_morning ──────────────────────────────────────────────────
+async def cmd_admin_sim_morning(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+
+    CT = pytz.timezone("America/Chicago")
+    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+    today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
+    tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
+    all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
+
+    today_matches = []
+    for m in all_matches:
+        try:
+            kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+            if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct:
+                today_matches.append((kickoff_utc_dt, m))
+        except Exception:
+            continue
+
+    if not today_matches:
+        await update.message.reply_text("No matches today to simulate.")
+        return
+
+    lines = ["☀️ Good morning! Catch up from last night:\n"]
+    for kickoff_utc_dt, m in sorted(today_matches, key=lambda x: x[0]):
+        home_d = format_team(m["home"])
+        away_d = format_team(m["away"])
+        if m["status"] == "FINISHED":
+            ou_label = "Over 2.5" if m["ou_result"] == "over" else "Under 2.5"
+            lines.append(f"{home_d} {m['home_score']}–{m['away_score']} {away_d} · {ou_label}")
+        elif m["status"] in ("IN_PLAY", "PAUSED", "HALFTIME"):
+            lines.append(f"{home_d} vs {away_d} — IN PLAY")
+        else:
+            time_str = kickoff_utc_dt.astimezone(SGT).strftime("%I:%M %p SGT").lstrip("0")
+            lines.append(f"{home_d} vs {away_d} — {time_str}")
+    lines.append("\n[Fun line based on overnight results would appear here]")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ── Admin: /admin_sim_prematch ─────────────────────────────────────────────────
+async def cmd_admin_sim_prematch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+
+    args = context.args
+    if args:
+        session = _admin_pending.get(ADMIN_TELEGRAM_ID)
+        if not session or session_expired(session) or session.get("action") != "sim_prematch":
+            await update.message.reply_text("Run /admin_sim_prematch first.")
+            return
+        try:
+            index = int(args[0]) - 1
+            matches = session["data"]["matches"]
+            if index < 0 or index >= len(matches):
+                await update.message.reply_text("Invalid number.")
+                return
+        except ValueError:
+            return
+        del _admin_pending[ADMIN_TELEGRAM_ID]
+        match = matches[index]
+        match_label = format_match_teams(match["home"], match["away"])
+        bets = await sheet.get_bets_for_match(match["match_id"])
+        open_bets = sorted([b for b in bets if b["status"] == "open"],
+                           key=lambda b: (sheet.cache["users"].get(b["user_id"], {}).get("first_name") or "").lower())
+
+        lines = [f"⚽ {match_label} kicks off in 15 mins!\n"]
+        if open_bets:
+            lines.append("Current bets:")
+            for b in open_bets:
+                user = sheet.cache["users"].get(b["user_id"], {})
+                name = (user.get("first_name") or user.get("username") or "?")[:10]
+                lines.append(f"{name} — {sched._outcome_label(b['outcome'], match)} — {b['amount']}c")
+        else:
+            lines.append("No bets placed yet.")
+        lines.append("\nGet your bets in before kickoff! ⚽")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    CT = pytz.timezone("America/Chicago")
+    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+    today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
+    tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
+    all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
+
+    upcoming = []
+    for m in all_matches:
+        try:
+            kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+            if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct and m["status"] in ("SCHEDULED", "TIMED"):
+                upcoming.append(m)
+        except Exception:
+            continue
+
+    if not upcoming:
+        await update.message.reply_text("No upcoming matches today.")
+        return
+
+    lines = ["Which match to simulate pre-match for?\n"]
+    for i, m in enumerate(upcoming, 1):
+        lines.append(f"{i}. {format_match_teams(m['home'], m['away'])}")
+    lines.append("\nReply /admin_sim_prematch [number]")
+    _admin_pending[ADMIN_TELEGRAM_ID] = {
+        "action": "sim_prematch",
+        "data": {"matches": upcoming},
+        "expires": datetime.now(UTC) + timedelta(seconds=120)
+    }
+    await update.message.reply_text("\n".join(lines))
+
+
+# ── Admin: /admin_sim_kickoff ──────────────────────────────────────────────────
+async def cmd_admin_sim_kickoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+
+    args = context.args
+    if args:
+        session = _admin_pending.get(ADMIN_TELEGRAM_ID)
+        if not session or session_expired(session) or session.get("action") != "sim_kickoff":
+            await update.message.reply_text("Run /admin_sim_kickoff first.")
+            return
+        try:
+            index = int(args[0]) - 1
+            matches = session["data"]["matches"]
+            if index < 0 or index >= len(matches):
+                await update.message.reply_text("Invalid number.")
+                return
+        except ValueError:
+            return
+        del _admin_pending[ADMIN_TELEGRAM_ID]
+        match = matches[index]
+        await sched.job_kickoff_message(match["match_id"])
+        await update.message.reply_text("✅ Kickoff message simulation sent to group.")
+        return
+
+    CT = pytz.timezone("America/Chicago")
+    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+    today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
+    tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
+    all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
+
+    upcoming = []
+    for m in all_matches:
+        try:
+            kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+            if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct:
+                upcoming.append(m)
+        except Exception:
+            continue
+
+    if not upcoming:
+        await update.message.reply_text("No matches today.")
+        return
+
+    lines = ["Which match to simulate kickoff message for?\n"]
+    for i, m in enumerate(upcoming, 1):
+        lines.append(f"{i}. {format_match_teams(m['home'], m['away'])}")
+    lines.append("\nReply /admin_sim_kickoff [number]")
+    _admin_pending[ADMIN_TELEGRAM_ID] = {
+        "action": "sim_kickoff",
+        "data": {"matches": upcoming},
+        "expires": datetime.now(UTC) + timedelta(seconds=120)
+    }
+    await update.message.reply_text("\n".join(lines))
+
+
+# ── Admin: /admin_sim_result ───────────────────────────────────────────────────
+async def cmd_admin_sim_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+
+    args = context.args
+    if args:
+        session = _admin_pending.get(ADMIN_TELEGRAM_ID)
+        if not session or session_expired(session) or session.get("action") != "sim_result":
+            await update.message.reply_text("Run /admin_sim_result first.")
+            return
+        try:
+            index = int(args[0]) - 1
+            matches = session["data"]["matches"]
+            if index < 0 or index >= len(matches):
+                await update.message.reply_text("Invalid number.")
+                return
+        except ValueError:
+            return
+        del _admin_pending[ADMIN_TELEGRAM_ID]
+        match = matches[index]
+        bets = await sheet.get_bets_for_match(match["match_id"])
+        settlements = [b for b in bets if b["status"] in ("won", "lost")]
+        result_msg = sched.format_result_message(match, settlements)
+        await update.message.reply_text(f"Simulation:\n\n{result_msg}")
+        return
+
+    CT = pytz.timezone("America/Chicago")
+    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+    today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
+    tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
+    all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
+
+    finished = []
+    for m in all_matches:
+        try:
+            kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+            if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct and m["status"] == "FINISHED":
+                finished.append(m)
+        except Exception:
+            continue
+
+    if not finished:
+        await update.message.reply_text("No finished matches today to simulate.")
+        return
+
+    lines = ["Which match to simulate result for?\n"]
+    for i, m in enumerate(finished, 1):
+        home_d = format_team(m["home"])
+        away_d = format_team(m["away"])
+        lines.append(f"{i}. {home_d} {m['home_score']}–{m['away_score']} {away_d}")
+    lines.append("\nReply /admin_sim_result [number]")
+    _admin_pending[ADMIN_TELEGRAM_ID] = {
+        "action": "sim_result",
+        "data": {"matches": finished},
+        "expires": datetime.now(UTC) + timedelta(seconds=120)
+    }
+    await update.message.reply_text("\n".join(lines))
+
+
+# ── Admin: /admin_announce ────────────────────────────────────────────────────
+async def cmd_admin_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /admin_announce [message]")
+        return
+
+    message = " ".join(context.args)
+    # Replace literal \n with actual newlines
+    message = message.replace("\\n", "\n")
+
+    await sched.send_group(message)
+    await update.message.reply_text("✅ Announcement sent to group.")
 
 
 # ── Admin: /admin_status ──────────────────────────────────────────────────────
@@ -1287,12 +2005,14 @@ def setup_handlers():
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("matches", cmd_matches))
     application.add_handler(CommandHandler("balance", cmd_balance))
+    application.add_handler(CommandHandler("groups", cmd_groups))
     application.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
     application.add_handler(CommandHandler("mybets", cmd_mybets))
     application.add_handler(CommandHandler("bet", cmd_bet))
     application.add_handler(CommandHandler("cancel", cmd_cancelbet))
 
     # Admin commands
+    application.add_handler(CommandHandler("admin_announce", cmd_admin_announce))
     application.add_handler(CommandHandler("admin_status", cmd_admin_status))
     application.add_handler(CommandHandler("admin_refresh", cmd_admin_refresh))
     application.add_handler(CommandHandler("admin_result", cmd_admin_result))
@@ -1302,7 +2022,14 @@ def setup_handlers():
     application.add_handler(CommandHandler("admin_poll", cmd_admin_poll))
     application.add_handler(CommandHandler("admin_result_push", cmd_admin_result_push))
     application.add_handler(CommandHandler("admin_eod_push", cmd_admin_eod_push))
+    application.add_handler(CommandHandler("predict", cmd_predict))
+    application.add_handler(CommandHandler("admin_event", cmd_admin_event))
     application.add_handler(CommandHandler("admin_simulate_eod", cmd_admin_simulate_eod))
+    application.add_handler(CommandHandler("admin_sim_night", cmd_admin_sim_night))
+    application.add_handler(CommandHandler("admin_sim_morning", cmd_admin_sim_morning))
+    application.add_handler(CommandHandler("admin_sim_prematch", cmd_admin_sim_prematch))
+    application.add_handler(CommandHandler("admin_sim_kickoff", cmd_admin_sim_kickoff))
+    application.add_handler(CommandHandler("admin_sim_result", cmd_admin_sim_result))
     application.add_handler(CommandHandler("confirm_admin", cmd_confirm_admin))
     application.add_handler(CommandHandler("cancel_admin", cmd_cancel_admin))
 
@@ -1314,13 +2041,16 @@ async def post_init(app):
         _group_chat_id = ENV_GROUP_CHAT_ID
         sched.init(app.bot, _group_chat_id)
         logger.info(f"Group chat ID set from env: {_group_chat_id}")
+    sheet.ensure_events_tab()
     await app.bot.set_my_commands([
         ("matches", "Today's matches + kickoff times"),
         ("bet", "Place a bet"),
         ("mybets", "Your open bets"),
         ("cancel", "Cancel an open bet"),
         ("balance", "Your current credits"),
-        ("leaderboard", "Full standings"),
+        ("predict", "Free event prediction"),
+        ("groups", "Group stage standings"),
+        ("leaderboard", "Credits standings"),
         ("help", "Help"),
     ])
     await sched.on_startup(notify_fn=dm_admin)

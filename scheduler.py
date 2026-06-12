@@ -76,78 +76,50 @@ def format_match_line(match: dict) -> str:
     return f"{format_match_teams(match['home'], match['away'])} — {time_str}"
 
 
-def format_standings(match_ids: list = None) -> str:
-    standings = sheet.get_standings()
-    if not standings:
-        return "No players yet."
 
-    pl_map = sheet.get_daily_pl(match_ids) if match_ids else {}
-
-    lines = []
-    for i, user in enumerate(standings, 1):
-        name = (user.get("first_name") or user.get("username") or "Unknown")[:10]
-        credits = user["credits"]
-        pl = pl_map.get(user["user_id"], 0)
-        pl_str = f"+{pl}" if pl > 0 else str(pl)
-        badge = " 🏆" if i == 1 else ""
-        lines.append(f"{i}. {name}{badge}    {credits}c    {pl_str}")
-
-    return "\n".join(lines)
+def _outcome_label(outcome: str, match: dict) -> str:
+    """Convert internal outcome to display label."""
+    if outcome == "draw":
+        return "Draw"
+    if outcome == "over":
+        return "Over 2.5"
+    if outcome == "under":
+        return "Under 2.5"
+    if outcome == "home":
+        team = match["home"]
+        code = TEAM_DISPLAY[team][0] if team in TEAM_DISPLAY else team[:3].upper()
+        return f"{code} Win"
+    if outcome == "away":
+        team = match["away"]
+        code = TEAM_DISPLAY[team][0] if team in TEAM_DISPLAY else team[:3].upper()
+        return f"{code} Win"
+    return outcome.capitalize()
 
 
 def format_result_message(match: dict, settlements: list) -> str:
-    home = match["home"]
-    away = match["away"]
-    home_display = format_team(home)
-    away_display = format_team(away)
-    home_score = match["home_score"]
-    away_score = match["away_score"]
-    result = match["result"]
-    ou_result = match["ou_result"]
-
-    result_label = "Draw" if result == "draw" else (f"{home_display} Win" if result == "home" else f"{away_display} Win")
-    ou_label = "Over 2.5" if ou_result == "over" else "Under 2.5"
+    home_display = format_team(match["home"])
+    away_display = format_team(match["away"])
+    ou_label = "Over 2.5" if match["ou_result"] == "over" else "Under 2.5"
 
     lines = [
-        f"🏁 FT: {home_display} {home_score}–{away_score} {away_display}",
-        f"{result_label} · {ou_label}",
+        f"{home_display} {match['home_score']}–{match['away_score']} {away_display}",
+        f"{_outcome_label(match['result'], match)} · {ou_label}",
+        "",
     ]
 
     if not settlements:
+        lines.append("No bets placed on this match.")
         return "\n".join(lines)
-
-    lines.append("")
 
     def get_name(s):
         user = sheet.cache["users"].get(s["user_id"], {})
         return (user.get("first_name") or user.get("username") or "").lower()
 
-    sorted_settlements = sorted(settlements, key=get_name)
-
-    for s in sorted_settlements:
+    for s in sorted(settlements, key=get_name):
         user = sheet.cache["users"].get(s["user_id"], {})
         name = (user.get("first_name") or user.get("username") or "?")[:10]
-        # Inline outcome label
-        outcome = s["outcome"]
-        if outcome == "draw":
-            outcome_label = "Draw"
-        elif outcome == "over":
-            outcome_label = "Over 2.5"
-        elif outcome == "under":
-            outcome_label = "Under 2.5"
-        elif outcome == "home":
-            team = match["home"]
-            code = TEAM_DISPLAY[team][0] if team in TEAM_DISPLAY else team[:3].upper()
-            outcome_label = f"{code} Win"
-        elif outcome == "away":
-            team = match["away"]
-            code = TEAM_DISPLAY[team][0] if team in TEAM_DISPLAY else team[:3].upper()
-            outcome_label = f"{code} Win"
-        else:
-            outcome_label = outcome.capitalize()
         icon = "✅" if s["status"] == "won" else "❌"
-        pl = f"+{s['amount']}c" if s["status"] == "won" else f"-{s['amount']}c"
-        lines.append(f"{name} — {outcome_label} — {s['amount']}c {icon} {pl}")
+        lines.append(f"{name} — {_outcome_label(s['outcome'], match)} — {s['amount']}c {icon}")
 
     return "\n".join(lines)
 
@@ -166,7 +138,7 @@ async def job_night_reminder():
             logger.info("Night reminder: no matches tomorrow, skipping")
             return
 
-        lines = ["🌙 Good evening gents! Matches tomorrow:\n"]
+        lines = ["🌙 Good evening gents! Matches later:\n"]
         for m in sorted(matches, key=lambda x: x["kickoff_utc"]):
             lines.append(f"  {format_match_line(m)}")
         lines.append("\nGet your bets in before kickoff. Good night! 🌛")
@@ -181,28 +153,75 @@ async def job_night_reminder():
 # ── Morning catchup (7:30AM SGT) ─────────────────────────────────────────────
 async def job_morning_catchup():
     try:
-        now_sgt = datetime.now(SGT)
-        today = now_sgt.strftime("%Y-%m-%d")
-        today_matches = await sheet.get_matches_for_date(today)
+        import random
+        CT = pytz.timezone("America/Chicago")
+        today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+        today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
+        tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
+        all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
 
-        overnight_finished = [
-            m for m in today_matches
-            if m["status"] == "FINISHED"
-        ]
+        today_matches = []
+        for m in all_matches:
+            try:
+                kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct:
+                    today_matches.append((kickoff_utc_dt, m))
+            except Exception:
+                continue
 
-        if not overnight_finished:
-            logger.info("Morning catchup: no overnight results")
+        if not today_matches:
+            logger.info("Morning catchup: no matches today, skipping")
             return
 
-        lines = ["☀️ Good morning! Overnight results:\n"]
-        for m in sorted(overnight_finished, key=lambda x: x["kickoff_utc"]):
+        lines = ["☀️ Good morning! Catch up from last night:\n"]
+        now_utc = datetime.now(UTC)
+
+        overnight_match_ids = []
+        for kickoff_utc_dt, m in sorted(today_matches, key=lambda x: x[0]):
             home_d = format_team(m["home"])
             away_d = format_team(m["away"])
-            result_label = "Draw" if m["result"] == "draw" else (
-                f"{home_d} Win" if m["result"] == "home" else f"{away_d} Win"
-            )
-            ou_label = "Over 2.5" if m["ou_result"] == "over" else "Under 2.5"
-            lines.append(f"🏁 {home_d} vs {away_d} — {m['home_score']}–{m['away_score']} | {result_label} · {ou_label}")
+            if m["status"] == "FINISHED":
+                ou_label = "Over 2.5" if m["ou_result"] == "over" else "Under 2.5"
+                lines.append(f"{home_d} {m['home_score']}–{m['away_score']} {away_d} · {ou_label}")
+                overnight_match_ids.append(m["match_id"])
+            elif m["status"] in ("IN_PLAY", "PAUSED", "HALFTIME"):
+                lines.append(f"{home_d} vs {away_d} — IN PLAY")
+            else:
+                time_str = kickoff_utc_dt.astimezone(SGT).strftime("%I:%M %p SGT").lstrip("0")
+                lines.append(f"{home_d} vs {away_d} — {time_str}")
+
+        # Fun line based on overnight match results
+        if overnight_match_ids:
+            pl_map = sheet.get_daily_pl(overnight_match_ids)
+            if pl_map:
+                best_uid = max(pl_map, key=lambda u: pl_map[u])
+                worst_uid = min(pl_map, key=lambda u: pl_map[u])
+                best_pl = pl_map[best_uid]
+                worst_pl = pl_map[worst_uid]
+
+                def get_name(uid):
+                    user = sheet.cache["users"].get(uid, {})
+                    return (user.get("first_name") or user.get("username") or "Someone")
+
+                if best_pl > 0:
+                    name = get_name(best_uid)
+                    fun = random.choice([
+                        f"{name} won big while everyone was asleep! 💰",
+                        f"{name} woke up richer today! 😏",
+                        f"{name} had a good night's sleep and a good bet! 🤑",
+                    ])
+                elif worst_pl < 0:
+                    name = get_name(worst_uid)
+                    fun = random.choice([
+                        f"{name} woke up to a bad surprise! 😬",
+                        f"{name} lost big while everyone was sleeping! 😅",
+                        f"{name} might need more than coffee this morning! ☕",
+                    ])
+                else:
+                    fun = None
+
+                if fun:
+                    lines.append(f"\n{fun}")
 
         await send_group("\n".join(lines))
         logger.info("Morning catchup sent")
@@ -221,14 +240,8 @@ async def job_prematch_summary(match_id: str):
 
         bets = await sheet.get_bets_for_match(match_id)
         open_bets = [b for b in bets if b["status"] == "open"]
-
         match_label = format_match_teams(match["home"], match["away"])
 
-        if not open_bets:
-            logger.info(f"Pre-match summary: no bets for {match_id}, skipping")
-            return
-
-        # Sort alphabetically
         def get_name(b):
             user = sheet.cache["users"].get(b["user_id"], {})
             return (user.get("first_name") or user.get("username") or "").lower()
@@ -236,35 +249,115 @@ async def job_prematch_summary(match_id: str):
         sorted_bets = sorted(open_bets, key=get_name)
 
         lines = [f"⚽ {match_label} kicks off in 15 mins!\n"]
+        if sorted_bets:
+            lines.append("Current bets:")
+            for b in sorted_bets:
+                user = sheet.cache["users"].get(b["user_id"], {})
+                name = (user.get("first_name") or user.get("username") or "?")[:10]
+                lines.append(f"{name} — {_outcome_label(b['outcome'], match)} — {b['amount']}c")
+        else:
+            lines.append("No bets placed yet.")
 
-        for b in sorted_bets:
-            user = sheet.cache["users"].get(b["user_id"], {})
-            name = (user.get("first_name") or user.get("username") or "?")[:10]
-            outcome = b["outcome"]
-            if outcome == "draw":
-                outcome_label = "Draw"
-            elif outcome == "over":
-                outcome_label = "Over 2.5"
-            elif outcome == "under":
-                outcome_label = "Under 2.5"
-            elif outcome == "home":
-                team = match["home"]
-                code = TEAM_DISPLAY[team][0] if team in TEAM_DISPLAY else team[:3].upper()
-                outcome_label = f"{code} Win"
-            elif outcome == "away":
-                team = match["away"]
-                code = TEAM_DISPLAY[team][0] if team in TEAM_DISPLAY else team[:3].upper()
-                outcome_label = f"{code} Win"
-            else:
-                outcome_label = outcome.capitalize()
-            lines.append(f"{name} — {outcome_label} — {b['amount']}c")
-
-        lines.append("\nGood luck! 🤞")
+        lines.append("\nGet your bets in before kickoff! ⚽")
         await send_group("\n".join(lines))
         logger.info(f"Pre-match summary sent for {match_id}")
     except Exception as e:
         logger.error(f"Pre-match summary job failed for {match_id}: {e}")
         await dm_admin(f"⚠️ Pre-match summary job failed for match {match_id}: {e}")
+
+
+# ── Kickoff message ───────────────────────────────────────────────────────────
+async def job_kickoff_message(match_id: str):
+    try:
+        import random
+        match = await sheet.get_match_by_id(match_id)
+        if not match:
+            return
+
+        bets = await sheet.get_bets_for_match(match_id)
+        open_bets = [b for b in bets if b["status"] == "open"]
+        match_label = format_match_teams(match["home"], match["away"])
+
+        def get_name_str(uid):
+            user = sheet.cache["users"].get(uid, {})
+            return (user.get("first_name") or user.get("username") or "Someone")
+
+        def get_sort_name(b):
+            user = sheet.cache["users"].get(b["user_id"], {})
+            return (user.get("first_name") or user.get("username") or "").lower()
+
+        sorted_bets = sorted(open_bets, key=get_sort_name)
+
+        lines = [
+            f"{match_label} has kicked off!",
+            "🚨 Bets are closed!",
+            "",
+        ]
+
+        for b in sorted_bets:
+            user = sheet.cache["users"].get(b["user_id"], {})
+            name = (user.get("first_name") or user.get("username") or "?")[:10]
+            lines.append(f"{name} — {_outcome_label(b['outcome'], match)} — {b['amount']}c")
+
+        # Fun line
+        standings = sheet.get_standings()
+        fun_line = None
+
+        if not open_bets:
+            pass  # no bets, no fun line
+        elif len(set(b["user_id"] for b in open_bets)) == 1:
+            name = get_name_str(open_bets[0]["user_id"])
+            fun_line = random.choice([
+                f"Brave soul {name}! Everyone else folded. 🫡",
+                f"{name} going solo today! 🕺",
+                f"Just {name}? Bold move. 👏",
+            ])
+        else:
+            # Check biggest bet
+            bet_totals = {}
+            for b in open_bets:
+                bet_totals[b["user_id"]] = bet_totals.get(b["user_id"], 0) + b["amount"]
+            max_uid = max(bet_totals, key=lambda u: bet_totals[u])
+            max_amt = bet_totals[max_uid]
+            avg_amt = sum(bet_totals.values()) / len(bet_totals)
+
+            if max_amt > avg_amt * 2:
+                name = get_name_str(max_uid)
+                fun_line = random.choice([
+                    f"{name} going all in today! 😤",
+                    f"Big money from {name} today! 💰",
+                    f"Confident or crazy {name}? Big bet! 👀",
+                ])
+            elif standings:
+                # Check if leader didn't bet
+                leader = standings[0]
+                leader_uid = leader["user_id"]
+                leader_bet_uids = {b["user_id"] for b in open_bets}
+                if leader_uid not in leader_bet_uids:
+                    name = get_name_str(leader_uid)
+                    fun_line = random.choice([
+                        f"Playing it safe {name}? 😏",
+                        f"{name} sitting out. Smart or scared? 🤔",
+                        f"The leader {name} on the sidelines! 👑",
+                    ])
+                else:
+                    # Last place
+                    last = standings[-1]
+                    name = get_name_str(last["user_id"])
+                    fun_line = random.choice([
+                        f"Good luck {name}, you need it! 🍀",
+                        f"{name} could really use a win here! 😬",
+                        f"Come on {name}, time to climb! 💪",
+                    ])
+
+        if fun_line:
+            lines.append(f"\n{fun_line}")
+
+        await send_group("\n".join(lines))
+        logger.info(f"Kickoff message sent for {match_id}")
+    except Exception as e:
+        logger.error(f"Kickoff message job failed for {match_id}: {e}")
+        await dm_admin(f"⚠️ Kickoff message job failed for match {match_id}: {e}")
 
 
 # ── Result polling ────────────────────────────────────────────────────────────
@@ -363,84 +456,129 @@ async def check_all_matches_done():
 # ── Post standings + daily credits ───────────────────────────────────────────
 async def job_post_standings(match_ids: list):
     try:
+        import random
         today_matches = []
         for mid in match_ids:
             m = await sheet.get_match_by_id(mid)
             if m:
                 today_matches.append(m)
 
-        # Build results block
-        result_lines = ["📅 End of Day Results\n"]
+        # Get standings BEFORE adding credits (for P&L calculation)
+        pl_map = sheet.get_daily_pl(match_ids)
+        standings_before = sheet.get_standings()
+
+        # Parlay bonus — result bets won across 2+ different matches
+        parlay_bonuses = {}
+        for uid in {u["user_id"] for u in standings_before}:
+            user_result_bets = [
+                b for b in sheet.cache["bets"]
+                if b["user_id"] == uid
+                and b["market"] == "result"
+                and b["match_id"] in match_ids
+                and b["status"] in ("won", "lost")
+            ]
+            # Group by match — take best result per match
+            match_results = {}
+            for b in user_result_bets:
+                mid = b["match_id"]
+                if mid not in match_results:
+                    match_results[mid] = False
+                if b["status"] == "won":
+                    match_results[mid] = True
+            # Count matches where they won at least one result bet
+            wins = sum(1 for won in match_results.values() if won)
+            if wins >= 2:
+                bonus = 50 + (wins - 2) * 25
+                parlay_bonuses[uid] = bonus
+
+        # Apply parlay bonuses
+        if parlay_bonuses:
+            for uid, bonus in parlay_bonuses.items():
+                user = sheet.cache["users"].get(uid)
+                if user:
+                    new_credits = user["credits"] + bonus
+                    await sheet.update_user_credits(uid, new_credits, notify_fn=dm_admin)
+                    await sheet.append_ledger(uid, "payout", bonus, new_credits, f"Parlay bonus ({list(parlay_bonuses.keys()).index(uid)+1} match wins)", notify_fn=dm_admin)
+
+        # Add daily credits
+        await sheet.add_daily_credits(DAILY_CREDITS, notify_fn=dm_admin)
+
+        # Get standings AFTER credits added
+        standings_after = sheet.get_standings()
+
+        # Build EOD message
+        lines = ["📅 End of Day\n"]
+
+        # Match results
         for m in sorted(today_matches, key=lambda x: x["kickoff_utc"]):
             if m["status"] == "FINISHED":
                 home_d = format_team(m["home"])
                 away_d = format_team(m["away"])
-                result_label = "Draw" if m["result"] == "draw" else (
-                    f"{home_d} Win" if m["result"] == "home" else f"{away_d} Win"
-                )
                 ou_label = "Over 2.5" if m["ou_result"] == "over" else "Under 2.5"
-                result_lines.append(f"🏁 {home_d} {m['home_score']}–{m['away_score']} {away_d} | {result_label} · {ou_label}")
+                lines.append(f"{home_d} {m['home_score']}–{m['away_score']} {away_d} · {ou_label}")
 
-        # Build standings block
-        result_lines.append("\n🏆 Standings")
+        lines.append("\n🏆 Standings")
 
-        standings = sheet.get_standings()
-        pl_map = sheet.get_daily_pl(match_ids)
-
-        for i, user in enumerate(standings, 1):
+        for i, user in enumerate(standings_after, 1):
             name = (user.get("first_name") or user.get("username") or "Unknown")[:10]
             credits = user["credits"]
             pl = pl_map.get(user["user_id"], 0)
             pl_str = f"+{pl}c" if pl > 0 else f"{pl}c"
             badge = " 🏆" if i == 1 else ""
-            result_lines.append(f"{i}. {name}{badge} — {credits}c ({pl_str} today)")
+            lines.append(f"{i}. {name}{badge} — {credits}c ({pl_str} today)")
 
-        await send_group("\n".join(result_lines))
+        # Dynamic commentary
+        def get_name(uid):
+            user = sheet.cache["users"].get(uid, {})
+            return (user.get("first_name") or user.get("username") or "Someone")
 
-        # Add daily credits
-        await sheet.add_daily_credits(DAILY_CREDITS, notify_fn=dm_admin)
+        # Biggest winner today
+        if pl_map:
+            best_uid = max(pl_map, key=lambda u: pl_map[u])
+            best_pl = pl_map[best_uid]
+            if best_pl > 0:
+                lines.append(f"\n🎉 {get_name(best_uid)} had the biggest win today with +{best_pl}c!")
 
-        # Credits message
-        await send_group(f"+{DAILY_CREDITS}c daily credits added. Good luck tomorrow! 🍀")
+        # Overtakes — compare before and after rankings
+        before_ranks = {u["user_id"]: i+1 for i, u in enumerate(standings_before)}
+        after_ranks = {u["user_id"]: i+1 for i, u in enumerate(standings_after)}
+        overtakes = []
+        for uid, new_rank in after_ranks.items():
+            old_rank = before_ranks.get(uid, new_rank)
+            if new_rank < old_rank:
+                # This person moved up — find who they passed
+                passed = [u for u, r in after_ranks.items() if before_ranks.get(u, r) < old_rank and r >= new_rank and u != uid]
+                for passed_uid in passed:
+                    overtakes.append((get_name(uid), get_name(passed_uid)))
+        if overtakes:
+            parts = " and ".join([f"{loser} 🤡" for _, loser in overtakes])
+            winner_name = overtakes[0][0]
+            lines.append(f"📈 {winner_name} overtook {parts} today.")
 
-        # Post group standings for groups that played today
-        try:
-            today_teams = set()
-            for m in today_matches:
-                today_teams.add(m["home"])
-                today_teams.add(m["away"])
+        # Gap warning — if 2nd is within 100c of 1st
+        if len(standings_after) >= 2:
+            first_credits = standings_after[0]["credits"]
+            second_credits = standings_after[1]["credits"]
+            gap = first_credits - second_credits
+            if 0 < gap <= 100:
+                first_name = get_name(standings_after[0]["user_id"])
+                second_name = get_name(standings_after[1]["user_id"])
+                lines.append(f"⚠️ {second_name} is {gap}c behind {first_name}. Watch out!")
 
-            all_standings = api.fetch_standings()
-            group_lines = ["📊 Group Standings\n"]
-            posted_any = False
+        # Parlay bonus shoutout
+        if parlay_bonuses:
+            def get_name_p(uid):
+                user = sheet.cache["users"].get(uid, {})
+                return (user.get("first_name") or user.get("username") or "Someone")
+            for uid, bonus in parlay_bonuses.items():
+                wins = 2 + (bonus - 50) // 25
+                lines.append(f"🎯 {get_name_p(uid)} hit a {wins}-match parlay! +{bonus}c bonus!")
 
-            for group in all_standings:
-                group_teams = {row["team"] for row in group["table"]}
-                if not today_teams.intersection(group_teams):
-                    continue
-                posted_any = True
-                group_name = group["group"].replace("GROUP_", "Group ")
-                group_lines.append(f"── {group_name} ──")
-                for row in group["table"]:
-                    team = row["team"]
-                    flag_code = ""
-                    if team in TEAM_DISPLAY:
-                        code, flag = TEAM_DISPLAY[team]
-                        flag_code = f"{flag} {code}"
-                    else:
-                        flag_code = team[:3].upper()
-                    w, d, l = row["won"], row["draw"], row["lost"]
-                    pts = row["points"]
-                    group_lines.append(f"{row['position']}. {flag_code} — {pts}pts ({w}W {d}D {l}L)")
-                group_lines.append("")
+        lines.append(f"\nDaily credits added, good luck tomorrow! 🍀")
+        lines.append("Use /groups for today's group tables.")
 
-            if posted_any:
-                await send_group("\n".join(group_lines))
-        except Exception as e:
-            logger.error(f"Failed to post group standings: {e}")
-            await dm_admin(f"⚠️ Failed to post group standings: {e}")
-
-        logger.info("Standings and daily credits posted")
+        await send_group("\n".join(lines))
+        logger.info("End of day standings and daily credits posted")
 
     except Exception as e:
         logger.error(f"Post standings job failed: {e}")
@@ -518,6 +656,17 @@ def register_match_jobs(matches: list):
             )
             logger.info(f"Scheduled pre-match summary for {match_id} at {summary_time}")
 
+        # Kickoff message — at exact kickoff time
+        if kickoff_utc > now_utc:
+            scheduler.add_job(
+                job_kickoff_message,
+                trigger=DateTrigger(run_date=kickoff_utc + timedelta(seconds=60)),
+                args=[match_id],
+                id=f"kickoff_{match_id}",
+                replace_existing=True
+            )
+            logger.info(f"Scheduled kickoff message for {match_id} at {kickoff_utc}")
+
         # Result polling — starts kickoff + 95 min
         is_knockout = m.get("round", "").upper() not in ("GROUP_STAGE", "")
         offset = POLL_START_OFFSET if not is_knockout else (KNOCKOUT_DURATION + 5 * 60)
@@ -565,12 +714,13 @@ async def on_startup(notify_fn=None):
 
         scheduler.start()
 
-        await dm_admin(
-            f"✅ Degen v{BOT_VERSION} is up and running\n"
-            f"Sheet: Connected\n"
-            f"Matches today: {len(all_today_matches)}\n"
-            f"Scheduler: {len(scheduler.get_jobs())} jobs active"
-        )
+        if _bot is not None:
+            await dm_admin(
+                f"✅ Degen v{BOT_VERSION} is up and running\n"
+                f"Sheet: Connected\n"
+                f"Matches today: {len(all_today_matches)}\n"
+                f"Scheduler: {len(scheduler.get_jobs())} jobs active"
+            )
 
         logger.info("Startup complete")
 
