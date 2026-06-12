@@ -656,6 +656,36 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+# ── Admin: /admin_simulate_eod ────────────────────────────────────────────────
+async def cmd_admin_simulate_eod(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+
+    # Build a sample end of day message and send to admin DM
+    standings = sheet.get_standings()
+
+    lines = ["📅 End of Day Results (SIMULATION)\n"]
+    lines.append("🏁 🇲🇽 MEX 2–0 🇿🇦 RSA | MEX Win · Under 2.5")
+    lines.append("🏁 🇰🇷 KOR 1–1 🇨🇿 CZE | Draw · Under 2.5")
+    lines.append("\n🏆 Standings")
+
+    for i, user in enumerate(standings, 1):
+        name = (user.get("first_name") or user.get("username") or "Unknown")[:10]
+        credits = user["credits"]
+        badge = " 🏆" if i == 1 else ""
+        lines.append(f"{i}. {name}{badge} — {credits}c (+50c today)")
+
+    lines.append("\n+100c daily credits added. Good luck tomorrow! 🍀")
+    lines.append("\n📊 Group Standings\n")
+    lines.append("── Group A ──")
+    lines.append("1. 🇲🇽 MEX — 4pts (1W 1D 0L)")
+    lines.append("2. 🇰🇷 KOR — 2pts (0W 2D 0L)")
+    lines.append("3. 🇨🇿 CZE — 2pts (0W 2D 0L)")
+    lines.append("4. 🇿🇦 RSA — 0pts (0W 0D 1L)")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 # ── Admin: /admin_status ──────────────────────────────────────────────────────
 async def cmd_admin_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
@@ -1100,6 +1130,7 @@ def setup_handlers():
     application.add_handler(CommandHandler("admin_cancel_match", cmd_admin_cancel_match))
     application.add_handler(CommandHandler("admin_credits", cmd_admin_credits))
     application.add_handler(CommandHandler("admin_endtournament", cmd_admin_endtournament))
+    application.add_handler(CommandHandler("admin_simulate_eod", cmd_admin_simulate_eod))
     application.add_handler(CommandHandler("confirm_admin", cmd_confirm_admin))
     application.add_handler(CommandHandler("cancel_admin", cmd_cancel_admin))
 

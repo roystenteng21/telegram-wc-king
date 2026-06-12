@@ -396,6 +396,43 @@ async def job_post_standings(match_ids: list):
         # Credits message
         await send_group(f"+{DAILY_CREDITS}c daily credits added. Good luck tomorrow! 🍀")
 
+        # Post group standings for groups that played today
+        try:
+            today_teams = set()
+            for m in today_matches:
+                today_teams.add(m["home"])
+                today_teams.add(m["away"])
+
+            all_standings = api.fetch_standings()
+            group_lines = ["📊 Group Standings\n"]
+            posted_any = False
+
+            for group in all_standings:
+                group_teams = {row["team"] for row in group["table"]}
+                if not today_teams.intersection(group_teams):
+                    continue
+                posted_any = True
+                group_name = group["group"].replace("GROUP_", "Group ")
+                group_lines.append(f"── {group_name} ──")
+                for row in group["table"]:
+                    team = row["team"]
+                    flag_code = ""
+                    if team in TEAM_DISPLAY:
+                        code, flag = TEAM_DISPLAY[team]
+                        flag_code = f"{flag} {code}"
+                    else:
+                        flag_code = team[:3].upper()
+                    w, d, l = row["won"], row["draw"], row["lost"]
+                    pts = row["points"]
+                    group_lines.append(f"{row['position']}. {flag_code} — {pts}pts ({w}W {d}D {l}L)")
+                group_lines.append("")
+
+            if posted_any:
+                await send_group("\n".join(group_lines))
+        except Exception as e:
+            logger.error(f"Failed to post group standings: {e}")
+            await dm_admin(f"⚠️ Failed to post group standings: {e}")
+
         logger.info("Standings and daily credits posted")
 
     except Exception as e:
