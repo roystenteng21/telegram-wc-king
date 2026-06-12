@@ -726,6 +726,104 @@ async def cmd_admin_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+# ── Admin: /admin_result_push ─────────────────────────────────────────────────
+async def cmd_admin_result_push(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+
+    args = context.args
+
+    # /admin_result_push [number] — push result message for selected match
+    if args:
+        session = _admin_pending.get(ADMIN_TELEGRAM_ID)
+        if not session or session_expired(session) or session.get("action") != "result_push_select":
+            await update.message.reply_text("Run /admin_result_push first to see matches.")
+            return
+        try:
+            index = int(args[0]) - 1
+            matches = session["data"]["matches"]
+            if index < 0 or index >= len(matches):
+                await update.message.reply_text("Invalid number.")
+                return
+        except ValueError:
+            await update.message.reply_text("Usage: /admin_result_push [number]")
+            return
+
+        del _admin_pending[ADMIN_TELEGRAM_ID]
+        match = matches[index]
+        match_id = match["match_id"]
+
+        bets = await sheet.get_bets_for_match(match_id)
+        settlements = [b for b in bets if b["status"] in ("won", "lost")]
+        result_msg = sched.format_result_message(match, settlements)
+        await sched.send_group(result_msg)
+        await update.message.reply_text("✅ Result message pushed to group.")
+        return
+
+    # /admin_result_push — list today's finished matches
+    CT = pytz.timezone("America/Chicago")
+    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+    today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
+    tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
+    all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
+
+    finished = []
+    for m in all_matches:
+        try:
+            kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+            if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") != today_ct:
+                continue
+            if m["status"] == "FINISHED":
+                finished.append(m)
+        except Exception:
+            continue
+
+    if not finished:
+        await update.message.reply_text("No finished matches today.")
+        return
+
+    lines = ["Which match to push result for?\n"]
+    for i, m in enumerate(finished, 1):
+        home = format_team(m["home"])
+        away = format_team(m["away"])
+        lines.append(f"{i}. {home} vs {away} — {m['home_score']}–{m['away_score']}")
+    lines.append("\nReply /admin_result_push [number]")
+
+    _admin_pending[ADMIN_TELEGRAM_ID] = {
+        "action": "result_push_select",
+        "data": {"matches": finished},
+        "expires": datetime.now(UTC) + timedelta(seconds=120)
+    }
+    await update.message.reply_text("\n".join(lines))
+
+
+# ── Admin: /admin_eod_push ────────────────────────────────────────────────────
+async def cmd_admin_eod_push(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+
+    try:
+        CT = pytz.timezone("America/Chicago")
+        today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+        today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
+        tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
+        all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
+
+        match_ids = []
+        for m in all_matches:
+            try:
+                kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct:
+                    match_ids.append(m["match_id"])
+            except Exception:
+                continue
+
+        await sched.job_post_standings(match_ids)
+        await update.message.reply_text("✅ End of day message pushed to group.")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Failed: {e}")
+
+
 # ── Admin: /admin_simulate_eod ────────────────────────────────────────────────
 async def cmd_admin_simulate_eod(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
@@ -1201,6 +1299,8 @@ def setup_handlers():
     application.add_handler(CommandHandler("admin_credits", cmd_admin_credits))
     application.add_handler(CommandHandler("admin_endtournament", cmd_admin_endtournament))
     application.add_handler(CommandHandler("admin_poll", cmd_admin_poll))
+    application.add_handler(CommandHandler("admin_result_push", cmd_admin_result_push))
+    application.add_handler(CommandHandler("admin_eod_push", cmd_admin_eod_push))
     application.add_handler(CommandHandler("admin_simulate_eod", cmd_admin_simulate_eod))
     application.add_handler(CommandHandler("confirm_admin", cmd_confirm_admin))
     application.add_handler(CommandHandler("cancel_admin", cmd_cancel_admin))
