@@ -109,31 +109,45 @@ def format_result_message(match: dict, settlements: list) -> str:
     ou_label = "Over 2.5" if ou_result == "over" else "Under 2.5"
 
     lines = [
-        f"🏁 FT: {home_display} vs {away_display} — {home_score}–{away_score}",
-        f"Result: {result_label} · {ou_label}",
-        ""
+        f"🏁 FT: {home_display} {home_score}–{away_score} {away_display}",
+        f"{result_label} · {ou_label}",
     ]
 
     if not settlements:
         return "\n".join(lines)
 
-    # Sort alphabetically by first_name
+    lines.append("")
+
     def get_name(s):
         user = sheet.cache["users"].get(s["user_id"], {})
         return (user.get("first_name") or user.get("username") or "").lower()
 
     sorted_settlements = sorted(settlements, key=get_name)
 
-    lines.append(f"{'Player':<12} {'Bet':<6} {'Amt':>5} {'P&L':>6}")
-    lines.append("─" * 32)
-
     for s in sorted_settlements:
         user = sheet.cache["users"].get(s["user_id"], {})
         name = (user.get("first_name") or user.get("username") or "?")[:10]
-        outcome = s["outcome"].capitalize()
-        amt = f"{s['amount']}c"
-        pl = f"+{s['amount']}" if s["status"] == "won" else f"-{s['amount']}"
-        lines.append(f"{name:<12} {outcome:<6} {amt:>5} {pl:>6}")
+        # Inline outcome label
+        outcome = s["outcome"]
+        if outcome == "draw":
+            outcome_label = "Draw"
+        elif outcome == "over":
+            outcome_label = "Over 2.5"
+        elif outcome == "under":
+            outcome_label = "Under 2.5"
+        elif outcome == "home":
+            team = match["home"]
+            code = TEAM_DISPLAY[team][0] if team in TEAM_DISPLAY else team[:3].upper()
+            outcome_label = f"{code} Win"
+        elif outcome == "away":
+            team = match["away"]
+            code = TEAM_DISPLAY[team][0] if team in TEAM_DISPLAY else team[:3].upper()
+            outcome_label = f"{code} Win"
+        else:
+            outcome_label = outcome.capitalize()
+        icon = "✅" if s["status"] == "won" else "❌"
+        pl = f"+{s['amount']}c" if s["status"] == "won" else f"-{s['amount']}c"
+        lines.append(f"{name} — {outcome_label} — {s['amount']}c {icon} {pl}")
 
     return "\n".join(lines)
 
@@ -222,15 +236,28 @@ async def job_prematch_summary(match_id: str):
         sorted_bets = sorted(open_bets, key=get_name)
 
         lines = [f"⚽ {match_label} kicks off in 15 mins!\n"]
-        lines.append(f"{'Player':<12} {'Pick':<8} {'Amt':>5}")
-        lines.append("─" * 28)
 
         for b in sorted_bets:
             user = sheet.cache["users"].get(b["user_id"], {})
             name = (user.get("first_name") or user.get("username") or "?")[:10]
-            outcome = b["outcome"].capitalize()
-            amt = f"{b['amount']}c"
-            lines.append(f"{name:<12} {outcome:<8} {amt:>5}")
+            outcome = b["outcome"]
+            if outcome == "draw":
+                outcome_label = "Draw"
+            elif outcome == "over":
+                outcome_label = "Over 2.5"
+            elif outcome == "under":
+                outcome_label = "Under 2.5"
+            elif outcome == "home":
+                team = match["home"]
+                code = TEAM_DISPLAY[team][0] if team in TEAM_DISPLAY else team[:3].upper()
+                outcome_label = f"{code} Win"
+            elif outcome == "away":
+                team = match["away"]
+                code = TEAM_DISPLAY[team][0] if team in TEAM_DISPLAY else team[:3].upper()
+                outcome_label = f"{code} Win"
+            else:
+                outcome_label = outcome.capitalize()
+            lines.append(f"{name} — {outcome_label} — {b['amount']}c")
 
         lines.append("\nGood luck! 🤞")
         await send_group("\n".join(lines))
@@ -345,12 +372,10 @@ async def job_post_standings(match_ids: list):
                     f"{home_d} Win" if m["result"] == "home" else f"{away_d} Win"
                 )
                 ou_label = "Over 2.5" if m["ou_result"] == "over" else "Under 2.5"
-                result_lines.append(f"🏁 {home_d} vs {away_d} — {m['home_score']}–{m['away_score']} | {result_label} · {ou_label}")
+                result_lines.append(f"🏁 {home_d} {m['home_score']}–{m['away_score']} {away_d} | {result_label} · {ou_label}")
 
         # Build standings block
         result_lines.append("\n🏆 Standings")
-        result_lines.append(f"{'#':<3} {'Player':<12} {'Credits':>8} {'Today':>7}")
-        result_lines.append("─" * 34)
 
         standings = sheet.get_standings()
         pl_map = sheet.get_daily_pl(match_ids)
@@ -359,9 +384,9 @@ async def job_post_standings(match_ids: list):
             name = (user.get("first_name") or user.get("username") or "Unknown")[:10]
             credits = user["credits"]
             pl = pl_map.get(user["user_id"], 0)
-            pl_str = f"+{pl}" if pl > 0 else str(pl)
+            pl_str = f"+{pl}c" if pl > 0 else f"{pl}c"
             badge = " 🏆" if i == 1 else ""
-            result_lines.append(f"{i:<3} {name+badge:<12} {credits:>8} {pl_str:>7}")
+            result_lines.append(f"{i}. {name}{badge} — {credits}c ({pl_str} today)")
 
         await send_group("\n".join(result_lines))
 
@@ -369,7 +394,7 @@ async def job_post_standings(match_ids: list):
         await sheet.add_daily_credits(DAILY_CREDITS, notify_fn=dm_admin)
 
         # Credits message
-        await send_group("Good PM gents, your day's credits have been added. Good luck today! 🍀")
+        await send_group(f"+{DAILY_CREDITS}c daily credits added. Good luck tomorrow! 🍀")
 
         logger.info("Standings and daily credits posted")
 
