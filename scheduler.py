@@ -12,7 +12,7 @@ from config import (
     MORNING_CATCHUP_HOUR, MORNING_CATCHUP_MINUTE,
     PREMATCH_SUMMARY_MINUTES, POLL_START_OFFSET, POLL_INTERVAL,
     GROUP_STAGE_DURATION, KNOCKOUT_DURATION,
-    ADMIN_TELEGRAM_ID, BOT_VERSION, TEAM_DISPLAY
+    ADMIN_TELEGRAM_ID, BOT_VERSION, TEAM_DISPLAY, PARLAY_MULTIPLIERS
 )
 import sheet
 import api
@@ -96,7 +96,12 @@ def _outcome_label(outcome: str, match: dict) -> str:
     return outcome.capitalize()
 
 
-def format_result_message(match: dict, settlements: list) -> str:
+def _get_user_name(uid: int) -> str:
+    user = sheet.cache["users"].get(uid, {})
+    return (user.get("first_name") or user.get("username") or "Someone")
+
+
+
     home_display = format_team(match["home"])
     away_display = format_team(match["away"])
     ou_label = "Over 2.5" if match["ou_result"] == "over" else "Under 2.5"
@@ -222,6 +227,15 @@ async def job_morning_catchup():
 
                 if fun:
                     lines.append(f"\n{fun}")
+
+        # Parlay wins from silent hours
+        pending = sheet.cache.get("pending_parlay_wins", [])
+        if pending:
+            for pid, p in pending:
+                name = _get_user_name(p["user_id"])
+                legs_str = "\n".join(f"• {label} ✅" for label in p["leg_labels"])
+                lines.append(f"\n🎰 {name} hit a {p['legs']}-leg parlay!\n{legs_str}\n{p['stake']}c → {p['payout']}c 🔥")
+            sheet.cache["pending_parlay_wins"] = []
 
         await send_group("\n".join(lines))
         logger.info("Morning catchup sent")
@@ -361,7 +375,28 @@ async def job_kickoff_message(match_id: str):
 
 
 # ── Result polling ────────────────────────────────────────────────────────────
+async def check_parlay_completions(match_id: str) -> list:
+    """
+    After a match settles, find all parlays that had a leg on this match
+    and check if they're now fully settled. Returns list of payout dicts.
+    """
+    payouts = []
+    affected_parlay_ids = set(
+        b.get("parlay_id", "") for b in sheet.cache["bets"]
+        if b.get("parlay_id") and b["match_id"] == str(match_id)
+        and b["market"] == "result"
+    )
+    affected_parlay_ids.discard("")
+
+    for pid in affected_parlay_ids:
+        result = await sheet.settle_parlay(pid, notify_fn=dm_admin)
+        if result:
+            payouts.append((pid, result))
+    return payouts
+
+
 async def job_poll_result(match_id: str, attempt: int = 1):
+    MAX_POLL_ATTEMPTS = 36  # 36 x 5min = 3 hours max
     try:
         logger.info(f"Polling result for match {match_id} (attempt {attempt})")
         try:
@@ -375,14 +410,18 @@ async def job_poll_result(match_id: str, attempt: int = 1):
                 )
                 return
             await dm_admin(f"⚠️ API error polling match {match_id}: {e}")
-            # Reschedule retry
-            _schedule_poll(match_id, delay_seconds=POLL_INTERVAL, attempt=attempt + 1)
+            if attempt < MAX_POLL_ATTEMPTS:
+                _schedule_poll(match_id, delay_seconds=POLL_INTERVAL, attempt=attempt + 1)
+            else:
+                await dm_admin(f"⚠️ Match {match_id} polling gave up after {MAX_POLL_ATTEMPTS} attempts. Use /admin_result to settle manually.")
             return
 
         if not result_data:
-            # Not finished yet — reschedule
             logger.info(f"Match {match_id} not finished yet, rescheduling poll")
-            _schedule_poll(match_id, delay_seconds=POLL_INTERVAL, attempt=attempt + 1)
+            if attempt < MAX_POLL_ATTEMPTS:
+                _schedule_poll(match_id, delay_seconds=POLL_INTERVAL, attempt=attempt + 1)
+            else:
+                await dm_admin(f"⚠️ Match {match_id} still not finished after {MAX_POLL_ATTEMPTS} attempts. Use /admin_result to settle manually.")
             return
 
         # Result confirmed — settle bets
@@ -391,11 +430,27 @@ async def job_poll_result(match_id: str, attempt: int = 1):
         result, ou_result = await sheet.update_match_result(match_id, home_score, away_score, notify_fn=dm_admin)
         settlements = await sheet.settle_bets_for_match(match_id, result, ou_result, notify_fn=dm_admin)
 
+        # Check parlay completions after settlement
+        parlay_wins = await check_parlay_completions(match_id)
+
         match = await sheet.get_match_by_id(match_id)
         result_msg = format_result_message(match, settlements)
 
+        # Append parlay wins to result message
+        if parlay_wins:
+            result_msg += "\n"
+            for pid, p in parlay_wins:
+                name = _get_user_name(p["user_id"])
+                legs_str = "\n".join(f"• {label} ✅" for label in p["leg_labels"])
+                result_msg += f"\n🎰 {name} hit a {p['legs']}-leg parlay!\n{legs_str}\n{p['stake']}c → {p['payout']}c 🔥"
+
         if is_silent_hours():
             logger.info(f"Match {match_id} result held — silent hours")
+            # Store parlay wins for morning catchup
+            if parlay_wins:
+                if "pending_parlay_wins" not in sheet.cache:
+                    sheet.cache["pending_parlay_wins"] = []
+                sheet.cache["pending_parlay_wins"].extend(parlay_wins)
         else:
             await send_group(result_msg)
 
@@ -430,8 +485,20 @@ def _schedule_poll(match_id: str, delay_seconds: int, attempt: int):
 # ── Check all matches done → fire standings ───────────────────────────────────
 async def check_all_matches_done():
     try:
-        today = datetime.now(UTC).strftime("%Y-%m-%d")
-        today_matches = await sheet.get_matches_for_date(today)
+        CT = pytz.timezone("America/Chicago")
+        today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+        today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
+        tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
+        today_matches = []
+        for m in all_matches:
+            try:
+                kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct:
+                    today_matches.append(m)
+            except Exception:
+                continue
 
         if not today_matches:
             return
@@ -444,8 +511,15 @@ async def check_all_matches_done():
         if not all_done:
             return
 
+        # Guard against double-fire — check if EOD already ran today
+        eod_date = sheet.cache.get("eod_date")
+        if eod_date == today_ct:
+            logger.info("EOD already fired today, skipping duplicate")
+            return
+
+        sheet.cache["eod_date"] = today_ct
         logger.info("All matches done — firing standings")
-        match_ids = [m["match_id"] for m in today_matches]
+        match_ids = [str(m["match_id"]) for m in today_matches]
         await job_post_standings(match_ids)
 
     except Exception as e:
@@ -457,6 +531,9 @@ async def check_all_matches_done():
 async def job_post_standings(match_ids: list):
     try:
         import random
+        # Normalise all match_ids to str to avoid int/str comparison mismatches
+        match_ids = [str(mid) for mid in match_ids]
+
         today_matches = []
         for mid in match_ids:
             m = await sheet.get_match_by_id(mid)
@@ -467,38 +544,70 @@ async def job_post_standings(match_ids: list):
         pl_map = sheet.get_daily_pl(match_ids)
         standings_before = sheet.get_standings()
 
-        # Parlay bonus — result bets won across 2+ different matches
-        parlay_bonuses = {}
-        for uid in {u["user_id"] for u in standings_before}:
-            user_result_bets = [
-                b for b in sheet.cache["bets"]
-                if b["user_id"] == uid
-                and b["market"] == "result"
-                and b["match_id"] in match_ids
-                and b["status"] in ("won", "lost")
-            ]
-            # Group by match — take best result per match
-            match_results = {}
-            for b in user_result_bets:
-                mid = b["match_id"]
-                if mid not in match_results:
-                    match_results[mid] = False
-                if b["status"] == "won":
-                    match_results[mid] = True
-            # Count matches where they won at least one result bet
-            wins = sum(1 for won in match_results.values() if won)
-            if wins >= 2:
-                bonus = 50 + (wins - 2) * 25
-                parlay_bonuses[uid] = bonus
+        # Parlay settlement — check all parlays with legs in today's matches
+        parlay_payouts = {}  # parlay_id -> {uid, legs, stake, multiplier, payout}
+        today_parlay_ids = set(
+            b.get("parlay_id", "") for b in sheet.cache["bets"]
+            if b.get("parlay_id") and b["match_id"] in match_ids
+            and b["market"] == "result"
+        )
+        today_parlay_ids.discard("")
 
-        # Apply parlay bonuses
-        if parlay_bonuses:
-            for uid, bonus in parlay_bonuses.items():
+        for pid in today_parlay_ids:
+            # Skip already paid out (settled after last leg)
+            if pid in sheet.cache.get("paid_parlays", set()):
+                continue
+
+            legs = sheet.get_parlay_bets(pid)
+            if not legs:
+                continue
+            uid = legs[0]["user_id"]
+            stake = legs[0]["amount"]  # same amount on all legs
+
+            # Separate settled from voided (voided = match cancelled)
+            active_legs = [b for b in legs if b["status"] in ("won", "lost", "void")]
+            settled_legs = [b for b in active_legs if b["status"] in ("won", "lost")]
+            open_legs = [b for b in legs if b["status"] == "open"]
+
+            if open_legs:
+                await dm_admin(f"⚠️ Parlay {pid} has {len(open_legs)} unsettled leg(s) at EOD — skipped. Settle bets manually then re-push EOD.")
+                continue
+
+            if not settled_legs:
+                continue  # nothing settled yet
+
+            # Drop voided legs — recalculate multiplier on remaining settled legs
+            all_won = all(b["status"] == "won" for b in settled_legs)
+            effective_legs = len(settled_legs)
+
+            if all_won and effective_legs >= 2:
+                multiplier = PARLAY_MULTIPLIERS.get(effective_legs, PARLAY_MULTIPLIERS[4] if effective_legs > 4 else None)
+                if not multiplier:
+                    continue
+                payout = int(stake * multiplier)
+                net = payout - stake
+                parlay_payouts[pid] = {
+                    "user_id": uid,
+                    "legs": effective_legs,
+                    "stake": stake,
+                    "multiplier": multiplier,
+                    "payout": payout,
+                    "net": net
+                }
+
+        # Credit parlay winners
+        if parlay_payouts:
+            for pid, p in parlay_payouts.items():
+                uid = p["user_id"]
                 user = sheet.cache["users"].get(uid)
                 if user:
-                    new_credits = user["credits"] + bonus
+                    new_credits = user["credits"] + p["payout"]
                     await sheet.update_user_credits(uid, new_credits, notify_fn=dm_admin)
-                    await sheet.append_ledger(uid, "payout", bonus, new_credits, f"Parlay bonus ({list(parlay_bonuses.keys()).index(uid)+1} match wins)", notify_fn=dm_admin)
+                    await sheet.append_ledger(
+                        uid, "payout", p["payout"], new_credits,
+                        f"Parlay {pid} won ({p['legs']} legs x{p['multiplier']})",
+                        notify_fn=dm_admin
+                    )
 
         # Add daily credits
         await sheet.add_daily_credits(DAILY_CREDITS, notify_fn=dm_admin)
@@ -565,14 +674,14 @@ async def job_post_standings(match_ids: list):
                 second_name = get_name(standings_after[1]["user_id"])
                 lines.append(f"⚠️ {second_name} is {gap}c behind {first_name}. Watch out!")
 
-        # Parlay bonus shoutout
-        if parlay_bonuses:
+        # Parlay shoutout
+        if parlay_payouts:
             def get_name_p(uid):
                 user = sheet.cache["users"].get(uid, {})
                 return (user.get("first_name") or user.get("username") or "Someone")
-            for uid, bonus in parlay_bonuses.items():
-                wins = 2 + (bonus - 50) // 25
-                lines.append(f"🎯 {get_name_p(uid)} hit a {wins}-match parlay! +{bonus}c bonus!")
+            for pid, p in parlay_payouts.items():
+                name = get_name_p(p["user_id"])
+                lines.append(f"🎰 {name} hit a {p['legs']}-leg parlay! {p['stake']}c → {p['payout']}c 🔥")
 
         lines.append(f"\nDaily credits added, good luck tomorrow! 🍀")
         lines.append("Use /groups for today's group tables.")
@@ -610,7 +719,7 @@ def register_static_jobs():
         replace_existing=True
     )
 
-    # Cache refresh — every 5 minutes
+    # Cache refresh — every 10 minutes
     scheduler.add_job(
         job_refresh_cache,
         trigger=CronTrigger(minute="*/10"),

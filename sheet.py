@@ -22,9 +22,12 @@ cache = {
     "users": {},
     "matches": {},
     "bets": [],
-    "events": {},       # keyed by event_id
+    "events": {},
     "last_refresh": None,
-    "daily_credits_date": None
+    "daily_credits_date": None,
+    "eod_date": None,
+    "paid_parlays": set(),          # parlay_ids already paid out, skip at EOD
+    "pending_parlay_wins": []       # parlay wins during silent hours, shown in morning catchup
 }
 
 # Row index cache — tracks sheet row numbers to avoid re-reading
@@ -129,7 +132,8 @@ async def refresh_cache(notify_fn=None):
                 "amount": int(row["amount"]),
                 "status": row["status"],
                 "payout": row["payout"],
-                "placed_at": row["placed_at"]
+                "placed_at": row["placed_at"],
+                "parlay_id": str(row.get("parlay_id", ""))
             })
             _bet_rows[row["bet_id"]] = i + 2
 
@@ -306,7 +310,7 @@ async def update_match_result(match_id: str, home_score: int, away_score: int, n
         raise
 
 # ── Bet operations ───────────────────────────────────────────────────────────
-async def place_bet(user_id: int, match_id: str, market: str, outcome: str, amount: int, notify_fn=None) -> str:
+async def place_bet(user_id: int, match_id: str, market: str, outcome: str, amount: int, notify_fn=None, parlay_id: str = "") -> str:
     """Deduct credits and write bet. Returns bet_id."""
     async with get_user_lock(user_id):
         user = cache["users"].get(user_id)
@@ -317,7 +321,7 @@ async def place_bet(user_id: int, match_id: str, market: str, outcome: str, amou
 
         bet_id = f"{user_id}_{match_id}_{market}_{datetime.now(UTC).strftime('%H%M%S%f')}"
         placed_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
-        row = [bet_id, user_id, match_id, market, outcome, amount, "open", "", placed_at]
+        row = [bet_id, user_id, match_id, market, outcome, amount, "open", "", placed_at, parlay_id]
 
         try:
             ws = get_sheet(SHEET_BETS)
@@ -327,12 +331,14 @@ async def place_bet(user_id: int, match_id: str, market: str, outcome: str, amou
 
             new_credits = user["credits"] - amount
             await update_user_credits(user_id, new_credits, notify_fn)
-            await append_ledger(user_id, "bet", -amount, new_credits, f"Bet on {match_id} {market} {outcome}", notify_fn)
+            ledger_note = f"Parlay {parlay_id} leg on {match_id}" if parlay_id else f"Bet on {match_id} {market} {outcome}"
+            await append_ledger(user_id, "bet", -amount, new_credits, ledger_note, notify_fn)
 
             cache["bets"].append({
                 "bet_id": bet_id, "user_id": user_id, "match_id": match_id,
                 "market": market, "outcome": outcome, "amount": amount,
-                "status": "open", "payout": "", "placed_at": placed_at
+                "status": "open", "payout": "", "placed_at": placed_at,
+                "parlay_id": parlay_id
             })
 
             return bet_id
@@ -342,8 +348,104 @@ async def place_bet(user_id: int, match_id: str, market: str, outcome: str, amou
                 await notify_fn(f"⚠️ Failed to place bet for user {user_id}: {e}")
             raise
 
+
+def get_parlay_bets(parlay_id: str) -> list:
+    """Return all bets tagged with a given parlay_id."""
+    return [b for b in cache["bets"] if b.get("parlay_id") == parlay_id]
+
+
+def get_user_active_parlays(user_id: int) -> list:
+    """Return list of distinct active parlay_ids for a user (bets still open)."""
+    seen = set()
+    result = []
+    for b in cache["bets"]:
+        pid = b.get("parlay_id", "")
+        if pid and b["user_id"] == user_id and b["status"] == "open" and pid not in seen:
+            seen.add(pid)
+            result.append(pid)
+    return result
+
+
+def mark_parlay_paid(parlay_id: str):
+    """Mark a parlay as already paid so EOD skips it."""
+    cache["paid_parlays"].add(parlay_id)
+
+
+async def settle_parlay(parlay_id: str, notify_fn=None) -> dict | None:
+    """
+    Check if all legs of a parlay are settled. If all won → credit payout.
+    Returns payout dict {user_id, legs, stake, multiplier, payout, leg_labels}
+    or None if not ready or already paid or didn't win.
+    """
+    from config import PARLAY_MULTIPLIERS, TEAM_DISPLAY
+    if parlay_id in cache["paid_parlays"]:
+        return None
+
+    legs = get_parlay_bets(parlay_id)
+    if not legs:
+        return None
+
+    # Must have no open legs remaining
+    open_legs = [b for b in legs if b["status"] == "open"]
+    if open_legs:
+        return None
+
+    settled_legs = [b for b in legs if b["status"] in ("won", "lost")]
+    if not settled_legs:
+        return None
+
+    all_won = all(b["status"] == "won" for b in settled_legs)
+    effective_legs = len(settled_legs)
+
+    if not all_won or effective_legs < 2:
+        mark_parlay_paid(parlay_id)  # lost or invalid — mark done so EOD skips
+        return None
+
+    multiplier = PARLAY_MULTIPLIERS.get(effective_legs, PARLAY_MULTIPLIERS[4] if effective_legs > 4 else None)
+    if not multiplier:
+        return None
+
+    uid = legs[0]["user_id"]
+    stake = legs[0]["amount"]
+    payout = int(stake * multiplier)
+
+    # Build leg labels for display
+    leg_labels = []
+    for b in settled_legs:
+        match = cache["matches"].get(str(b["match_id"]), {})
+        if b["outcome"] == "draw":
+            label = "Draw"
+        elif b["outcome"] in ("home", "away"):
+            team = match.get("home") if b["outcome"] == "home" else match.get("away")
+            if team and team in TEAM_DISPLAY:
+                code, flag = TEAM_DISPLAY[team]
+                label = f"{flag} {code} Win"
+            else:
+                label = f"{(team or b['outcome'])[:3].upper()} Win"
+        else:
+            label = b["outcome"].capitalize()
+        leg_labels.append(label)
+
+    # Credit payout
+    user = cache["users"].get(uid)
+    if user:
+        new_credits = user["credits"] + payout
+        await update_user_credits(uid, new_credits, notify_fn)
+        await append_ledger(uid, "payout", payout, new_credits,
+                           f"Parlay {parlay_id} won ({effective_legs} legs x{multiplier})", notify_fn)
+
+    mark_parlay_paid(parlay_id)
+    return {
+        "user_id": uid,
+        "legs": effective_legs,
+        "stake": stake,
+        "multiplier": multiplier,
+        "payout": payout,
+        "leg_labels": leg_labels
+    }
+
 async def get_user_open_bets(user_id: int) -> list:
-    return [b for b in cache["bets"] if b["user_id"] == user_id and b["status"] == "open"]
+    return [b for b in cache["bets"] if b["user_id"] == user_id and b["status"] == "open" and not b.get("parlay_id", "")]
 
 async def get_bets_for_match(match_id: str) -> list:
     return [b for b in cache["bets"] if b["match_id"] == str(match_id)]
@@ -399,14 +501,18 @@ async def settle_bets_for_match(match_id: str, result: str, ou_result: str, noti
             status = "won" if won else "lost"
             pl = bet["amount"] if won else -bet["amount"]
 
+            # Parlay legs: mark won/lost but DO NOT pay out here.
+            # Payout is handled at EOD via multiplier in job_post_standings.
+            is_parlay_leg = bool(bet.get("parlay_id", ""))
+
             row_num = _bet_rows.get(bet["bet_id"])
             if row_num:
                 ws.update_cell(row_num, 7, status)
-                ws.update_cell(row_num, 8, payout)
+                ws.update_cell(row_num, 8, 0 if is_parlay_leg else payout)
             bet["status"] = status
-            bet["payout"] = payout
+            bet["payout"] = 0 if is_parlay_leg else payout
 
-            if won:
+            if won and not is_parlay_leg:
                 async with get_user_lock(bet["user_id"]):
                     user = cache["users"].get(bet["user_id"])
                     if user:
@@ -459,6 +565,37 @@ async def void_all_bets_for_match(match_id: str, notify_fn=None):
         if notify_fn:
             await notify_fn(f"⚠️ Failed to void bets for match {match_id}: {e}")
         raise
+
+async def void_parlay_bets(parlay_id: str, user_id: int, notify_fn=None) -> int:
+    """Void all open bets for a parlay and refund the stake. Returns count voided."""
+    parlay_bets = [b for b in cache["bets"] if b.get("parlay_id") == parlay_id and b["status"] == "open"]
+    if not parlay_bets:
+        return 0
+
+    try:
+        ws = get_sheet(SHEET_BETS)
+        for bet in parlay_bets:
+            row_num = _bet_rows.get(bet["bet_id"])
+            if row_num:
+                ws.update_cell(row_num, 7, "void")
+            bet["status"] = "void"
+
+        # Refund total stake (all legs combined)
+        total_stake = sum(b["amount"] for b in parlay_bets)
+        async with get_user_lock(user_id):
+            user = cache["users"].get(user_id)
+            if user:
+                new_credits = user["credits"] + total_stake
+                await update_user_credits(user_id, new_credits, notify_fn)
+                await append_ledger(user_id, "refund", total_stake, new_credits, f"Cancelled parlay {parlay_id}", notify_fn)
+
+        return len(parlay_bets)
+    except Exception as e:
+        logger.error(f"Failed to void parlay {parlay_id}: {e}")
+        if notify_fn:
+            await notify_fn(f"⚠️ Failed to void parlay {parlay_id}: {e}")
+        raise
+
 
 # ── Ledger operations ────────────────────────────────────────────────────────
 async def append_ledger(user_id: int, type_: str, amount: int, balance_after: int, notes: str, notify_fn=None):

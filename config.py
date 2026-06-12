@@ -222,6 +222,9 @@ STATUS_FINISHED = "FINISHED"
 STATUS_CANCELLED = "CANCELLED"
 STATUS_POSTPONED = "POSTPONED"
 
+# Parlay multipliers by number of legs
+PARLAY_MULTIPLIERS = {2: 2.5, 3: 5.0, 4: 10.0}
+
 # Bet status values
 BET_OPEN = "open"
 BET_WON = "won"

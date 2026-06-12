@@ -15,7 +15,7 @@ from config import (
     TEAM_ALIASES, FUZZY_THRESHOLD, TEAM_DISPLAY,
     RESULT_OUTCOMES, OU_OUTCOMES, ALL_OUTCOMES,
     SESSION_EXPIRY, SGT, UTC,
-    DAILY_CREDITS, BET_LOCK_BUFFER
+    DAILY_CREDITS, BET_LOCK_BUFFER, PARLAY_MULTIPLIERS
 )
 import sheet
 import scheduler as sched
@@ -57,6 +57,18 @@ def is_silent_hours() -> bool:
     start = now_sgt.replace(hour=0, minute=0, second=0, microsecond=0)
     end = now_sgt.replace(hour=7, minute=30, second=0, microsecond=0)
     return start <= now_sgt < end
+
+
+async def send_confirmation(update, message: str):
+    """Send confirmation — DM during silent hours, group reply otherwise."""
+    user = update.effective_user
+    if is_silent_hours():
+        try:
+            await application.bot.send_message(chat_id=user.id, text=message)
+            return
+        except Exception:
+            pass
+    await update.message.reply_text(message)
 
 
 def is_group_message(update: Update) -> bool:
@@ -309,8 +321,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 Degen — WC Kings 2026\n\n"
         "/matches — Today's matches + kickoff times\n"
         "/bet [team] [win|loss|draw|over|under] [amount] — Place a bet\n"
+        "/parlay [amount], [team] [win|draw|loss], ... — Place a parlay\n"
         "/mybets — Your open bets\n"
         "/cancel — Cancel an open bet\n"
+        "/cancelparlay — Cancel an active parlay\n"
         "/balance — Your current credits\n"
         "/leaderboard — Full standings\n"
         "/help — This message\n\n"
@@ -781,6 +795,306 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+# ── /parlay ───────────────────────────────────────────────────────────────────
+async def cmd_parlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_group_message(update):
+        await update.message.reply_text("Please use this command in the group.")
+        return
+
+    user = update.effective_user
+    user_data = await ensure_registered(update)
+
+    # Parse: /parlay 50, mexico win, brazil draw, germany win
+    raw = " ".join(context.args)
+    if not raw:
+        await update.message.reply_text(
+            "Usage: /parlay [amount], [team] [win|draw|loss], ...\n"
+            "Example: /parlay 50, mexico win, brazil draw\n\n"
+            "Multipliers: 2 legs = 2.5x · 3 legs = 5x · 4 legs = 10x\n"
+            "Result/draw bets only. All legs must win."
+        )
+        return
+
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if len(parts) < 3:
+        await update.message.reply_text(
+            "Need at least: amount + 2 legs.\n"
+            "Example: /parlay 50, mexico win, brazil draw"
+        )
+        return
+
+    # First part is amount
+    try:
+        amount = int(float(parts[0].lower().replace("c", "")))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("First value must be the stake amount. Example: /parlay 50, mexico win, brazil draw")
+        return
+
+    leg_parts = parts[1:]
+    if len(leg_parts) < 2:
+        await update.message.reply_text("Need at least 2 legs.")
+        return
+    if len(leg_parts) > 4:
+        await update.message.reply_text("Maximum 4 legs per parlay.")
+        return
+
+    if user_data["credits"] < amount:
+        await update.message.reply_text(f"Insufficient credits. Balance: {user_data['credits']}c")
+        return
+
+    # Validate all legs before placing anything
+    validated_legs = []
+    for leg_str in leg_parts:
+        tokens = leg_str.strip().split()
+        if len(tokens) < 2:
+            await update.message.reply_text(f"Invalid leg: '{leg_str}'. Format: [team] [win|draw|loss]")
+            return
+
+        team_input = tokens[0]
+        outcome_input = tokens[1].lower()
+
+        if outcome_input not in RESULT_OUTCOMES:
+            await update.message.reply_text(
+                f"'{outcome_input}' is not valid for parlays. Use: win, draw, loss (no over/under)."
+            )
+            return
+
+        team_name, is_ambiguous = resolve_team(team_input)
+        if is_ambiguous:
+            await update.message.reply_text(f"'{team_input}' is ambiguous. Be more specific.")
+            return
+        if not team_name:
+            await update.message.reply_text(f"Couldn't find team '{team_input}'. Check /matches.")
+            return
+
+        match = find_match_for_team(team_name)
+        if not match:
+            await update.message.reply_text(
+                f"No open match for {team_name}, or betting is already closed."
+            )
+            return
+
+        internal_outcome = map_outcome_to_result(outcome_input, match, team_name)
+        if not internal_outcome:
+            await update.message.reply_text(f"Invalid outcome for {team_name}.")
+            return
+
+        validated_legs.append({
+            "team_name": team_name,
+            "match": match,
+            "outcome": internal_outcome,
+            "outcome_display": outcome_input.capitalize()
+        })
+
+    # Check no duplicate matches
+    match_ids_in_parlay = [l["match"]["match_id"] for l in validated_legs]
+    if len(match_ids_in_parlay) != len(set(match_ids_in_parlay)):
+        await update.message.reply_text("Duplicate match in parlay. Each leg must be a different match.")
+        return
+
+    # Check all legs are on the same CT match day
+    CT = pytz.timezone("America/Chicago")
+    leg_dates = set()
+    for leg in validated_legs:
+        try:
+            kickoff_utc = datetime.strptime(leg["match"]["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+            leg_dates.add(kickoff_utc.astimezone(CT).strftime("%Y-%m-%d"))
+        except Exception:
+            pass
+    if len(leg_dates) > 1:
+        await update.message.reply_text("All parlay legs must be on the same match day. These legs span different days.")
+        return
+
+    multiplier = PARLAY_MULTIPLIERS.get(len(validated_legs))
+    potential_return = int(amount * multiplier)
+
+    # Place all legs atomically — generate one parlay_id
+    parlay_id = f"p_{user.id}_{datetime.now(UTC).strftime('%H%M%S%f')}"
+    placed_bet_ids = []
+
+    try:
+        for leg in validated_legs:
+            bet_id = await sheet.place_bet(
+                user_id=user.id,
+                match_id=leg["match"]["match_id"],
+                market="result",
+                outcome=leg["outcome"],
+                amount=amount,
+                notify_fn=dm_admin,
+                parlay_id=parlay_id
+            )
+            placed_bet_ids.append(bet_id)
+
+        new_balance = sheet.cache["users"][user.id]["credits"]
+        lines = [f"🎰 Parlay locked! ({len(validated_legs)} legs · {multiplier}x)\n"]
+        for i, leg in enumerate(validated_legs, 1):
+            home = format_team(leg["match"]["home"])
+            away = format_team(leg["match"]["away"])
+            lines.append(f"{i}. {home} vs {away} — {leg['outcome_display']}")
+        lines.append(f"\nStake: {amount}c · Win all → {potential_return}c back")
+        lines.append(f"Balance: {new_balance}c")
+
+        confirm_msg = "\n".join(lines)
+        if is_silent_hours():
+            try:
+                await application.bot.send_message(chat_id=user.id, text=confirm_msg)
+            except Exception:
+                await update.message.reply_text(confirm_msg)
+        else:
+            await update.message.reply_text(confirm_msg)
+
+    except ValueError as e:
+        # Rollback any legs already placed
+        for bid in placed_bet_ids:
+            try:
+                await sheet.cancel_bet(bid, user.id)
+            except Exception:
+                pass
+        await update.message.reply_text(str(e))
+    except Exception as e:
+        # Rollback any legs already placed
+        for bid in placed_bet_ids:
+            try:
+                await sheet.cancel_bet(bid, user.id)
+            except Exception:
+                pass
+        logger.error(f"Parlay placement failed for {user.id}: {e}")
+        await update.message.reply_text("Something went wrong placing your parlay. All legs rolled back.")
+        await dm_admin(f"⚠️ Parlay placement failed for user {user.id}: {e}")
+
+
+# ── /cancelparlay ─────────────────────────────────────────────────────────────
+async def cmd_cancelparlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_registered(update)
+    user_id = update.effective_user.id
+    args = context.args
+
+    active_parlays = sheet.get_user_active_parlays(user_id)
+    if not active_parlays:
+        await update.message.reply_text("You have no active parlays.")
+        return
+
+    # /cancelparlay [number] — cancel specific parlay from session
+    if args:
+        session = _sessions.get(user_id)
+        if not session or session_expired(session) or session.get("action") != "cancelparlay":
+            await update.message.reply_text("Run /cancelparlay first to see your parlays.")
+            return
+        clear_session(user_id)
+
+        try:
+            index = int(args[0]) - 1
+            parlays = session["data"]["parlays"]
+            if index < 0 or index >= len(parlays):
+                await update.message.reply_text("Invalid number. Run /cancelparlay again.")
+                return
+        except ValueError:
+            await update.message.reply_text("Usage: /cancelparlay [number]")
+            return
+
+        parlay_id = parlays[index]["parlay_id"]
+        legs = parlays[index]["legs"]
+
+        # Check all legs still pre-kickoff
+        for leg in legs:
+            match = await sheet.get_match_by_id(leg["match_id"])
+            if match:
+                try:
+                    kickoff = datetime.strptime(match["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                    lock_time = kickoff + timedelta(seconds=BET_LOCK_BUFFER)
+                    if datetime.now(UTC) >= lock_time:
+                        home = format_team(match["home"])
+                        away = format_team(match["away"])
+                        await update.message.reply_text(
+                            f"Cannot cancel — {home} vs {away} has already kicked off."
+                        )
+                        return
+                except Exception:
+                    pass
+
+        try:
+            count = await sheet.void_parlay_bets(parlay_id, user_id, notify_fn=dm_admin)
+            new_balance = sheet.cache["users"][user_id]["credits"]
+            stake = legs[0]["amount"]
+            await update.message.reply_text(
+                f"✅ Parlay cancelled.\n"
+                f"{count} leg(s) voided · {stake}c refunded.\n"
+                f"Balance: {new_balance}c"
+            )
+        except Exception as e:
+            await update.message.reply_text("Failed to cancel parlay. Please try again.")
+            await dm_admin(f"⚠️ Cancel parlay failed for user {user_id}: {e}")
+        return
+
+    # Only 1 parlay — cancel directly without listing
+    if len(active_parlays) == 1:
+        parlay_id = active_parlays[0]
+        legs = sheet.get_parlay_bets(parlay_id)
+
+        for leg in legs:
+            match = await sheet.get_match_by_id(leg["match_id"])
+            if match:
+                try:
+                    kickoff = datetime.strptime(match["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                    lock_time = kickoff + timedelta(seconds=BET_LOCK_BUFFER)
+                    if datetime.now(UTC) >= lock_time:
+                        home = format_team(match["home"])
+                        away = format_team(match["away"])
+                        await update.message.reply_text(
+                            f"Cannot cancel — {home} vs {away} has already kicked off."
+                        )
+                        return
+                except Exception:
+                    pass
+
+        try:
+            count = await sheet.void_parlay_bets(parlay_id, user_id, notify_fn=dm_admin)
+            new_balance = sheet.cache["users"][user_id]["credits"]
+            stake = legs[0]["amount"] if legs else 0
+            await update.message.reply_text(
+                f"✅ Parlay cancelled.\n"
+                f"{count} leg(s) voided · {stake}c refunded.\n"
+                f"Balance: {new_balance}c"
+            )
+        except Exception as e:
+            await update.message.reply_text("Failed to cancel parlay. Please try again.")
+            await dm_admin(f"⚠️ Cancel parlay failed for user {user_id}: {e}")
+        return
+
+    # Multiple parlays — list them
+    lines = ["🎰 Your active parlays:\n"]
+    parlay_list = []
+    for i, pid in enumerate(active_parlays, 1):
+        legs = sheet.get_parlay_bets(pid)
+        if not legs:
+            continue
+        stake = legs[0]["amount"]
+        multiplier = PARLAY_MULTIPLIERS.get(len(legs), "?")
+        leg_lines = []
+        for leg in legs:
+            match = await sheet.get_match_by_id(leg["match_id"])
+            if match:
+                home = format_team(match["home"])
+                away = format_team(match["away"])
+                outcome_label = format_outcome_label(leg["outcome"], match)
+                leg_lines.append(f"{home} vs {away} — {outcome_label}")
+        lines.append(f"{i}. {stake}c · {multiplier}x")
+        for ll in leg_lines:
+            lines.append(f"   {ll}")
+        parlay_list.append({"parlay_id": pid, "legs": legs})
+
+    lines.append("\nReply /cancelparlay [number] to cancel.")
+
+    _sessions[user_id] = {
+        "action": "cancelparlay",
+        "data": {"parlays": parlay_list},
+        "expires": datetime.now(UTC) + timedelta(seconds=SESSION_EXPIRY)
+    }
+    await update.message.reply_text("\n".join(lines))
+
+
 # ── Admin: /admin_poll ────────────────────────────────────────────────────────
 async def cmd_admin_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
@@ -938,6 +1252,7 @@ async def cmd_admin_eod_push(update: Update, context: ContextTypes.DEFAULT_TYPE)
         match_ids = session["data"]["match_ids"]
         del _admin_pending[ADMIN_TELEGRAM_ID]
         try:
+            sheet.cache["eod_date"] = None  # allow manual push to bypass guard
             await sched.job_post_standings(match_ids)
             await update.message.reply_text("✅ End of day message pushed to group.")
         except Exception as e:
@@ -1904,8 +2219,21 @@ async def cmd_confirm_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             updated_match = await sheet.get_match_by_id(match["match_id"])
             result_msg = sched.format_result_message(updated_match, settlements)
 
+            # Check parlay completions
+            parlay_wins = await sched.check_parlay_completions(match["match_id"])
+            if parlay_wins:
+                result_msg += "\n"
+                for pid, p in parlay_wins:
+                    name = sched._get_user_name(p["user_id"])
+                    legs_str = "\n".join(f"• {label} ✅" for label in p["leg_labels"])
+                    result_msg += f"\n🎰 {name} hit a {p['legs']}-leg parlay!\n{legs_str}\n{p['stake']}c → {p['payout']}c 🔥"
+
             if not sched.is_silent_hours():
                 await sched.send_group(result_msg)
+            elif parlay_wins:
+                if "pending_parlay_wins" not in sheet.cache:
+                    sheet.cache["pending_parlay_wins"] = []
+                sheet.cache["pending_parlay_wins"].extend(parlay_wins)
 
             await update.message.reply_text(f"✅ Done. {len(settlements)} bets settled.")
             await sched.check_all_matches_done()
@@ -2017,6 +2345,8 @@ def setup_handlers():
     application.add_handler(CommandHandler("mybets", cmd_mybets))
     application.add_handler(CommandHandler("bet", cmd_bet))
     application.add_handler(CommandHandler("cancel", cmd_cancelbet))
+    application.add_handler(CommandHandler("parlay", cmd_parlay))
+    application.add_handler(CommandHandler("cancelparlay", cmd_cancelparlay))
 
     # Admin commands
     application.add_handler(CommandHandler("admin_announce", cmd_admin_announce))
@@ -2052,8 +2382,10 @@ async def post_init(app):
     await app.bot.set_my_commands([
         ("matches", "Today's matches + kickoff times"),
         ("bet", "Place a bet"),
+        ("parlay", "Place a parlay bet"),
         ("mybets", "Your open bets"),
         ("cancel", "Cancel an open bet"),
+        ("cancelparlay", "Cancel an active parlay"),
         ("balance", "Your current credits"),
         ("predict", "Free event prediction"),
         ("groups", "Group stage standings"),
