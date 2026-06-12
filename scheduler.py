@@ -314,8 +314,15 @@ async def job_poll_result(match_id: str, attempt: int = 1):
         await dm_admin(f"⚠️ Poll result job failed for match {match_id}: {e}")
 
 
+def trigger_poll(match_id: str):
+    """Manually trigger an immediate poll for a match (admin use)."""
+    _schedule_poll(match_id, delay_seconds=0, attempt=99)
+    logger.info(f"Admin triggered poll for match {match_id}")
+
+
 def _schedule_poll(match_id: str, delay_seconds: int, attempt: int):
-    run_time = datetime.now(UTC) + timedelta(seconds=delay_seconds)
+    # Add 30s offset to avoid colliding with cache refresh jobs at :00
+    run_time = datetime.now(UTC) + timedelta(seconds=delay_seconds + 30)
     job_id = f"poll_{match_id}_attempt_{attempt}"
     scheduler.add_job(
         job_poll_result,
