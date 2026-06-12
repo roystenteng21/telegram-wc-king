@@ -406,7 +406,7 @@ def register_static_jobs():
     # Cache refresh — every 5 minutes
     scheduler.add_job(
         job_refresh_cache,
-        trigger=CronTrigger(minute="*/5"),
+        trigger=CronTrigger(minute="*/10"),
         id="cache_refresh",
         replace_existing=True
     )
@@ -483,7 +483,7 @@ async def on_startup(notify_fn=None):
             tomorrow_matches = api.fetch_matches_for_date(tomorrow)
             for m in matches + tomorrow_matches:
                 await sheet.upsert_match(m, notify_fn=dm_admin)
-            await sheet.refresh_cache(notify_fn=dm_admin)
+            # No second refresh needed — upsert_match updates cache directly
         except RuntimeError as e:
             await dm_admin(f"⚠️ Startup: failed to fetch today's fixtures: {e}\nUse /admin_refresh to retry.")
 

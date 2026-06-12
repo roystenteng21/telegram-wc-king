@@ -25,6 +25,12 @@ cache = {
     "last_refresh": None
 }
 
+# Row index cache — tracks sheet row numbers to avoid re-reading
+# row numbers are 1-indexed sheet rows (header = row 1, first data = row 2)
+_user_rows: dict[int, int] = {}       # user_id -> sheet row
+_match_rows: dict[str, int] = {}      # match_id -> sheet row
+_bet_rows: dict[str, int] = {}        # bet_id -> sheet row
+
 # Per-user asyncio locks to prevent race conditions on credit writes
 _user_locks: dict[int, asyncio.Lock] = {}
 
@@ -57,7 +63,7 @@ async def with_retry(fn, *args, retries=3, delay=2, **kwargs):
 
 # ── Cache refresh ────────────────────────────────────────────────────────────
 async def refresh_cache(notify_fn=None):
-    """Rebuild in-memory cache from sheet. notify_fn is called with error message on failure."""
+    """Rebuild in-memory cache from sheet. Also rebuilds row index cache."""
     try:
         client = get_client()
         spreadsheet = client.open_by_key(SPREADSHEET_ID)
@@ -65,23 +71,32 @@ async def refresh_cache(notify_fn=None):
         # Users
         users_ws = spreadsheet.worksheet(SHEET_USERS)
         users_data = users_ws.get_all_records()
-        cache["users"] = {
-            int(row["user_id"]): {
+        cache["users"] = {}
+        _user_rows.clear()
+        for i, row in enumerate(users_data):
+            if not row.get("user_id"):
+                continue
+            uid = int(row["user_id"])
+            cache["users"][uid] = {
                 "username": row["username"],
                 "first_name": row["first_name"],
                 "credits": int(row["credits"]),
                 "joined_date": row["joined_date"],
                 "is_admin": str(row["is_admin"]).lower() == "true"
             }
-            for row in users_data if row.get("user_id")
-        }
+            _user_rows[uid] = i + 2  # +2 for header row + 0-index
 
         # Matches
         matches_ws = spreadsheet.worksheet(SHEET_MATCHES)
         matches_data = matches_ws.get_all_records()
-        cache["matches"] = {
-            str(row["match_id"]): {
-                "match_id": str(row["match_id"]),
+        cache["matches"] = {}
+        _match_rows.clear()
+        for i, row in enumerate(matches_data):
+            if not row.get("match_id"):
+                continue
+            mid = str(row["match_id"])
+            cache["matches"][mid] = {
+                "match_id": mid,
                 "home": row["home"],
                 "away": row["away"],
                 "kickoff_utc": row["kickoff_utc"],
@@ -93,14 +108,17 @@ async def refresh_cache(notify_fn=None):
                 "matchday": row["matchday"],
                 "round": row["round"]
             }
-            for row in matches_data if row.get("match_id")
-        }
+            _match_rows[mid] = i + 2
 
         # Bets
         bets_ws = spreadsheet.worksheet(SHEET_BETS)
         bets_data = bets_ws.get_all_records()
-        cache["bets"] = [
-            {
+        cache["bets"] = []
+        _bet_rows.clear()
+        for i, row in enumerate(bets_data):
+            if not row.get("bet_id"):
+                continue
+            cache["bets"].append({
                 "bet_id": row["bet_id"],
                 "user_id": int(row["user_id"]),
                 "match_id": str(row["match_id"]),
@@ -110,9 +128,8 @@ async def refresh_cache(notify_fn=None):
                 "status": row["status"],
                 "payout": row["payout"],
                 "placed_at": row["placed_at"]
-            }
-            for row in bets_data if row.get("bet_id")
-        ]
+            })
+            _bet_rows[row["bet_id"]] = i + 2
 
         cache["last_refresh"] = datetime.now(UTC)
         logger.info("Cache refreshed successfully")
@@ -135,7 +152,10 @@ async def register_user(user_id: int, username: str, first_name: str, is_admin: 
     row = [user_id, username or "", first_name or "", STARTING_CREDITS, joined_date, str(is_admin)]
 
     try:
-        await with_retry(get_sheet(SHEET_USERS).append_row, row)
+        ws = get_sheet(SHEET_USERS)
+        await with_retry(ws.append_row, row)
+        # New row is header + existing users + 1
+        new_row_num = len(cache["users"]) + 2
         user = {
             "username": username or "",
             "first_name": first_name or "",
@@ -144,6 +164,7 @@ async def register_user(user_id: int, username: str, first_name: str, is_admin: 
             "is_admin": is_admin
         }
         cache["users"][user_id] = user
+        _user_rows[user_id] = new_row_num
         logger.info(f"Registered user {user_id} ({first_name})")
         return user
     except Exception as e:
@@ -153,17 +174,15 @@ async def register_user(user_id: int, username: str, first_name: str, is_admin: 
         raise
 
 async def update_user_credits(user_id: int, new_credits: int, notify_fn=None):
-    """Update credits in sheet and cache. Always >= 0."""
+    """Update credits in sheet and cache using cached row number."""
     new_credits = max(0, new_credits)
     try:
+        row_num = _user_rows.get(user_id)
+        if not row_num:
+            raise ValueError(f"User {user_id} row not in cache — run refresh")
         ws = get_sheet(SHEET_USERS)
-        records = ws.get_all_records()
-        for i, row in enumerate(records):
-            if int(row["user_id"]) == user_id:
-                ws.update_cell(i + 2, 4, new_credits)  # col 4 = credits
-                cache["users"][user_id]["credits"] = new_credits
-                return
-        raise ValueError(f"User {user_id} not found in sheet")
+        ws.update_cell(row_num, 4, new_credits)  # col 4 = credits
+        cache["users"][user_id]["credits"] = new_credits
     except Exception as e:
         logger.error(f"Failed to update credits for {user_id}: {e}")
         if notify_fn:
@@ -171,22 +190,21 @@ async def update_user_credits(user_id: int, new_credits: int, notify_fn=None):
         raise
 
 async def refresh_display_name(user_id: int, username: str, first_name: str, notify_fn=None):
-    """Update username and first_name on every command."""
+    """Update username and first_name if changed, using cached row number."""
     try:
         if user_id not in cache["users"]:
             return
         cached = cache["users"][user_id]
         if cached["username"] == (username or "") and cached["first_name"] == (first_name or ""):
             return  # no change, skip write
+        row_num = _user_rows.get(user_id)
+        if not row_num:
+            return
         ws = get_sheet(SHEET_USERS)
-        records = ws.get_all_records()
-        for i, row in enumerate(records):
-            if int(row["user_id"]) == user_id:
-                ws.update_cell(i + 2, 2, username or "")
-                ws.update_cell(i + 2, 3, first_name or "")
-                cache["users"][user_id]["username"] = username or ""
-                cache["users"][user_id]["first_name"] = first_name or ""
-                return
+        ws.update_cell(row_num, 2, username or "")
+        ws.update_cell(row_num, 3, first_name or "")
+        cache["users"][user_id]["username"] = username or ""
+        cache["users"][user_id]["first_name"] = first_name or ""
     except Exception as e:
         logger.error(f"Failed to refresh display name for {user_id}: {e}")
         if notify_fn:
@@ -194,7 +212,6 @@ async def refresh_display_name(user_id: int, username: str, first_name: str, not
 
 # ── Match operations ─────────────────────────────────────────────────────────
 async def get_matches_for_date(date_str: str) -> list:
-    """Return matches for a given date (YYYY-MM-DD) in UTC."""
     return [
         m for m in cache["matches"].values()
         if m["kickoff_utc"].startswith(date_str)
@@ -204,11 +221,9 @@ async def get_match_by_id(match_id: str) -> dict | None:
     return cache["matches"].get(str(match_id))
 
 async def upsert_match(match: dict, notify_fn=None):
-    """Insert or update a match in sheet and cache."""
+    """Insert or update a match in sheet and cache using cached row number."""
     match_id = str(match["match_id"])
     try:
-        ws = get_sheet(SHEET_MATCHES)
-        records = ws.get_all_records()
         row = [
             match["match_id"], match["home"], match["away"],
             match["kickoff_utc"], match["status"],
@@ -216,13 +231,14 @@ async def upsert_match(match: dict, notify_fn=None):
             match.get("result", ""), match.get("ou_result", ""),
             match.get("matchday", ""), match.get("round", "")
         ]
-        for i, r in enumerate(records):
-            if str(r["match_id"]) == match_id:
-                ws.update(f"A{i+2}:K{i+2}", [row])
-                cache["matches"][match_id] = match
-                return
-        ws.append_row(row)
-        cache["matches"][match_id] = match
+        ws = get_sheet(SHEET_MATCHES)
+        if match_id in _match_rows:
+            row_num = _match_rows[match_id]
+            ws.update(f"A{row_num}:K{row_num}", [row])
+        else:
+            await with_retry(ws.append_row, row)
+            _match_rows[match_id] = len(cache["matches"]) + 2
+        cache["matches"][match_id] = {**match, "match_id": match_id}
     except Exception as e:
         logger.error(f"Failed to upsert match {match_id}: {e}")
         if notify_fn:
@@ -230,10 +246,9 @@ async def upsert_match(match: dict, notify_fn=None):
         raise
 
 async def update_match_result(match_id: str, home_score: int, away_score: int, notify_fn=None):
-    """Set final score, result and ou_result."""
+    """Set final score and result using cached row number."""
     match_id = str(match_id)
     try:
-        # Derive result
         if home_score > away_score:
             result = "home"
         elif away_score > home_score:
@@ -244,21 +259,20 @@ async def update_match_result(match_id: str, home_score: int, away_score: int, n
         total_goals = home_score + away_score
         ou_result = "over" if total_goals > 2 else "under"
 
+        row_num = _match_rows.get(match_id)
+        if not row_num:
+            raise ValueError(f"Match {match_id} row not in cache")
         ws = get_sheet(SHEET_MATCHES)
-        records = ws.get_all_records()
-        for i, row in enumerate(records):
-            if str(row["match_id"]) == match_id:
-                ws.update(f"F{i+2}:J{i+2}", [[home_score, away_score, result, ou_result, "FINISHED"]])
-                if match_id in cache["matches"]:
-                    cache["matches"][match_id].update({
-                        "home_score": home_score,
-                        "away_score": away_score,
-                        "result": result,
-                        "ou_result": ou_result,
-                        "status": "FINISHED"
-                    })
-                return result, ou_result
-        raise ValueError(f"Match {match_id} not found")
+        ws.update(f"F{row_num}:J{row_num}", [[home_score, away_score, result, ou_result, "FINISHED"]])
+        if match_id in cache["matches"]:
+            cache["matches"][match_id].update({
+                "home_score": home_score,
+                "away_score": away_score,
+                "result": result,
+                "ou_result": ou_result,
+                "status": "FINISHED"
+            })
+        return result, ou_result
     except Exception as e:
         logger.error(f"Failed to update match result {match_id}: {e}")
         if notify_fn:
@@ -280,15 +294,15 @@ async def place_bet(user_id: int, match_id: str, market: str, outcome: str, amou
         row = [bet_id, user_id, match_id, market, outcome, amount, "open", "", placed_at]
 
         try:
-            await with_retry(get_sheet(SHEET_BETS).append_row, row)
+            ws = get_sheet(SHEET_BETS)
+            await with_retry(ws.append_row, row)
+            new_row_num = len(cache["bets"]) + 2
+            _bet_rows[bet_id] = new_row_num
 
             new_credits = user["credits"] - amount
             await update_user_credits(user_id, new_credits, notify_fn)
-
-            # Write ledger entry
             await append_ledger(user_id, "bet", -amount, new_credits, f"Bet on {match_id} {market} {outcome}", notify_fn)
 
-            # Update cache
             cache["bets"].append({
                 "bet_id": bet_id, "user_id": user_id, "match_id": match_id,
                 "market": market, "outcome": outcome, "amount": amount,
@@ -309,7 +323,7 @@ async def get_bets_for_match(match_id: str) -> list:
     return [b for b in cache["bets"] if b["match_id"] == str(match_id)]
 
 async def cancel_bet(bet_id: str, user_id: int, notify_fn=None):
-    """Void bet and refund credits."""
+    """Void bet and refund credits using cached row number."""
     async with get_user_lock(user_id):
         bet = next((b for b in cache["bets"] if b["bet_id"] == bet_id), None)
         if not bet:
@@ -318,13 +332,12 @@ async def cancel_bet(bet_id: str, user_id: int, notify_fn=None):
             raise ValueError("Bet is not open")
 
         try:
+            row_num = _bet_rows.get(bet_id)
+            if not row_num:
+                raise ValueError(f"Bet {bet_id} row not in cache")
             ws = get_sheet(SHEET_BETS)
-            records = ws.get_all_records()
-            for i, row in enumerate(records):
-                if row["bet_id"] == bet_id:
-                    ws.update_cell(i + 2, 7, "void")
-                    bet["status"] = "void"
-                    break
+            ws.update_cell(row_num, 7, "void")
+            bet["status"] = "void"
 
             user = cache["users"][user_id]
             new_credits = user["credits"] + bet["amount"]
@@ -338,7 +351,7 @@ async def cancel_bet(bet_id: str, user_id: int, notify_fn=None):
             raise
 
 async def settle_bets_for_match(match_id: str, result: str, ou_result: str, notify_fn=None) -> list:
-    """Settle all open bets for a match. Returns list of settlement dicts for display."""
+    """Settle all open bets for a match using cached row numbers."""
     match_id = str(match_id)
     settlements = []
 
@@ -348,7 +361,6 @@ async def settle_bets_for_match(match_id: str, result: str, ou_result: str, noti
 
     try:
         ws = get_sheet(SHEET_BETS)
-        records = ws.get_all_records()
 
         for bet in open_bets:
             won = False
@@ -361,16 +373,13 @@ async def settle_bets_for_match(match_id: str, result: str, ou_result: str, noti
             status = "won" if won else "lost"
             pl = bet["amount"] if won else -bet["amount"]
 
-            # Update sheet
-            for i, row in enumerate(records):
-                if row["bet_id"] == bet["bet_id"]:
-                    ws.update_cell(i + 2, 7, status)
-                    ws.update_cell(i + 2, 8, payout)
-                    bet["status"] = status
-                    bet["payout"] = payout
-                    break
+            row_num = _bet_rows.get(bet["bet_id"])
+            if row_num:
+                ws.update_cell(row_num, 7, status)
+                ws.update_cell(row_num, 8, payout)
+            bet["status"] = status
+            bet["payout"] = payout
 
-            # Update credits if won
             if won:
                 async with get_user_lock(bet["user_id"]):
                     user = cache["users"].get(bet["user_id"])
@@ -397,20 +406,18 @@ async def settle_bets_for_match(match_id: str, result: str, ou_result: str, noti
         raise
 
 async def void_all_bets_for_match(match_id: str, notify_fn=None):
-    """Void and refund all open bets for a match (postponement/cancellation)."""
+    """Void and refund all open bets for a match using cached row numbers."""
     match_id = str(match_id)
     open_bets = [b for b in cache["bets"] if b["match_id"] == match_id and b["status"] == "open"]
 
     try:
         ws = get_sheet(SHEET_BETS)
-        records = ws.get_all_records()
 
         for bet in open_bets:
-            for i, row in enumerate(records):
-                if row["bet_id"] == bet["bet_id"]:
-                    ws.update_cell(i + 2, 7, "void")
-                    bet["status"] = "void"
-                    break
+            row_num = _bet_rows.get(bet["bet_id"])
+            if row_num:
+                ws.update_cell(row_num, 7, "void")
+            bet["status"] = "void"
 
             async with get_user_lock(bet["user_id"]):
                 user = cache["users"].get(bet["user_id"])
@@ -441,19 +448,17 @@ async def append_ledger(user_id: int, type_: str, amount: int, balance_after: in
 
 # ── Daily credits ────────────────────────────────────────────────────────────
 async def add_daily_credits(daily_amount: int, notify_fn=None):
-    """Add daily credits to all users."""
+    """Add daily credits to all users using cached row numbers."""
     try:
         ws = get_sheet(SHEET_USERS)
-        records = ws.get_all_records()
-        for i, row in enumerate(records):
-            if not row.get("user_id"):
+        for user_id, user in cache["users"].items():
+            row_num = _user_rows.get(user_id)
+            if not row_num:
                 continue
-            uid = int(row["user_id"])
-            new_credits = int(row["credits"]) + daily_amount
-            ws.update_cell(i + 2, 4, new_credits)
-            if uid in cache["users"]:
-                cache["users"][uid]["credits"] = new_credits
-            await append_ledger(uid, "daily_credit", daily_amount, new_credits, "Daily top-up", notify_fn)
+            new_credits = user["credits"] + daily_amount
+            ws.update_cell(row_num, 4, new_credits)
+            cache["users"][user_id]["credits"] = new_credits
+            await append_ledger(user_id, "daily_credit", daily_amount, new_credits, "Daily top-up", notify_fn)
         logger.info("Daily credits added to all users")
     except Exception as e:
         logger.error(f"Failed to add daily credits: {e}")
@@ -463,7 +468,6 @@ async def add_daily_credits(daily_amount: int, notify_fn=None):
 
 # ── Standings ────────────────────────────────────────────────────────────────
 def get_standings() -> list:
-    """Return users sorted by credits descending."""
     return sorted(
         [{"user_id": uid, **data} for uid, data in cache["users"].items()],
         key=lambda x: x["credits"],
@@ -471,7 +475,6 @@ def get_standings() -> list:
     )
 
 def get_daily_pl(match_ids: list) -> dict:
-    """Calculate today's P&L per user from settled bets."""
     pl = {}
     for bet in cache["bets"]:
         if bet["match_id"] not in [str(m) for m in match_ids]:
