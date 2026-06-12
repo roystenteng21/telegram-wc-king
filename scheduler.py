@@ -51,9 +51,9 @@ async def dm_admin(message: str):
 
 
 # ── Group message ─────────────────────────────────────────────────────────────
-async def send_group(message: str):
+async def send_group(message: str, parse_mode: str = None):
     try:
-        await _bot.send_message(chat_id=_group_chat_id, text=message)
+        await _bot.send_message(chat_id=_group_chat_id, text=message, parse_mode=parse_mode)
     except Exception as e:
         logger.error(f"Failed to send group message: {e}")
         await dm_admin(f"⚠️ Failed to send group message: {e}")

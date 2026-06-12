@@ -1562,14 +1562,13 @@ async def cmd_admin_announce(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: /admin_announce [message]")
+        await update.message.reply_text("Usage: /admin_announce [message]\nUse \\n for line breaks, *text* for bold.")
         return
 
     message = " ".join(context.args)
-    # Replace literal \n with actual newlines
     message = message.replace("\\n", "\n")
 
-    await sched.send_group(message)
+    await sched.send_group(message, parse_mode="Markdown")
     await update.message.reply_text("✅ Announcement sent to group.")
 
 
