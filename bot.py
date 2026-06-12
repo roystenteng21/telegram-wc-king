@@ -702,6 +702,41 @@ async def cmd_admin_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = context.args
 
+    # Direct override: /admin_result [match_id] [home_score] [away_score]
+    if len(args) == 3:
+        try:
+            match_id = args[0]
+            home_score = int(args[1])
+            away_score = int(args[2])
+            match = await sheet.get_match_by_id(match_id)
+            if not match:
+                await update.message.reply_text(f"Match {match_id} not found in cache. Try /admin_refresh first.")
+                return
+            home = format_team(match["home"])
+            away = format_team(match["away"])
+            _admin_pending[ADMIN_TELEGRAM_ID] = {
+                "action": "result_confirm",
+                "data": {"match": match, "home_score": home_score, "away_score": away_score},
+                "expires": datetime.now(UTC) + timedelta(seconds=120)
+            }
+            total = home_score + away_score
+            if home_score > away_score:
+                result_label = f"{home} Win"
+            elif away_score > home_score:
+                result_label = f"{away} Win"
+            else:
+                result_label = "Draw"
+            ou_label = "Over 2.5" if total > 2 else "Under 2.5"
+            await update.message.reply_text(
+                f"Confirm: {home} vs {away} — {home_score}–{away_score}\n"
+                f"Result: {result_label} · {ou_label}\n\n"
+                f"Settle all bets? /confirm_admin or /cancel_admin"
+            )
+            return
+        except (ValueError, IndexError):
+            await update.message.reply_text("Usage: /admin_result [match_id] [home_score] [away_score]")
+            return
+
     # Step 1: /admin_result — list pending matches
     if not args:
         today = datetime.now(UTC).strftime("%Y-%m-%d")
