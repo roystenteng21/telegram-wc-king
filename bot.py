@@ -321,28 +321,66 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
     all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
 
-    # Filter by CT date
-    upcoming = []
+    # Filter by CT date — include all statuses
+    day_matches = []
     for m in all_matches:
-        if m["status"] not in ("SCHEDULED", "TIMED"):
-            continue
         try:
             kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
             if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct:
-                upcoming.append(m)
+                day_matches.append(m)
         except Exception:
             continue
 
-    if not upcoming:
-        await update.message.reply_text("No upcoming matches today.")
+    if not day_matches:
+        await update.message.reply_text("No matches today.")
         return
 
-    lines = ["📅 Today's matches:\n"]
-    for m in sorted(upcoming, key=lambda x: x["kickoff_utc"]):
+    lines = ["📅 Today's Matches\n"]
+    for m in sorted(day_matches, key=lambda x: x["kickoff_utc"]):
         kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
         kickoff_sgt = kickoff_utc_dt.astimezone(SGT)
         time_str = kickoff_sgt.strftime("%I:%M %p SGT").lstrip("0")
-        lines.append(f"  {format_match_teams(m['home'], m['away'])} — {time_str}")
+
+        status = m.get("status", "")
+        if status == "FINISHED":
+            hs = m.get("home_score", "")
+            as_ = m.get("away_score", "")
+            status_str = f"FINISHED • {hs}-{as_}"
+        elif status in ("SCHEDULED", "TIMED"):
+            now = datetime.now(UTC)
+            diff = kickoff_utc_dt - now
+            mins = int(diff.total_seconds() // 60)
+            if mins > 60:
+                hrs = mins // 60
+                status_str = f"Kickoff in {hrs}h"
+            elif mins > 0:
+                status_str = f"Kickoff in {mins}m"
+            else:
+                status_str = "Starting soon"
+        else:
+            status_str = status
+
+        lines.append(f"{format_match_teams(m['home'], m['away'])}")
+        lines.append(f"🕙 {time_str} • {status_str}")
+
+        # Bets for this match
+        match_bets = await sheet.get_bets_for_match(m["match_id"])
+        open_or_settled = [b for b in match_bets if b["status"] in ("open", "won", "lost")]
+        if open_or_settled:
+            lines.append("Bets:")
+            for b in open_or_settled:
+                user = sheet.cache["users"].get(b["user_id"])
+                name = truncate(user.get("first_name") or user.get("username") or "?") if user else "?"
+                outcome_label = format_outcome_label(b["outcome"], m)
+                if b["status"] == "won":
+                    icon = " ✅"
+                elif b["status"] == "lost":
+                    icon = " ❌"
+                else:
+                    icon = ""
+                lines.append(f"• {name} — {outcome_label} — {b['amount']}c{icon}")
+
+        lines.append("")  # blank line between matches
 
     await update.message.reply_text("\n".join(lines))
 
