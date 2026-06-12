@@ -220,21 +220,29 @@ def get_market_for_outcome(outcome: str) -> str:
 # ── Auto-lock group chat ID ───────────────────────────────────────────────────
 async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global _group_chat_id
+
+    # Admin announce — catch next DM message as announcement
+    if update.effective_chat.type == "private" and update.effective_user.id == ADMIN_TELEGRAM_ID:
+        session = _sessions.get(ADMIN_TELEGRAM_ID)
+        if session and not session_expired(session) and session.get("action") == "announce":
+            if update.message and update.message.text and not update.message.text.startswith("/"):
+                clear_session(ADMIN_TELEGRAM_ID)
+                await sched.send_group(update.message.text, parse_mode=None)
+                await update.message.reply_text("✅ Announcement sent to group.")
+                return
+
     if update.effective_chat.type in ("group", "supergroup"):
         if _group_chat_id is None:
             _group_chat_id = update.effective_chat.id
             sched.init(context.bot, _group_chat_id)
             logger.info(f"Group chat ID locked: {_group_chat_id}")
             await dm_admin(f"✅ Degen locked to group chat ID: {_group_chat_id}")
-            # Save to sheet for persistence across restarts
             try:
                 ws = sheet.get_sheet("users")
-                # Store in a reserved row or use a separate config mechanism
-                # For now just log it — admin should set GROUP_CHAT_ID env var after first run
             except Exception:
                 pass
         elif update.effective_chat.id != _group_chat_id:
-            return  # ignore other chats
+            return
 
 
 # ── Welcome new members ───────────────────────────────────────────────────────
@@ -1561,15 +1569,15 @@ async def cmd_admin_announce(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
 
-    if not context.args:
-        await update.message.reply_text("Usage: /admin_announce [message]\nUse \\n for line breaks, *text* for bold.")
-        return
-
-    message = " ".join(context.args)
-    message = message.replace("\\n", "\n")
-
-    await sched.send_group(message, parse_mode="Markdown")
-    await update.message.reply_text("✅ Announcement sent to group.")
+    _sessions[ADMIN_TELEGRAM_ID] = {
+        "action": "announce",
+        "expires": datetime.now(UTC) + timedelta(seconds=300)
+    }
+    await update.message.reply_text(
+        "📢 Send your announcement as the next message.\n"
+        "Formatting, line breaks and emojis will be preserved.\n\n"
+        "Send /cancel_admin to abort."
+    )
 
 
 # ── Admin: /admin_status ──────────────────────────────────────────────────────
