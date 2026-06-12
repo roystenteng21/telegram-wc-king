@@ -6,6 +6,7 @@ BOT_VERSION = "1.0"
 # Telegram
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_TELEGRAM_ID = int(os.environ["ADMIN_TELEGRAM_ID"])
+GROUP_CHAT_ID = int(os.environ.get("GROUP_CHAT_ID", 0)) or None
 
 # Google Sheets
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]

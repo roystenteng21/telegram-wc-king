@@ -11,6 +11,7 @@ from rapidfuzz import process, fuzz
 
 from config import (
     BOT_TOKEN, ADMIN_TELEGRAM_ID, BOT_VERSION,
+    GROUP_CHAT_ID as ENV_GROUP_CHAT_ID,
     TEAM_ALIASES, FUZZY_THRESHOLD, TEAM_DISPLAY,
     RESULT_OUTCOMES, OU_OUTCOMES, ALL_OUTCOMES,
     SESSION_EXPIRY, SGT, UTC,
@@ -1308,6 +1309,11 @@ def setup_handlers():
 
 async def post_init(app):
     """Runs after bot starts — triggers startup sequence."""
+    global _group_chat_id
+    if ENV_GROUP_CHAT_ID:
+        _group_chat_id = ENV_GROUP_CHAT_ID
+        sched.init(app.bot, _group_chat_id)
+        logger.info(f"Group chat ID set from env: {_group_chat_id}")
     await app.bot.set_my_commands([
         ("matches", "Today's matches + kickoff times"),
         ("bet", "Place a bet"),
