@@ -915,7 +915,7 @@ async def cmd_parlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     placed_bet_ids = []
 
     try:
-        for leg in validated_legs:
+        for i, leg in enumerate(validated_legs):
             bet_id = await sheet.place_bet(
                 user_id=user.id,
                 match_id=leg["match"]["match_id"],
@@ -923,7 +923,8 @@ async def cmd_parlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 outcome=leg["outcome"],
                 amount=amount,
                 notify_fn=dm_admin,
-                parlay_id=parlay_id
+                parlay_id=parlay_id,
+                deduct_credits=(i == 0)  # only deduct on first leg
             )
             placed_bet_ids.append(bet_id)
 
@@ -946,18 +947,18 @@ async def cmd_parlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(confirm_msg)
 
     except ValueError as e:
-        # Rollback any legs already placed
-        for bid in placed_bet_ids:
+        # Rollback — cancel first leg only (only leg that deducted credits)
+        if placed_bet_ids:
             try:
-                await sheet.cancel_bet(bid, user.id)
+                await sheet.cancel_bet(placed_bet_ids[0], user.id)
             except Exception:
                 pass
         await update.message.reply_text(str(e))
     except Exception as e:
-        # Rollback any legs already placed
-        for bid in placed_bet_ids:
+        # Rollback — cancel first leg only
+        if placed_bet_ids:
             try:
-                await sheet.cancel_bet(bid, user.id)
+                await sheet.cancel_bet(placed_bet_ids[0], user.id)
             except Exception:
                 pass
         logger.error(f"Parlay placement failed for {user.id}: {e}")

@@ -310,13 +310,13 @@ async def update_match_result(match_id: str, home_score: int, away_score: int, n
         raise
 
 # ── Bet operations ───────────────────────────────────────────────────────────
-async def place_bet(user_id: int, match_id: str, market: str, outcome: str, amount: int, notify_fn=None, parlay_id: str = "") -> str:
+async def place_bet(user_id: int, match_id: str, market: str, outcome: str, amount: int, notify_fn=None, parlay_id: str = "", deduct_credits: bool = True) -> str:
     """Deduct credits and write bet. Returns bet_id."""
     async with get_user_lock(user_id):
         user = cache["users"].get(user_id)
         if not user:
             raise ValueError("User not found")
-        if user["credits"] < amount:
+        if deduct_credits and user["credits"] < amount:
             raise ValueError("Insufficient credits")
 
         bet_id = f"{user_id}_{match_id}_{market}_{datetime.now(UTC).strftime('%H%M%S%f')}"
@@ -329,10 +329,11 @@ async def place_bet(user_id: int, match_id: str, market: str, outcome: str, amou
             new_row_num = len(cache["bets"]) + 2
             _bet_rows[bet_id] = new_row_num
 
-            new_credits = user["credits"] - amount
-            await update_user_credits(user_id, new_credits, notify_fn)
-            ledger_note = f"Parlay {parlay_id} leg on {match_id}" if parlay_id else f"Bet on {match_id} {market} {outcome}"
-            await append_ledger(user_id, "bet", -amount, new_credits, ledger_note, notify_fn)
+            if deduct_credits:
+                new_credits = user["credits"] - amount
+                await update_user_credits(user_id, new_credits, notify_fn)
+                ledger_note = f"Parlay {parlay_id} stake on {match_id}" if parlay_id else f"Bet on {match_id} {market} {outcome}"
+                await append_ledger(user_id, "bet", -amount, new_credits, ledger_note, notify_fn)
 
             cache["bets"].append({
                 "bet_id": bet_id, "user_id": user_id, "match_id": match_id,
@@ -580,14 +581,14 @@ async def void_parlay_bets(parlay_id: str, user_id: int, notify_fn=None) -> int:
                 ws.update_cell(row_num, 7, "void")
             bet["status"] = "void"
 
-        # Refund total stake (all legs combined)
-        total_stake = sum(b["amount"] for b in parlay_bets)
+        # Refund total stake once — amount is the same on all legs, deducted only once
+        stake = parlay_bets[0]["amount"]
         async with get_user_lock(user_id):
             user = cache["users"].get(user_id)
             if user:
-                new_credits = user["credits"] + total_stake
+                new_credits = user["credits"] + stake
                 await update_user_credits(user_id, new_credits, notify_fn)
-                await append_ledger(user_id, "refund", total_stake, new_credits, f"Cancelled parlay {parlay_id}", notify_fn)
+                await append_ledger(user_id, "refund", stake, new_credits, f"Cancelled parlay {parlay_id}", notify_fn)
 
         return len(parlay_bets)
     except Exception as e:
