@@ -523,34 +523,14 @@ async def cmd_roast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     else:
-        # No target — Katerina picks worst performer
+        # No target — Katerina picks someone at random
+        import random
         standings = sheet.get_standings()
         if not standings:
             await update.message.reply_text("No players to roast yet. Come back when someone's losing. 😏")
             return
-        # Pick worst P&L today, fall back to last place
-        CT = pytz.timezone("America/Chicago")
-        today_ct = datetime.now(CT).strftime("%Y-%m-%d")
-        pl_map = {}
-        for b in sheet.cache["bets"]:
-            if b["status"] not in ("won", "lost"):
-                continue
-            match = sheet.cache["matches"].get(str(b["match_id"]), {})
-            ko_str = match.get("kickoff_utc", "")
-            try:
-                ko = datetime.strptime(ko_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-                if ko.astimezone(CT).strftime("%Y-%m-%d") != today_ct:
-                    continue
-            except Exception:
-                continue
-            uid = b["user_id"]
-            pl_map[uid] = pl_map.get(uid, 0) + (b["amount"] if b["status"] == "won" else -b["amount"])
-
-        if pl_map:
-            target_uid = min(pl_map, key=lambda u: pl_map[u])
-        else:
-            target_uid = standings[-1]["user_id"]
-
+        picked = random.choice(standings)
+        target_uid = picked["user_id"]
         u = sheet.cache["users"].get(target_uid, {})
         target_name = u.get("first_name") or u.get("username") or "someone"
 
@@ -1327,7 +1307,16 @@ async def cmd_parlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for i, leg in enumerate(validated_legs, 1):
             home = format_team(leg["match"]["home"])
             away = format_team(leg["match"]["away"])
-            lines.append(f"{i}. {home} vs {away} — {leg['outcome_display']}")
+            outcome = leg["outcome"]
+            if outcome == "draw":
+                outcome_label = "Draw"
+            elif outcome == "home":
+                outcome_label = f"{format_team(leg['match']['home'])} Win"
+            elif outcome == "away":
+                outcome_label = f"{format_team(leg['match']['away'])} Win"
+            else:
+                outcome_label = leg["outcome_display"]
+            lines.append(f"{i}. {home} vs {away} — {outcome_label}")
         lines.append(f"\nStake: {amount}c · Win all → {potential_return}c back")
         lines.append(f"Balance: {new_balance}c")
 
