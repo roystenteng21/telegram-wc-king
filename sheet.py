@@ -294,7 +294,7 @@ async def update_match_result(match_id: str, home_score: int, away_score: int, n
         if not row_num:
             raise ValueError(f"Match {match_id} row not in cache")
         ws = get_sheet(SHEET_MATCHES)
-        ws.update(f"F{row_num}:J{row_num}", [[home_score, away_score, result, ou_result, "FINISHED"]])
+        ws.update(f"E{row_num}:I{row_num}", [["FINISHED", home_score, away_score, result, ou_result]])
         if match_id in cache["matches"]:
             cache["matches"][match_id].update({
                 "home_score": home_score,
