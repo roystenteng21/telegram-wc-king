@@ -20,6 +20,31 @@ WC_COMPETITION = "WC"
 # Anthropic API (for Katerina)
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
+# ── Tournament stages (UTC dates) ─────────────────────────────────────────────
+from datetime import date as _date
+
+TOURNAMENT_STAGES = [
+    {"name": "Group Stage",  "start": _date(2026, 6, 11), "end": _date(2026, 6, 27)},
+    {"name": "Round of 32",  "start": _date(2026, 6, 28), "end": _date(2026, 7,  3)},
+    {"name": "Round of 16",  "start": _date(2026, 7,  4), "end": _date(2026, 7,  7)},
+    {"name": "Quarterfinals","start": _date(2026, 7,  9), "end": _date(2026, 7, 11)},
+    {"name": "Semifinals",   "start": _date(2026, 7, 14), "end": _date(2026, 7, 15)},
+    {"name": "Third Place",  "start": _date(2026, 7, 18), "end": _date(2026, 7, 18)},
+    {"name": "Final",        "start": _date(2026, 7, 19), "end": _date(2026, 7, 19)},
+]
+TOURNAMENT_FINAL_DATE = _date(2026, 7, 19)
+
+# ── Prize pool ────────────────────────────────────────────────────────────────
+PRIZE_PLAYER_COUNT = 5
+PRIZE_PER_PLAYER = 80  # SGD
+PRIZE_INFO = (
+    f"Prize pool: {PRIZE_PLAYER_COUNT} players × $80 = $400 SGD total. "
+    "1st place wins the World Cup champion jersey plus the remaining pool value in dining vouchers. "
+    "2nd place wins the World Cup runner-up jersey. "
+    "Winner is determined by highest credits at the end of the tournament (after the World Cup Final on July 19, 2026). "
+    "No tiebreaker rule — credits standings are final."
+)
+
 # Timezone
 SGT = pytz.timezone("Asia/Singapore")
 UTC = pytz.utc

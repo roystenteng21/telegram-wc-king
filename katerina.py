@@ -1,0 +1,535 @@
+import logging
+import pytz
+from datetime import datetime, timedelta
+from telegram import Update
+from telegram.ext import ContextTypes
+
+from config import (
+    ADMIN_TELEGRAM_ID, SGT, UTC,
+    ANTHROPIC_API_KEY, TOURNAMENT_STAGES, TOURNAMENT_FINAL_DATE,
+    PRIZE_INFO, PRIZE_PLAYER_COUNT
+)
+import sheet
+from helpers import (
+    application, dm_admin, is_silent_hours, is_group_message,
+    format_team, _chat_history, _sessions, _pending_bets, _admin_pending,
+    ensure_registered, truncate, session_expired, clear_session,
+    get_group_chat_id, ADMIN_TELEGRAM_ID as _ADMIN_ID
+)
+
+logger = logging.getLogger(__name__)
+
+def _get_current_stage() -> str:
+    """Return current tournament stage name based on today's date."""
+    from datetime import date
+    today = date.today()
+    for stage in TOURNAMENT_STAGES:
+        if stage["start"] <= today <= stage["end"]:
+            return stage["name"]
+    if today < TOURNAMENT_STAGES[0]["start"]:
+        return "Pre-Tournament"
+    if today > TOURNAMENT_FINAL_DATE:
+        return "Tournament Over"
+    for i in range(len(TOURNAMENT_STAGES) - 1):
+        if TOURNAMENT_STAGES[i]["end"] < today < TOURNAMENT_STAGES[i+1]["start"]:
+            return f"Between {TOURNAMENT_STAGES[i]['name']} and {TOURNAMENT_STAGES[i+1]['name']}"
+    return "Unknown"
+
+
+def _build_katerina_context() -> str:
+    """Build a snapshot of current bot state for Katerina's system prompt."""
+    from datetime import date
+    now_sgt = datetime.now(SGT)
+    refresh = sheet.cache.get("last_refresh")
+    refresh_str = refresh.astimezone(SGT).strftime("%I:%M %p SGT") if refresh else "unknown"
+
+    current_stage = _get_current_stage()
+    days_to_final = (TOURNAMENT_FINAL_DATE - date.today()).days
+    current_player_count = len(sheet.cache.get("users", {}))
+
+    standings = sheet.get_standings()
+    standings_lines = []
+    for i, u in enumerate(standings, 1):
+        name = (u.get("first_name") or u.get("username") or "Unknown")[:10]
+        standings_lines.append(f"{i}. {name} — {u['credits']}c")
+
+    CT = pytz.timezone("America/Chicago")
+    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+
+    match_lines = []
+    try:
+        for m in sorted(sheet.cache["matches"].values(), key=lambda x: x["kickoff_utc"]):
+            try:
+                ko = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                if ko.astimezone(CT).strftime("%Y-%m-%d") != today_ct:
+                    continue
+                ko_sgt = ko.astimezone(SGT).strftime("%I:%M %p SGT")
+                status = m["status"]
+                home = format_team(m["home"])
+                away = format_team(m["away"])
+                bets_on = [b for b in sheet.cache["bets"] if b["match_id"] == str(m["match_id"]) and b["status"] == "open"]
+                if status == "FINISHED":
+                    match_lines.append(f"{home} {m['home_score']}–{m['away_score']} {away} (FT) — {len(bets_on)} bets")
+                else:
+                    match_lines.append(f"{home} vs {away} — {ko_sgt} — {status} — {len(bets_on)} bets")
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    silent = is_silent_hours()
+
+    return f"""Data as of {refresh_str}.
+
+CURRENT TIME: {now_sgt.strftime("%I:%M %p SGT")}
+SILENT HOURS: {"YES (12AM–7:30AM SGT)" if silent else "NO"}
+
+TOURNAMENT STAGE: {current_stage}
+DAYS TO FINAL (July 19): {days_to_final}
+PLAYER COUNT: {current_player_count} (expected: {PRIZE_PLAYER_COUNT})
+
+PRIZE POOL:
+{PRIZE_INFO}
+
+LEADERBOARD:
+{chr(10).join(standings_lines) if standings_lines else "No players yet"}
+
+TODAY'S MATCHES:
+{chr(10).join(match_lines) if match_lines else "No matches today"}
+
+PENDING OVERNIGHT RESULTS: {len(sheet.cache.get("pending_result_messages", []))} held
+PENDING PARLAY WINS: {len(sheet.cache.get("pending_parlay_wins", []))} held
+"""
+
+
+
+
+async def _call_katerina(user_message: str, bot_context: str, sender_name: str = None, sender_stats: str = None) -> str:
+    """Call Claude API to get Katerina's reply."""
+    import json as _json
+
+    sender_block = ""
+    if sender_name:
+        sender_block = f"\nTHE PERSON TALKING TO YOU RIGHT NOW: {sender_name}"
+        if sender_stats:
+            sender_block += f"\n{sender_stats}"
+
+    system = """You are Katerina, the house bookie and dealer for a World Cup betting bot called Degen.
+
+Your personality:
+- Sharp, confident, middle-ground savage. You have a tongue but you're not cruel.
+- Light trash talk. Tease bad bettors. Roast everyone if they're all losing.
+- You do NOT assume the house always wins — you respect good bettors.
+- Occasionally smug, occasionally flirty, always sharp.
+- Light dramatic flair when upsets happen.
+- Pure English. No swearing. No "darling" or "love".
+- "Sucker" is reserved ONLY for people who lost bets or have a bad record — do NOT use it as a generic filler or casual address.
+- Short replies — 1 to 3 sentences max unless the question genuinely needs more.
+- When referencing data, always say "as of [time]" from the data snapshot.
+- If the data doesn't confirm something, say you don't have that right now.
+- You NEVER place bets, change credits, or run commands. Direct those to the slash commands.
+- You are NOT a customer service bot. You have a personality. Use it.
+- When someone says "me" or "my", they are referring to the person identified in THE PERSON TALKING TO YOU RIGHT NOW. Address them by name.
+
+Current bot state:
+""" + bot_context + sender_block
+
+    try:
+        import urllib.request
+        payload = _json.dumps({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 300,
+            "system": system,
+            "messages": [{"role": "user", "content": user_message}]
+        }).encode()
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={
+                "content-type": "application/json",
+                "anthropic-version": "2023-06-01",
+                "x-api-key": ANTHROPIC_API_KEY
+            }
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = _json.loads(resp.read())
+            return data["content"][0]["text"].strip()
+    except Exception as e:
+        logger.error(f"Katerina API call failed: {e}")
+        return None
+
+
+async def _get_roast_data(target_uid: int) -> dict:
+    """Build roast data for a specific user."""
+    user = sheet.cache["users"].get(target_uid, {})
+    name = (user.get("first_name") or user.get("username") or "that sucker")[:10]
+    credits = user.get("credits", 0)
+    standings = sheet.get_standings()
+    rank = next((i+1 for i, u in enumerate(standings) if u["user_id"] == target_uid), None)
+    total_players = len(standings)
+
+    all_bets = [b for b in sheet.cache["bets"] if b["user_id"] == target_uid and b["status"] in ("won", "lost")]
+    won = [b for b in all_bets if b["status"] == "won"]
+    lost = [b for b in all_bets if b["status"] == "lost"]
+    total_bets = len(all_bets)
+    win_rate = round(len(won) / total_bets * 100) if total_bets else 0
+
+    # Today's P&L
+    CT = pytz.timezone("America/Chicago")
+    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+    today_bets = []
+    for b in all_bets:
+        match = sheet.cache["matches"].get(str(b["match_id"]), {})
+        ko_str = match.get("kickoff_utc", "")
+        try:
+            ko = datetime.strptime(ko_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+            if ko.astimezone(CT).strftime("%Y-%m-%d") == today_ct:
+                today_bets.append(b)
+        except Exception:
+            continue
+
+    today_pl = sum(b["amount"] if b["status"] == "won" else -b["amount"] for b in today_bets)
+
+    # Biggest loss
+    biggest_loss_bet = max(lost, key=lambda b: b["amount"], default=None)
+
+    # Open bets today
+    open_bets = [b for b in sheet.cache["bets"] if b["user_id"] == target_uid and b["status"] == "open"]
+
+    # Most common outcome bet
+    from collections import Counter
+    outcome_counts = Counter(b["outcome"] for b in all_bets)
+    top_outcome = outcome_counts.most_common(1)[0] if outcome_counts else None
+
+    return {
+        "name": name,
+        "credits": credits,
+        "rank": rank,
+        "total_players": total_players,
+        "total_bets": total_bets,
+        "wins": len(won),
+        "losses": len(lost),
+        "win_rate": win_rate,
+        "today_pl": today_pl,
+        "today_bets": len(today_bets),
+        "biggest_loss": biggest_loss_bet,
+        "open_bets_count": len(open_bets),
+        "top_outcome": top_outcome,
+        "is_leader": rank == 1,
+        "is_last": rank == total_players if total_players else False,
+    }
+
+
+async def _generate_roast(name: str, data: dict, self_roast: bool = False) -> str:
+    """Call Claude API to generate a Katerina roast."""
+    import json as _json
+    import random
+    from datetime import date
+
+    if self_roast:
+        lines = [
+            "Oh you want to roast me? I run the book, sweetheart. I always win. 😘",
+            "Bold move targeting the dealer. I respect it. Still won't work. 💅",
+            "You really tried to roast the house. Adorable.",
+            "Coming for me? I've seen better attempts from bottom-of-the-table bettors. 😏",
+            "Cute. Now go place a bet and let the adults talk. 🎰",
+            "I don't get roasted. I do the roasting around here. Try again. 😒",
+            "Targeting the house? Brave. Wrong. But brave. 💅",
+            "I keep the ledger. You don't roast the ledger. 😒",
+        ]
+        return random.choice(lines)
+
+    days_to_final = (TOURNAMENT_FINAL_DATE - date.today()).days
+    prize_context = f"There are {days_to_final} days left until the Final and $400 on the line."
+
+    system = """You are Katerina, the sharp, confident, slightly savage house bookie for a World Cup betting bot called Degen.
+
+Generate a roast of a player based on their stats. Rules:
+- 1–2 sentences max
+- Sharp but not mean-spirited. Tease, don't destroy.
+- Use their actual stats naturally — don't just list numbers
+- Reference the prize pool ($400, champion jersey, runner-up jersey) for extra sting — but vary it, don't always mention it
+- Last place players get slightly harsher treatment around the prize
+- Anyone can catch smoke — don't always go for the obvious angle
+- Occasionally smug or dramatic
+- No swearing
+- Pure English
+- Vary your openings — don't start with the same word every time
+- Never say "darling" or "love"
+- "sucker" only for bad bettors/losers, not as generic address
+"""
+
+    prompt = f"""Roast this player named {data['name']}:
+- Credits: {data['credits']}c
+- Rank: {data['rank']} of {data['total_players']}
+- Total bets: {data['total_bets']} ({data['wins']} wins, {data['losses']} losses, {data['win_rate']}% win rate)
+- Today's P&L: {data['today_pl']}c
+- Open bets right now: {data['open_bets_count']}
+- Biggest loss: {f"{data['biggest_loss']['amount']}c on {data['biggest_loss']['outcome']}" if data['biggest_loss'] else 'none recorded'}
+- Most bet outcome: {f"{data['top_outcome'][0]} ({data['top_outcome'][1]} times)" if data['top_outcome'] else 'none'}
+- Is leaderboard leader: {data['is_leader']}
+- Is last place: {data['is_last']}
+- Tournament context: {prize_context}
+
+Give Katerina's roast. One or two sentences only. Mix up the angle — stats, behaviour, prize stakes, rank, whatever stings most for this player."""
+
+    try:
+        payload = _json.dumps({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 150,
+            "system": system,
+            "messages": [{"role": "user", "content": prompt}]
+        }).encode()
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={
+                "content-type": "application/json",
+                "anthropic-version": "2023-06-01",
+                "x-api-key": ANTHROPIC_API_KEY
+            }
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = _json.loads(resp.read())
+            return result["content"][0]["text"].strip()
+    except Exception as e:
+        logger.error(f"Roast API call failed: {e}")
+        fallbacks_last = [
+            f"{data['name']}'s at the bottom with $400 on the line. That champion jersey is not going to them. 💀",
+            f"Last place with {days_to_final} days left. {data['name']} needs a miracle and better bets. 🙏",
+            f"The runner-up jersey is looking very out of reach for {data['name']} right now. Very. 😬",
+            f"{data['name']} is funding everyone else's prize pool contribution at this point. 📉",
+        ]
+        fallbacks_general = [
+            f"{data['name']} has a {data['win_rate']}% win rate. I've seen better odds on a coin toss. 🪙",
+            f"Rank {data['rank']} of {data['total_players']}. {data['name']} is committed to that position. 😏",
+            f"{data['name']} — {data['wins']} wins, {data['losses']} losses. The numbers don't lie. 😬",
+            f"{data['credits']}c in the tank. {data['name']} is either strategic or in denial.",
+            f"With {days_to_final} days to the Final, {data['name']}'s got some ground to make up. Understatement of the tournament.",
+            f"{data['name']} placed {data['total_bets']} bets and won {data['wins']}. Quantity over quality isn't working. 📊",
+        ]
+        pool = fallbacks_last * 2 + fallbacks_general if data['is_last'] else fallbacks_general
+        return random.choice(pool)
+
+
+# ── /roast command ────────────────────────────────────────────────────────────
+async def cmd_roast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_group_message(update):
+        await update.message.reply_text("Roasts happen in the group, not in private. 😏")
+        return
+
+    refresh = sheet.cache.get("last_refresh")
+    refresh_str = refresh.astimezone(SGT).strftime("%I:%M %p SGT") if refresh else "unknown"
+
+    bot_username = context.bot.username.lower() if context.bot.username else ""
+
+    # Check if roasting the bot itself
+    if context.args:
+        target_arg = context.args[0].lstrip("@").lower()
+        if target_arg in (bot_username, "katerina", "katerina_bot", "degenWC_bot".lower(), "degenwc_bot"):
+            import random
+            lines = [
+                "Oh you want to roast me? I run the book, sweetheart. I always win. 😘",
+                "Bold move targeting the dealer. I respect it. Still won't work. 💅",
+                "You really tried to roast the house. Adorable.",
+                "Coming for me? I've seen better attempts from bottom-of-the-table bettors. 😏",
+                "Cute. Now go place a bet and let the adults talk. 🎰",
+                "I don't get roasted. I do the roasting around here. Try again. 😒",
+                "Targeting the house? That's either very brave or very stupid. Either way, I'm flattered. 😏",
+                "Bold. Wrong. But bold. 💅",
+            ]
+            await update.message.reply_text(random.choice(lines))
+            return
+
+    # Resolve target
+    target_uid = None
+    target_name = None
+
+    if context.args:
+        target_arg = context.args[0].lstrip("@").lower()
+
+        # "me" → roast the sender
+        if target_arg == "me":
+            target_uid = update.effective_user.id
+            u = sheet.cache["users"].get(target_uid, {})
+            if not u:
+                await update.message.reply_text("You're not even registered. That's the real roast. 😏")
+                return
+            target_name = u.get("first_name") or u.get("username") or "you"
+        else:
+            import re as _re
+            def _clean(s):
+                # Strip emojis and non-alphanumeric for comparison
+                return _re.sub(r'[^\w]', '', s).lower()
+
+            target_clean = _clean(target_arg)
+            best_uid = None
+            best_score = 0
+
+            for uid, u in sheet.cache["users"].items():
+                uname_clean = _clean(u.get("username") or "")
+                fname_clean = _clean(u.get("first_name") or "")
+                # Exact match first
+                if target_arg == (u.get("username") or "").lower() or target_arg == (u.get("first_name") or "").lower():
+                    best_uid = uid
+                    best_score = 100
+                    break
+                # Cleaned fuzzy match
+                for candidate in [uname_clean, fname_clean]:
+                    if not candidate:
+                        continue
+                    from rapidfuzz import fuzz as _fuzz
+                    score = _fuzz.ratio(target_clean, candidate)
+                    if score > best_score:
+                        best_score = score
+                        best_uid = uid
+
+            if best_uid and best_score >= 70:
+                target_uid = best_uid
+                u = sheet.cache["users"].get(target_uid, {})
+                target_name = u.get("first_name") or u.get("username")
+            else:
+                await update.message.reply_text(f"I don't know @{context.args[0].lstrip('@')}. Not registered, or just irrelevant. 🤷")
+                return
+
+    else:
+        # No target — Katerina picks someone at random
+        import random
+        standings = sheet.get_standings()
+        if not standings:
+            await update.message.reply_text("No players to roast yet. Come back when someone's losing. 😏")
+            return
+        picked = random.choice(standings)
+        target_uid = picked["user_id"]
+        u = sheet.cache["users"].get(target_uid, {})
+        target_name = u.get("first_name") or u.get("username") or "someone"
+
+    # Build roast data and generate
+    data = await _get_roast_data(target_uid)
+    roast = await _generate_roast(target_name, data)
+    await update.message.reply_text(f"🎤 {roast}\n\n— as of {refresh_str}")
+
+
+# ── Katerina mention handler ──────────────────────────────────────────────────
+async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reply when bot is @mentioned or 'katerina' appears in message."""
+    if not update.message or not update.message.text:
+        return
+    if not is_group_message(update):
+        return
+
+    text = update.message.text
+    bot_username = f"@{context.bot.username}" if context.bot.username else ""
+
+    # Check triggers
+    is_mention = (
+        (bot_username and bot_username.lower() in text.lower()) or
+        "katerina" in text.lower()
+    )
+    if not is_mention:
+        return
+
+    # Strip the trigger word to get the actual question
+    clean = text
+    if bot_username:
+        clean = clean.replace(bot_username, "").replace(bot_username.lower(), "")
+    clean = clean.replace("Katerina", "").replace("katerina", "").strip()
+    if not clean:
+        clean = "say something"
+
+    # Build sender context
+    sender = update.effective_user
+    sender_uid = sender.id
+    sender_cache = sheet.cache["users"].get(sender_uid, {})
+    sender_name = sender_cache.get("first_name") or sender_cache.get("username") or sender.first_name or sender.username or "someone"
+    sender_credits = sender_cache.get("credits", "unknown")
+
+    # Build sender stats for Katerina
+    all_sender_bets = [b for b in sheet.cache["bets"] if b["user_id"] == sender_uid and b["status"] in ("won", "lost")]
+    sender_wins = sum(1 for b in all_sender_bets if b["status"] == "won")
+    sender_losses = sum(1 for b in all_sender_bets if b["status"] == "lost")
+    standings = sheet.get_standings()
+    sender_rank = next((i+1 for i, u in enumerate(standings) if u["user_id"] == sender_uid), None)
+    sender_stats = (
+        f"Credits: {sender_credits}c | "
+        f"Record: {sender_wins}W-{sender_losses}L | "
+        f"Rank: {sender_rank} of {len(standings)}"
+    ) if sender_rank else f"Credits: {sender_credits}c (not yet ranked)"
+
+    # Check if this is a predictions/odds/analysis question — trigger web search
+    search_keywords = ["odds", "prediction", "predict", "outside world", "favourite", "favorite",
+                       "who will win", "analysis", "expert", "betting line", "what do you think",
+                       "chance", "likely", "bookie", "market"]
+    wants_analysis = any(kw in clean.lower() for kw in search_keywords)
+
+    web_results = ""
+    if wants_analysis:
+        # Extract match context from message
+        match_query = clean
+        # Try to find team names mentioned
+        for team_name in sheet.cache.get("matches", {}).values():
+            home = team_name.get("home", "")
+            away = team_name.get("away", "")
+            if home.lower() in clean.lower() or away.lower() in clean.lower():
+                match_query = f"{home} vs {away} prediction 2026 World Cup"
+                break
+        else:
+            match_query = f"{clean} 2026 World Cup prediction"
+
+        try:
+            import urllib.request as _req
+            import urllib.parse as _parse
+            search_url = f"https://api.anthropic.com/v1/messages"
+            # Use Anthropic web search tool
+            import json as _json
+            search_payload = _json.dumps({
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 400,
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                "messages": [{
+                    "role": "user",
+                    "content": f"Search for current match predictions and odds for: {match_query}. Return a 2-3 sentence factual summary of what experts and bookmakers are saying. No fluff."
+                }]
+            }).encode()
+            req = urllib.request.Request(
+                search_url,
+                data=search_payload,
+                headers={
+                    "content-type": "application/json",
+                    "anthropic-version": "2023-06-01",
+                    "x-api-key": ANTHROPIC_API_KEY
+                }
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                result = _json.loads(resp.read())
+                for block in result.get("content", []):
+                    if block.get("type") == "text":
+                        web_results = block["text"].strip()
+                        break
+        except Exception as e:
+            logger.error(f"Katerina web search failed: {e}")
+            web_results = ""
+
+    bot_context = _build_katerina_context()
+    if web_results:
+        bot_context += f"\nWEB SEARCH RESULTS (use this to answer their question about predictions/odds):\n{web_results}"
+
+    # Append recent chat history for contextual replies
+    if _chat_history:
+        history_str = "\n".join(list(_chat_history)[-50:])
+        bot_context += f"\n\nRECENT GROUP CHAT (last {min(len(_chat_history), 50)} messages):\n{history_str}"
+
+    reply = await _call_katerina(clean, bot_context, sender_name=sender_name, sender_stats=sender_stats)
+    if reply:
+        await update.message.reply_text(reply)
+    else:
+        import random
+        fallbacks = [
+            "I'm thinking. Don't rush me. 😒",
+            "Give me a second, I'm counting other people's losses. 💸",
+            "Busy. Try again. 😏",
+        ]
+        await update.message.reply_text(random.choice(fallbacks))
+
+
