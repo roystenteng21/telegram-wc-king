@@ -68,6 +68,32 @@ def is_silent_hours() -> bool:
     return start <= now_sgt < end
 
 
+# ── Last match of day check ───────────────────────────────────────────────────
+async def is_last_match_of_day(match_id: str) -> bool:
+    """Returns True if match_id is the only unfinished match left on today's CT date."""
+    CT = pytz.timezone("America/Chicago")
+    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+    today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
+    tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
+    today_matches = []
+    for m in all_matches:
+        try:
+            kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+            if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct:
+                today_matches.append(m)
+        except Exception:
+            continue
+
+    for m in today_matches:
+        if str(m["match_id"]) == str(match_id):
+            continue
+        if m["status"] not in ("FINISHED", "CANCELLED", "POSTPONED"):
+            return False
+    return True
+
+
 # ── Format helpers ────────────────────────────────────────────────────────────
 def format_match_line(match: dict) -> str:
     kickoff_utc = datetime.strptime(match["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
@@ -228,6 +254,14 @@ async def job_morning_catchup():
                 if fun:
                     lines.append(f"\n{fun}")
 
+        # Overnight match results held from silent hours
+        pending_results = sheet.cache.get("pending_result_messages", [])
+        if pending_results:
+            lines.append("\n⚽ Overnight Results:")
+            for msg in pending_results:
+                lines.append(f"\n{msg}")
+            sheet.cache["pending_result_messages"] = []
+
         # Parlay wins from silent hours
         pending = sheet.cache.get("pending_parlay_wins", [])
         if pending:
@@ -367,6 +401,10 @@ async def job_kickoff_message(match_id: str):
         if fun_line:
             lines.append(f"\n{fun_line}")
 
+        if is_silent_hours() and not await is_last_match_of_day(match_id):
+            logger.info(f"Kickoff message suppressed for {match_id} — silent hours, not last match")
+            return
+
         await send_group("\n".join(lines))
         logger.info(f"Kickoff message sent for {match_id}")
     except Exception as e:
@@ -444,9 +482,13 @@ async def job_poll_result(match_id: str, attempt: int = 1):
                 legs_str = "\n".join(f"• {label} ✅" for label in p["leg_labels"])
                 result_msg += f"\n🎰 {name} hit a {p['legs']}-leg parlay!\n{legs_str}\n{p['stake']}c → {p['payout']}c 🔥"
 
-        if is_silent_hours():
-            logger.info(f"Match {match_id} result held — silent hours")
-            # Store parlay wins for morning catchup
+        if is_silent_hours() and not await is_last_match_of_day(match_id):
+            logger.info(f"Match {match_id} result held — silent hours, not last match")
+            # Store full result message for morning catchup
+            if "pending_result_messages" not in sheet.cache:
+                sheet.cache["pending_result_messages"] = []
+            sheet.cache["pending_result_messages"].append(result_msg)
+            # Store parlay wins too
             if parlay_wins:
                 if "pending_parlay_wins" not in sheet.cache:
                     sheet.cache["pending_parlay_wins"] = []

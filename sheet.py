@@ -27,7 +27,8 @@ cache = {
     "daily_credits_date": None,
     "eod_date": None,
     "paid_parlays": set(),          # parlay_ids already paid out, skip at EOD
-    "pending_parlay_wins": []       # parlay wins during silent hours, shown in morning catchup
+    "pending_parlay_wins": [],       # parlay wins during silent hours, shown in morning catchup
+    "pending_result_messages": [],   # FT result messages held during silent hours, shown in morning catchup
 }
 
 # Row index cache — tracks sheet row numbers to avoid re-reading

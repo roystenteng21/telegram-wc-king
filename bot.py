@@ -363,7 +363,7 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if all_done:
         tomorrow_ct = (datetime.now(CT) + timedelta(days=1)).strftime("%Y-%m-%d")
         day_after_utc = (datetime.now(UTC) + timedelta(days=2)).strftime("%Y-%m-%d")
-        next_matches_raw = await sheet.get_matches_for_date(tomorrow_utc) + await sheet.get_matches_for_date(day_after_utc)
+        next_matches_raw = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc) + await sheet.get_matches_for_date(day_after_utc)
         next_matches = []
         for m in next_matches_raw:
             try:
