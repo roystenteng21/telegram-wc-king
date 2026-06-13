@@ -185,12 +185,13 @@ def format_result_message(match: dict, settlements: list, parlay_wins: list = No
             seen_pids[pid].append(s)
         for pid, legs in seen_pids.items():
             name = get_name_str(legs[0]["user_id"])
-            leg_lines = "\n".join(
-                f"\u2022 {_outcome_label(l['outcome'], match)} {'\u2705' if l['status'] == 'won' else '\u274c'}"
-                for l in legs
-            )
+            leg_line_parts = []
+            for l in legs:
+                icon = "✅" if l["status"] == "won" else "❌"
+                leg_line_parts.append(f"• {_outcome_label(l['outcome'], match)} {icon}")
+            leg_lines = "\n".join(leg_line_parts)
             stake = legs[0]["amount"]
-            lines.append(f"\n\U0001f3b0 {name}'s parlay:\n{leg_lines}\n{stake}c \u2192 lost")
+            lines.append(f"\n🎰 {name}'s parlay:\n{leg_lines}\n{stake}c → lost")
 
     return "\n".join(lines)
 
