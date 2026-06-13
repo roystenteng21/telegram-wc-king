@@ -140,21 +140,34 @@ async def refresh_cache(notify_fn=None):
 
         cache["last_refresh"] = datetime.now(UTC)
 
-        # Rebuild paid_parlays from bets — any parlay where payout > 0 on a leg
-        # means it was already credited. Prevents double-payout on restart.
-        paid = set()
-        parlay_bets = [b for b in cache["bets"] if b.get("parlay_id")]
-        parlay_ids = set(b["parlay_id"] for b in parlay_bets)
-        for pid in parlay_ids:
-            legs = [b for b in parlay_bets if b["parlay_id"] == pid]
-            # If any leg has payout recorded, the parlay was already settled
-            if any(b.get("payout") and str(b["payout"]) not in ("", "0") for b in legs):
-                paid.add(pid)
-            # If all legs are non-open and none won, it lost — mark done
-            elif all(b["status"] in ("lost", "void") for b in legs):
-                paid.add(pid)
-        cache["paid_parlays"] = paid
-        logger.info(f"Cache refreshed successfully — {len(paid)} paid/settled parlays loaded")
+        # Rebuild paid_parlays from ledger — any parlay_id that already has a payout
+        # ledger entry was already credited. Prevents double-payout on restart.
+        try:
+            ledger_ws = spreadsheet.worksheet(SHEET_LEDGER)
+            ledger_data = ledger_ws.get_all_records()
+            paid = set()
+            for row in ledger_data:
+                notes = str(row.get("notes", ""))
+                if row.get("type") == "payout" and notes.startswith("Parlay p_"):
+                    # Extract parlay_id from notes like "Parlay p_123_456789 won (4 legs x10.0)"
+                    parts = notes.split(" ")
+                    if len(parts) >= 2:
+                        paid.add(parts[1])
+            # Also mark lost/voided parlays from bets cache — all legs settled, none won
+            parlay_bets = [b for b in cache["bets"] if b.get("parlay_id")]
+            parlay_ids = set(b["parlay_id"] for b in parlay_bets if b.get("parlay_id"))
+            for pid in parlay_ids:
+                if pid in paid:
+                    continue
+                legs = [b for b in parlay_bets if b["parlay_id"] == pid]
+                if legs and all(b["status"] in ("lost", "void") for b in legs):
+                    paid.add(pid)
+            cache["paid_parlays"] = paid
+            logger.info(f"Cache refreshed successfully — {len(paid)} paid/settled parlays loaded from ledger")
+        except Exception as e:
+            logger.warning(f"Could not rebuild paid_parlays from ledger: {e}")
+            cache["paid_parlays"] = set()
+            logger.info("Cache refreshed successfully")
 
         # Load events
         try:
