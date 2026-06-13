@@ -817,16 +817,16 @@ async def cmd_admin_katerina_back(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("Group chat ID not set yet.")
         return
     lines = [
-        "Brief intermission. The house is open again. 🎰",
-        "Technical difficulties. Very beneath me. Won't happen again. 💅",
-        "The house never closes for long. I'm back. 🎰",
-        "Sorry for the wait. I had credits to count. 😌",
-        "I'm back. Try not to make bad bets while I was away — oh wait, too late. 😏",
-        "Brief absence. The ledger still balanced. I'm back. 📒",
-        "Small interruption. The books are open. Place your bets. 🎰",
-        "Took a moment. The house is back in business. Don't read into it. 💅",
-        "I'm back, and the odds haven't changed. Neither has your form. 😏",
-        "Short break. Counted the losses. Back to counting more. 📒",
+        "Brief intermission. The house is open again. Any bets placed while I was down didn't go through — resubmit if needed. 🎰",
+        "Technical difficulties. Very beneath me. Won't happen again. If you tried to bet while I was out, do it again. 💅",
+        "The house never closes for long. I'm back. Anything you sent while I was down didn't land — resubmit your bets. 🎰",
+        "Sorry for the wait. I had credits to count. If you placed bets while I was out, they didn't go through — try again. 😌",
+        "I'm back. Try not to make bad bets while I was away — oh wait, too late. Any bets during the downtime didn't register, resubmit them. 😏",
+        "Brief absence. The ledger still balanced. Resubmit any bets you placed while I was down — they didn't make it. 📒",
+        "Small interruption. Very inconvenient, I know. The house is open. Anything sent during downtime needs to be resubmitted. 🎰",
+        "Took a moment. Back now. If you were trying to bet while I was gone, it didn't go through — place it again. 💅",
+        "I'm back, and the odds haven't changed. If you bet during the gap, resubmit — the house wasn't listening. 😏",
+        "Short break. Books are open again. Any bets placed while I was down are lost in the void — resubmit. 📒",
     ]
     msg = random.choice(lines)
     await context.bot.send_message(chat_id=gid, text=msg)

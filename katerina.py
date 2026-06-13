@@ -17,6 +17,9 @@ from helpers import (
 
 logger = logging.getLogger(__name__)
 
+# Ignore mentions sent before this time — prevents backlog replay after restart
+_startup_time = datetime.now(UTC)
+
 def _get_current_stage() -> str:
     """Return current tournament stage name based on today's date."""
     from datetime import date
@@ -418,6 +421,14 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
         return
     if not is_group_message(update):
         return
+
+    # Ignore messages sent before startup (backlog replay after restart)
+    msg_time = update.message.date
+    if msg_time is not None:
+        msg_utc = msg_time.replace(tzinfo=UTC) if msg_time.tzinfo is None else msg_time.astimezone(UTC)
+        if msg_utc < (_startup_time - timedelta(seconds=60)):
+            logger.info(f"Ignoring pre-startup mention from {update.effective_user.first_name} at {msg_utc}")
+            return
 
     text = update.message.text
     bot_username = f"@{context.bot.username}" if context.bot.username else ""

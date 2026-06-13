@@ -116,6 +116,8 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
         header = "📅 Today's Matches\n"
 
     lines = [header]
+    parlay_summary = {}  # parlay_id -> {name, total_legs, stake, multiplier, legs_seen}
+
     for m in sorted(day_matches, key=lambda x: x["kickoff_utc"]):
         kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
         kickoff_sgt = kickoff_utc_dt.astimezone(SGT)
@@ -158,9 +160,38 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     icon = " ❌"
                 else:
                     icon = ""
-                lines.append(f"• {name} — {outcome_label} — {b['amount']}c{icon}")
+
+                pid = b.get("parlay_id", "")
+                if pid:
+                    # Collect parlay info for summary
+                    if pid not in parlay_summary:
+                        all_legs = sheet.get_parlay_bets(pid)
+                        total_legs = len(all_legs)
+                        from config import PARLAY_MULTIPLIERS
+                        multiplier = PARLAY_MULTIPLIERS.get(total_legs, PARLAY_MULTIPLIERS.get(4, 10.0))
+                        parlay_summary[pid] = {
+                            "name": name,
+                            "total_legs": total_legs,
+                            "stake": b["amount"],
+                            "multiplier": multiplier,
+                            "legs_seen": 0
+                        }
+                    parlay_summary[pid]["legs_seen"] += 1
+                    leg_num = parlay_summary[pid]["legs_seen"]
+                    total = parlay_summary[pid]["total_legs"]
+                    lines.append(f"• {name} — {outcome_label}{icon} — 🎰 {leg_num}/{total}")
+                else:
+                    lines.append(f"• {name} — {outcome_label} — {b['amount']}c{icon}")
 
         lines.append("")  # blank line between matches
+
+    # Parlay summary at bottom
+    if parlay_summary:
+        lines.append("🎰 Parlays")
+        for pid, p in parlay_summary.items():
+            potential = int(p["stake"] * p["multiplier"])
+            lines.append(f"• {p['name']} — {p['total_legs']}-leg · {p['stake']}c → {potential}c if all win")
+        lines.append("")
 
     await update.message.reply_text("\n".join(lines))
 
