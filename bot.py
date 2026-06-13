@@ -140,6 +140,7 @@ def setup_handlers():
     # Admin commands
     application.add_handler(CommandHandler("admin_announce", ca.cmd_admin_announce))
     application.add_handler(CommandHandler("admin_katerina_back", ca.cmd_admin_katerina_back))
+    application.add_handler(CommandHandler("admin_silent_hours", ca.cmd_admin_silent_hours))
     application.add_handler(CommandHandler("admin_status", ca.cmd_admin_status))
     application.add_handler(CommandHandler("admin_refresh", ca.cmd_admin_refresh))
     application.add_handler(CommandHandler("admin_result", ca.cmd_admin_result))

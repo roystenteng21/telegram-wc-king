@@ -533,6 +533,25 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
         history_str = "\n".join(list(_chat_history)[-50:])
         bot_context += f"\n\nRECENT GROUP CHAT (last {min(len(_chat_history), 50)} messages):\n{history_str}"
 
+    # During silent hours — DM sender instead of replying in group
+    if is_silent_hours():
+        import random
+        quiet_lines = [
+            "Quiet hours. Bets are still open but I'm not taking questions right now. Back at 7:30AM. 😌",
+            "I'm off the clock. Place your bets via /bet if you need to — I'll be back at 7:30AM. 🌙",
+            "Sleeping hours. The house is still open for bets, just not for chat. See you at 7:30AM. 😴",
+            "Quiet hours. Use /bet if you need to place one. Questions can wait till 7:30AM. 😌",
+            "Taking a break. Bets still work — just use /bet. I'm back at 7:30AM SGT. 🌙",
+        ]
+        try:
+            await application.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=random.choice(quiet_lines)
+            )
+        except Exception as e:
+            logger.warning(f"Could not DM {update.effective_user.id} during silent hours: {e}")
+        return
+
     reply = await _call_katerina(clean, bot_context, sender_name=sender_name, sender_stats=sender_stats)
     if reply:
         await update.message.reply_text(reply)

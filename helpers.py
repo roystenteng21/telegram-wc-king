@@ -50,6 +50,9 @@ async def dm_admin(message: str):
 
 # ── Silent hours ──────────────────────────────────────────────────────────────
 def is_silent_hours() -> bool:
+    """Returns True if current SGT time is in silent hours AND toggle is on."""
+    if sheet.cache.get("silent_hours_disabled", False):
+        return False
     now_sgt = datetime.now(SGT)
     start = now_sgt.replace(hour=0, minute=0, second=0, microsecond=0)
     end = now_sgt.replace(hour=7, minute=30, second=0, microsecond=0)
