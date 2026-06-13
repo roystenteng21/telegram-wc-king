@@ -169,20 +169,49 @@ async def post_init(app):
         sched.init(app.bot, ENV_GROUP_CHAT_ID)
         logger.info(f"Group chat ID set from env: {ENV_GROUP_CHAT_ID}")
     sheet.ensure_events_tab()
-    await app.bot.set_my_commands([
-        ("matches", "Today's matches + kickoff times"),
-        ("bet", "Place a bet"),
-        ("parlay", "Place a parlay bet"),
-        ("mybets", "Your open bets"),
-        ("cancel", "Cancel an open bet"),
-        ("cancelparlay", "Cancel an active parlay"),
-        ("balance", "Your current credits"),
-        ("predict", "Free event prediction"),
-        ("groups", "Group stage standings"),
-        ("leaderboard", "Credits standings"),
-        ("roast", "Ask Katerina to roast someone"),
-        ("help", "Help"),
-    ])
+
+    # Player commands — visible in groups
+    from telegram import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
+    player_commands = [
+        BotCommand("matches", "Today's matches + kickoff times"),
+        BotCommand("bet", "Place a bet"),
+        BotCommand("parlay", "Place a parlay bet"),
+        BotCommand("mybets", "Your open bets"),
+        BotCommand("cancel", "Cancel an open bet"),
+        BotCommand("cancelparlay", "Cancel an active parlay"),
+        BotCommand("balance", "Your current credits"),
+        BotCommand("predict", "Free event prediction"),
+        BotCommand("groups", "Group stage standings"),
+        BotCommand("leaderboard", "Credits standings"),
+        BotCommand("roast", "Ask Katerina to roast someone"),
+        BotCommand("help", "Help"),
+    ]
+    await app.bot.set_my_commands(player_commands, scope=BotCommandScopeAllGroupChats())
+
+    # Admin commands — visible in DM only
+    admin_commands = player_commands + [
+        BotCommand("admin_status", "Bot health check"),
+        BotCommand("admin_refresh", "Reload fixtures from API"),
+        BotCommand("admin_result", "Manually set match result"),
+        BotCommand("admin_result_push", "Push FT result to group"),
+        BotCommand("admin_eod_push", "Push EOD to group"),
+        BotCommand("admin_poll", "Trigger result polling"),
+        BotCommand("admin_credits", "Adjust player credits"),
+        BotCommand("admin_cancel_match", "Void all bets for a match"),
+        BotCommand("admin_announce", "Announce to group"),
+        BotCommand("admin_event", "Manage ad hoc events"),
+        BotCommand("admin_katerina_back", "Send Katerina back message"),
+        BotCommand("admin_silent_hours", "Toggle silent hours on|off"),
+        BotCommand("admin_simulate_eod", "Preview EOD message"),
+        BotCommand("admin_sim_night", "Preview 11PM message"),
+        BotCommand("admin_sim_morning", "Preview 7:30AM message"),
+        BotCommand("admin_sim_prematch", "Preview pre-match summary"),
+        BotCommand("admin_sim_kickoff", "Test kickoff message"),
+        BotCommand("admin_sim_result", "Preview FT result message"),
+        BotCommand("confirm_admin", "Confirm pending action"),
+        BotCommand("cancel_admin", "Cancel pending action"),
+    ]
+    await app.bot.set_my_commands(admin_commands, scope=BotCommandScopeAllPrivateChats())
     await sched.on_startup(notify_fn=dm_admin)
 
 
