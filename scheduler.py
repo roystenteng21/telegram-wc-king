@@ -168,22 +168,24 @@ def format_result_message(match: dict, settlements: list) -> str:
 # ── Night reminder (11PM SGT) ────────────────────────────────────────────────
 async def job_night_reminder():
     try:
-        tomorrow_sgt = (datetime.now(SGT) + timedelta(days=1)).strftime("%Y-%m-%d")
-        # Fetch two UTC dates to capture all matches that fall on tomorrow SGT
+        CT = pytz.timezone("America/Chicago")
+        tomorrow_ct = (datetime.now(CT) + timedelta(days=1)).strftime("%Y-%m-%d")
+        # Fetch three UTC dates to capture all matches that fall on tomorrow CT
+        today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
         tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
         day_after_utc = (datetime.now(UTC) + timedelta(days=2)).strftime("%Y-%m-%d")
         try:
-            raw = api.fetch_matches_for_date(tomorrow_utc) + api.fetch_matches_for_date(day_after_utc)
+            raw = api.fetch_matches_for_date(today_utc) + api.fetch_matches_for_date(tomorrow_utc) + api.fetch_matches_for_date(day_after_utc)
         except RuntimeError as e:
             await dm_admin(f"⚠️ Night reminder: failed to fetch tomorrow's fixtures: {e}")
             return
 
-        # Filter to matches whose SGT kickoff date = tomorrow SGT
+        # Filter to matches whose CT kickoff date = tomorrow CT
         matches = []
         for m in raw:
             try:
                 ko = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-                if ko.astimezone(SGT).strftime("%Y-%m-%d") == tomorrow_sgt:
+                if ko.astimezone(CT).strftime("%Y-%m-%d") == tomorrow_ct:
                     matches.append(m)
             except Exception:
                 continue
@@ -300,6 +302,7 @@ async def job_morning_catchup():
         # Only clear pending messages after confirmed send
         sheet.cache["pending_result_messages"] = []
         sheet.cache["pending_parlay_wins"] = []
+        await sheet.clear_pending_msgs(notify_fn=dm_admin)
         logger.info("Morning catchup sent")
     except Exception as e:
         logger.error(f"Morning catchup job failed: {e}")
@@ -516,6 +519,7 @@ async def job_poll_result(match_id: str, attempt: int = 1):
             if "pending_result_messages" not in sheet.cache:
                 sheet.cache["pending_result_messages"] = []
             sheet.cache["pending_result_messages"].append(result_msg)
+            await sheet.append_pending_msg(result_msg, notify_fn=dm_admin)
             # Store parlay wins too
             if parlay_wins:
                 if "pending_parlay_wins" not in sheet.cache:
@@ -750,6 +754,10 @@ async def job_post_standings(match_ids: list):
 
         await send_group("\n".join(lines))
         logger.info("End of day standings and daily credits posted")
+
+        # Stage transition check — fire Katerina hype in background if today ends a stage
+        import katerina as _katerina
+        asyncio.create_task(_katerina.check_and_send_stage_hype(notify_fn=dm_admin))
 
     except Exception as e:
         logger.error(f"Post standings job failed: {e}")

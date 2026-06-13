@@ -64,7 +64,8 @@ async def send_confirmation(update, message: str):
     user = update.effective_user
     if is_silent_hours():
         try:
-            await application.bot.send_message(chat_id=user.id, text=message)
+            dm_message = message + "\n\n🔕 Sent here to minimise group notifications (12AM–7:30AM SGT)."
+            await application.bot.send_message(chat_id=user.id, text=dm_message)
             return
         except Exception:
             pass

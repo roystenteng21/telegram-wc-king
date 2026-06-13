@@ -274,30 +274,65 @@ async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_mybets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_registered(update)
     user_id = update.effective_user.id
-    open_bets = await sheet.get_user_open_bets(user_id)
 
-    if not open_bets:
+    all_open = [b for b in sheet.cache["bets"] if b["user_id"] == user_id and b["status"] == "open"]
+
+    if not all_open:
         await update.message.reply_text("You have no open bets.")
         return
 
+    singles = [b for b in all_open if not b.get("parlay_id", "")]
+    parlay_ids = []
+    seen = set()
+    for b in all_open:
+        pid = b.get("parlay_id", "")
+        if pid and pid not in seen:
+            parlay_ids.append(pid)
+            seen.add(pid)
+
     lines = ["📋 Your open bets:\n"]
-    for i, bet in enumerate(open_bets, 1):
-        match = await sheet.get_match_by_id(bet["match_id"])
-        if match:
-            outcome_label = format_outcome_label(bet["outcome"], match)
-            if bet["outcome"] in ("home", "away"):
-                team = match["home"] if bet["outcome"] == "home" else match["away"]
-                flag = TEAM_DISPLAY[team][1] if team in TEAM_DISPLAY else ""
-                label = f"{flag} {outcome_label}"
-            else:
+
+    # Singles
+    if singles:
+        lines.append("Singles:")
+        for i, bet in enumerate(singles, 1):
+            match = await sheet.get_match_by_id(bet["match_id"])
+            if match:
+                outcome_label = format_outcome_label(bet["outcome"], match)
                 home = format_team(match["home"])
                 away = format_team(match["away"])
                 label = f"{home} vs {away} — {outcome_label}"
-        else:
-            label = f"Match {bet['match_id']} — {bet['outcome'].capitalize()}"
-        lines.append(f"{i}. {label} — {bet['amount']}c")
+            else:
+                label = f"Match {bet['match_id']} — {bet['outcome'].capitalize()}"
+            lines.append(f"{i}. {label} — {bet['amount']}c")
 
-    lines.append("\nUse /cancel to cancel a bet.")
+    # Parlays
+    for pid in parlay_ids:
+        legs = sheet.get_parlay_bets(pid)
+        if not legs:
+            continue
+        stake = legs[0]["amount"]
+        multiplier = PARLAY_MULTIPLIERS.get(len(legs), PARLAY_MULTIPLIERS.get(4, 10.0))
+        potential = int(stake * multiplier)
+        lines.append(f"\n🎰 Parlay ({len(legs)}-leg · {stake}c → {potential}c if all win):")
+        for leg in legs:
+            match = await sheet.get_match_by_id(leg["match_id"])
+            if match:
+                outcome_label = format_outcome_label(leg["outcome"], match)
+                home = format_team(match["home"])
+                away = format_team(match["away"])
+                lines.append(f"• {home} vs {away} — {outcome_label}")
+            else:
+                lines.append(f"• Match {leg['match_id']} — {leg['outcome'].capitalize()}")
+
+    footer = []
+    if singles:
+        footer.append("/cancel to cancel a single bet.")
+    if parlay_ids:
+        footer.append("/cancelparlay to cancel a parlay.")
+    if footer:
+        lines.append("\n" + " ".join(footer))
+
     await update.message.reply_text("\n".join(lines))
 
 
@@ -468,9 +503,9 @@ async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # During silent hours — DM only
         if is_silent_hours():
             try:
-                await application.bot.send_message(chat_id=user.id, text=confirm_msg)
+                dm_msg = confirm_msg + "\n\n🔕 Sent here to minimise group notifications (12AM–7:30AM SGT)."
+                await application.bot.send_message(chat_id=user.id, text=dm_msg)
             except Exception:
-                # Can't DM — reply in group quietly
                 await update.message.reply_text(confirm_msg)
         else:
             await update.message.reply_text(confirm_msg)
@@ -737,7 +772,8 @@ async def cmd_parlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         confirm_msg = "\n".join(lines)
         if is_silent_hours():
             try:
-                await application.bot.send_message(chat_id=user.id, text=confirm_msg)
+                dm_msg = confirm_msg + "\n\n🔕 Sent here to minimise group notifications (12AM–7:30AM SGT)."
+                await application.bot.send_message(chat_id=user.id, text=dm_msg)
             except Exception:
                 await update.message.reply_text(confirm_msg)
         else:

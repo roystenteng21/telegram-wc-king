@@ -415,7 +415,71 @@ async def cmd_roast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Katerina mention handler ──────────────────────────────────────────────────
-async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_stage_hype(current_stage: str, next_stage: str, notify_fn=None) -> bool:
+    """Generate and send a Katerina stage transition hype message. Returns True if sent."""
+    try:
+        standings = sheet.get_standings()
+        leader = standings[0] if standings else None
+        leader_name = (leader.get("first_name") or leader.get("username") or "Someone")[:10] if leader else "Someone"
+        from config import PRIZE_PLAYER_COUNT, PRIZE_PER_PLAYER
+        prize_pool = PRIZE_PLAYER_COUNT * PRIZE_PER_PLAYER
+
+        prompt = (
+            f"The {current_stage} has just ended. The {next_stage} begins tomorrow. "
+            f"You are Katerina, the savage, unfiltered hype bot for WC Kings 2026, a private betting group. "
+            f"Write a hype message that gets the group absolutely fired up. Be dramatic, ruthless, and exciting. "
+            f"Trash the teams that got eliminated if relevant. Hype the stakes. "
+            f"End with one line mentioning that {leader_name} is currently leading the pack, "
+            f"and that the prize pool is ${prize_pool} SGD — a jersey and dining vouchers on the line. "
+            f"Keep it under 180 words. No hashtags."
+        )
+
+        bot_context = _build_katerina_context()
+        hype = await _call_katerina(prompt, bot_context)
+        if not hype:
+            if notify_fn:
+                await notify_fn(f"⚠️ Katerina stage hype failed — no response from API. Use /admin_stage_hype manually.")
+            return False
+
+        from scheduler import send_group
+        await send_group(f"🔥 {hype}")
+        logger.info(f"Stage hype sent: {current_stage} → {next_stage}")
+        return True
+    except Exception as e:
+        logger.error(f"Stage hype failed: {e}")
+        if notify_fn:
+            await notify_fn(f"⚠️ Stage hype failed: {e}")
+        return False
+
+
+async def check_and_send_stage_hype(notify_fn=None):
+    """
+    Called after EOD. Checks if today is the last day of a stage and tomorrow
+    starts a new one. If so, fires Katerina hype. No-op if no transition detected.
+    """
+    from datetime import date
+    import pytz as _pytz
+    CT = _pytz.timezone("America/Chicago")
+    today_ct = datetime.now(CT).date()
+    tomorrow_ct = today_ct + timedelta(days=1)
+
+    current_stage = None
+    next_stage = None
+
+    for i, stage in enumerate(TOURNAMENT_STAGES):
+        if stage["start"] <= today_ct <= stage["end"]:
+            current_stage = stage["name"]
+            # Check if today is the last day of this stage
+            if today_ct == stage["end"] and i + 1 < len(TOURNAMENT_STAGES):
+                next_stage = TOURNAMENT_STAGES[i + 1]["name"]
+            break
+
+    if not current_stage or not next_stage:
+        logger.info("Stage hype check: no transition today, skipping")
+        return
+
+    logger.info(f"Stage transition detected: {current_stage} → {next_stage}, firing hype")
+    await send_stage_hype(current_stage, next_stage, notify_fn=notify_fn)
     """Reply when bot is @mentioned or 'katerina' appears in message."""
     if not update.message or not update.message.text:
         return

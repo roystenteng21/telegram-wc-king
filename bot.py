@@ -140,6 +140,7 @@ def setup_handlers():
     # Admin commands
     application.add_handler(CommandHandler("admin_announce", ca.cmd_admin_announce))
     application.add_handler(CommandHandler("admin_katerina_back", ca.cmd_admin_katerina_back))
+    application.add_handler(CommandHandler("admin_stage_hype", ca.cmd_admin_stage_hype))
     application.add_handler(CommandHandler("admin_silent_hours", ca.cmd_admin_silent_hours))
     application.add_handler(CommandHandler("admin_status", ca.cmd_admin_status))
     application.add_handler(CommandHandler("admin_refresh", ca.cmd_admin_refresh))
@@ -201,6 +202,7 @@ async def post_init(app):
         BotCommand("admin_announce", "Announce to group"),
         BotCommand("admin_event", "Manage ad hoc events"),
         BotCommand("admin_katerina_back", "Send Katerina back message"),
+        BotCommand("admin_stage_hype", "Trigger Katerina stage transition hype"),
         BotCommand("admin_silent_hours", "Toggle silent hours on|off"),
         BotCommand("admin_simulate_eod", "Preview EOD message"),
         BotCommand("admin_sim_night", "Preview 11PM message"),

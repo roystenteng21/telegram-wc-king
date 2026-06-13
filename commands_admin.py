@@ -833,6 +833,40 @@ async def cmd_admin_katerina_back(update: Update, context: ContextTypes.DEFAULT_
     await update.message.reply_text("✅ Katerina's back message sent.")
 
 
+async def cmd_admin_stage_hype(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually trigger Katerina stage hype. Usage: /admin_stage_hype [current stage] | [next stage]"""
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+
+    import katerina as _katerina
+    from config import TOURNAMENT_STAGES
+
+    if not context.args:
+        stage_names = " / ".join(s["name"] for s in TOURNAMENT_STAGES)
+        await update.message.reply_text(
+            f"Usage: /admin_stage_hype [current] | [next]\n"
+            f"Stages: {stage_names}\n"
+            f"Example: /admin_stage_hype Group Stage | Round of 32"
+        )
+        return
+
+    raw = " ".join(context.args)
+    if "|" not in raw:
+        await update.message.reply_text("Separate current and next stage with |.\nExample: /admin_stage_hype Group Stage | Round of 32")
+        return
+
+    parts = raw.split("|", 1)
+    current_stage = parts[0].strip()
+    next_stage = parts[1].strip()
+
+    await update.message.reply_text(f"Firing Katerina hype: {current_stage} → {next_stage}...")
+    sent = await _katerina.send_stage_hype(current_stage, next_stage, notify_fn=dm_admin)
+    if sent:
+        await update.message.reply_text("✅ Stage hype sent to group.")
+    else:
+        await update.message.reply_text("⚠️ Stage hype failed — check admin DM for details.")
+
+
 async def cmd_admin_silent_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Toggle silent hours on/off. Resets to on on bot restart."""
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
