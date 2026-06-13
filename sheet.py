@@ -212,12 +212,12 @@ async def update_user_credits(user_id: int, new_credits: int, notify_fn=None):
         if not row_num:
             raise ValueError(f"User {user_id} row not in cache — run refresh")
         ws = get_sheet(SHEET_USERS)
-        ws.update_cell(row_num, 4, new_credits)  # col 4 = credits
+        await with_retry(ws.update_cell, row_num, 4, new_credits)
         cache["users"][user_id]["credits"] = new_credits
     except Exception as e:
         logger.error(f"Failed to update credits for {user_id}: {e}")
         if notify_fn:
-            await notify_fn(f"⚠️ Failed to update credits for user {user_id}: {e}")
+            await notify_fn(f"⚠️ Failed to update credits for user {user_id} after retries: {e}")
         raise
 
 async def refresh_display_name(user_id: int, username: str, first_name: str, notify_fn=None):
@@ -509,8 +509,8 @@ async def settle_bets_for_match(match_id: str, result: str, ou_result: str, noti
 
             row_num = _bet_rows.get(bet["bet_id"])
             if row_num:
-                ws.update_cell(row_num, 7, status)
-                ws.update_cell(row_num, 8, 0 if is_parlay_leg else payout)
+                await with_retry(ws.update_cell, row_num, 7, status)
+                await with_retry(ws.update_cell, row_num, 8, 0 if is_parlay_leg else payout)
             bet["status"] = status
             bet["payout"] = 0 if is_parlay_leg else payout
 
@@ -536,7 +536,7 @@ async def settle_bets_for_match(match_id: str, result: str, ou_result: str, noti
     except Exception as e:
         logger.error(f"Failed to settle bets for match {match_id}: {e}")
         if notify_fn:
-            await notify_fn(f"⚠️ Failed to settle bets for match {match_id}: {e}")
+            await notify_fn(f"⚠️ Failed to settle bets for match {match_id} after retries: {e}")
         raise
 
 async def void_all_bets_for_match(match_id: str, notify_fn=None):
@@ -607,9 +607,9 @@ async def append_ledger(user_id: int, type_: str, amount: int, balance_after: in
     try:
         await with_retry(get_sheet(SHEET_LEDGER).append_row, row)
     except Exception as e:
-        logger.error(f"Failed to write ledger for {user_id}: {e}")
+        logger.error(f"Failed to write ledger for {user_id} after retries: {e}")
         if notify_fn:
-            await notify_fn(f"⚠️ Failed to write ledger entry for user {user_id}: {e}")
+            await notify_fn(f"⚠️ Failed to write ledger entry for user {user_id} after retries: {e}")
 
 # ── Daily credits ────────────────────────────────────────────────────────────
 async def add_daily_credits(daily_amount: int, notify_fn=None):

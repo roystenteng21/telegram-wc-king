@@ -85,6 +85,7 @@ def format_team(name: str) -> str:
     if name in TEAM_DISPLAY:
         code, flag = TEAM_DISPLAY[name]
         return f"{flag} {code}"
+    logger.warning(f"Team not in TEAM_DISPLAY: '{name}'")
     return name[:3].upper()
 
 

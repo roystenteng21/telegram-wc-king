@@ -30,6 +30,7 @@ def format_team(name: str) -> str:
     if name in TEAM_DISPLAY:
         code, flag = TEAM_DISPLAY[name]
         return f"{flag} {code}"
+    logger.warning(f"Team not in TEAM_DISPLAY: '{name}'")
     return name[:3].upper()
 
 
@@ -68,23 +69,30 @@ def is_silent_hours() -> bool:
     return start <= now_sgt < end
 
 
-# ── Last match of day check ───────────────────────────────────────────────────
-async def is_last_match_of_day(match_id: str) -> bool:
-    """Returns True if match_id is the only unfinished match left on today's CT date."""
+# ── CT date helper ────────────────────────────────────────────────────────────
+async def get_today_ct_matches() -> list:
+    """Return all matches whose kickoff falls on today's CT date."""
     CT = pytz.timezone("America/Chicago")
     today_ct = datetime.now(CT).strftime("%Y-%m-%d")
     today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
     tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
 
     all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
-    today_matches = []
+    result = []
     for m in all_matches:
         try:
             kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
             if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct:
-                today_matches.append(m)
+                result.append(m)
         except Exception:
             continue
+    return result
+
+
+# ── Last match of day check ───────────────────────────────────────────────────
+async def is_last_match_of_day(match_id: str) -> bool:
+    """Returns True if match_id is the only unfinished match left on today's CT date."""
+    today_matches = await get_today_ct_matches()
 
     for m in today_matches:
         if str(m["match_id"]) == str(match_id):
@@ -185,18 +193,12 @@ async def job_night_reminder():
 async def job_morning_catchup():
     try:
         import random
-        CT = pytz.timezone("America/Chicago")
-        today_ct = datetime.now(CT).strftime("%Y-%m-%d")
-        today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
-        tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
-        all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
-
+        today_matches_raw = await get_today_ct_matches()
         today_matches = []
-        for m in all_matches:
+        for m in today_matches_raw:
             try:
                 kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-                if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct:
-                    today_matches.append((kickoff_utc_dt, m))
+                today_matches.append((kickoff_utc_dt, m))
             except Exception:
                 continue
 
@@ -539,18 +541,7 @@ async def check_all_matches_done():
     try:
         CT = pytz.timezone("America/Chicago")
         today_ct = datetime.now(CT).strftime("%Y-%m-%d")
-        today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
-        tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
-
-        all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
-        today_matches = []
-        for m in all_matches:
-            try:
-                kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-                if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct:
-                    today_matches.append(m)
-            except Exception:
-                continue
+        today_matches = await get_today_ct_matches()
 
         if not today_matches:
             return
@@ -583,6 +574,9 @@ async def check_all_matches_done():
 async def job_post_standings(match_ids: list):
     try:
         import random
+        # Force fresh data before P&L and credit calculations
+        await sheet.refresh_cache(notify_fn=dm_admin)
+
         # Normalise all match_ids to str to avoid int/str comparison mismatches
         match_ids = [str(mid) for mid in match_ids]
 
