@@ -37,9 +37,10 @@ TOURNAMENT_FINAL_DATE = _date(2026, 7, 19)
 # ── Prize pool ────────────────────────────────────────────────────────────────
 PRIZE_PLAYER_COUNT = 5
 PRIZE_PER_PLAYER = 80  # SGD
+PRIZE_POOL = PRIZE_PLAYER_COUNT * PRIZE_PER_PLAYER
 PRIZE_INFO = (
-    f"Prize pool: {PRIZE_PLAYER_COUNT} players × $80 = $400 SGD total. "
-    "1st place wins the World Cup champion jersey plus the remaining pool value in dining vouchers. "
+    f"Prize pool: {PRIZE_PLAYER_COUNT} players × $80 = ${PRIZE_POOL} total. "
+    "1st place wins the World Cup champion jersey plus dining vouchers (remainder after jerseys). "
     "2nd place wins the World Cup runner-up jersey. "
     "Winner is determined by highest credits at the end of the tournament (after the World Cup Final on July 19, 2026). "
     "No tiebreaker rule — credits standings are final."

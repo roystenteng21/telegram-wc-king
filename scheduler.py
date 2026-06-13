@@ -707,12 +707,51 @@ async def job_post_standings(match_ids: list):
             user = sheet.cache["users"].get(uid, {})
             return (user.get("first_name") or user.get("username") or "Someone")
 
-        # Biggest winner today
+        # Biggest winner + biggest loser combined commentary
         if pl_map:
             best_uid = max(pl_map, key=lambda u: pl_map[u])
+            worst_uid = min(pl_map, key=lambda u: pl_map[u])
             best_pl = pl_map[best_uid]
-            if best_pl > 0:
-                lines.append(f"\n🎉 {get_name(best_uid)} had the biggest win today with +{best_pl}c!")
+            worst_pl = pl_map[worst_uid]
+            best_name = get_name(best_uid)
+            worst_name = get_name(worst_uid)
+
+            if best_pl > 0 and worst_pl < 0 and best_uid != worst_uid:
+                combined = random.choice([
+                    f"{best_name} cleaned up today with +{best_pl}c while {worst_name} took a {worst_pl}c beating. Rough day to be {worst_name}. 😬",
+                    f"{best_name} pocketed +{best_pl}c today. {worst_name} lost {worst_pl}c. One of these people is sleeping well tonight. 😏",
+                    f"Big day for {best_name} (+{best_pl}c), terrible day for {worst_name} ({worst_pl}c). The leaderboard doesn't lie. 📊",
+                    f"{best_name}'s up +{best_pl}c, {worst_name}'s down {worst_pl}c. Someone's buying drinks, someone else is crying into theirs. 💸",
+                    f"+{best_pl}c for {best_name}, {worst_pl}c for {worst_name}. The gap between winner and loser is wider than their egos. 😅",
+                    f"{best_name} wins the day with +{best_pl}c. {worst_name} loses the day with {worst_pl}c. That's just how it goes. 🤷",
+                    f"{best_name} had a great read today (+{best_pl}c). {worst_name} did not ({worst_pl}c). Simple as that. 😌",
+                    f"Today's MVP: {best_name} with +{best_pl}c. Today's 🤡: {worst_name} with {worst_pl}c. Better luck tomorrow.",
+                    f"{best_name} is tonight's winner (+{best_pl}c). {worst_name} is tonight's cautionary tale ({worst_pl}c). 📖",
+                    f"Good news for {best_name}: +{best_pl}c. Bad news for {worst_name}: {worst_pl}c. Guess who's happier right now. 😏",
+                    f"{best_name} called it right and walked away +{best_pl}c richer. {worst_name} called it wrong and is {worst_pl}c poorer. Brutal. 😤",
+                    f"+{best_pl}c for {best_name}. {worst_pl}c for {worst_name}. The house always collects, and today {worst_name} paid the price. 💀",
+                    f"{best_name} ends the day up {best_pl}c. {worst_name} ends it down {abs(worst_pl)}c. Someone needs to rethink their strategy. 🤔",
+                    f"Today's leaderboard shift: {best_name} up +{best_pl}c, {worst_name} down {worst_pl}c. Football is cruel and so is this game. ⚽",
+                    f"{best_name} made the right calls today (+{best_pl}c). {worst_name} made all the wrong ones ({worst_pl}c). Difference is {best_pl + abs(worst_pl)}c. 📉",
+                    f"Congrats to {best_name} on a +{best_pl}c day. Condolences to {worst_name} on a {worst_pl}c day. The market has spoken. 🎰",
+                    f"{best_name} knew something today (+{best_pl}c). {worst_name} thought they knew something ({worst_pl}c). Big difference. 😂",
+                    f"Winner of the day: {best_name} +{best_pl}c. Loser of the day: {worst_name} {worst_pl}c. At least tomorrow's a fresh slate. 🌅",
+                    f"{best_name} is grinning at +{best_pl}c. {worst_name} is not at {worst_pl}c. That's football for you. 😬",
+                    f"Today {best_name} ate well (+{best_pl}c). Today {worst_name} did not ({worst_pl}c). The bets don't lie. 🍽️",
+                    f"+{best_pl}c to {best_name}, {worst_pl}c from {worst_name}. Credits don't care about feelings. 💳",
+                    f"{best_name} with a strong +{best_pl}c today. {worst_name} with a rough {worst_pl}c. Bounce back tomorrow. 💪",
+                    f"Day goes to {best_name} (+{best_pl}c). Day takes from {worst_name} ({worst_pl}c). Such is the life of a degen. 🎲",
+                    f"{best_name} read the game (+{best_pl}c). {worst_name} read the wrong game ({worst_pl}c). It happens. 📰",
+                    f"Today's scorecard — {best_name}: +{best_pl}c ✅ {worst_name}: {worst_pl}c ❌. See everyone tomorrow.",
+                ])
+                lines.append(f"\n{combined}")
+            elif best_pl > 0:
+                solo = random.choice([
+                    f"🎉 {best_name} had the best day with +{best_pl}c. Everyone else, better luck tomorrow.",
+                    f"🎉 {best_name} leads the day with +{best_pl}c. The rest of you know what to do tomorrow.",
+                    f"🎉 +{best_pl}c for {best_name} today. Nice work. 👏",
+                ])
+                lines.append(f"\n{solo}")
 
         # Overtakes — compare before and after rankings
         before_ranks = {u["user_id"]: i+1 for i, u in enumerate(standings_before)}
