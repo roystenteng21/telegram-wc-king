@@ -62,7 +62,9 @@ async def send_group(message: str, parse_mode: str = None):
 
 # ── Silent hours check ────────────────────────────────────────────────────────
 def is_silent_hours() -> bool:
-    """Returns True if current SGT time is between 12:00 AM and 7:30 AM."""
+    """Returns True if current SGT time is between 12:00 AM and 7:30 AM AND silent hours are enabled."""
+    if sheet.cache.get("silent_hours_disabled", False):
+        return False
     now_sgt = datetime.now(SGT)
     start = now_sgt.replace(hour=0, minute=0, second=0, microsecond=0)
     end = now_sgt.replace(hour=7, minute=30, second=0, microsecond=0)
@@ -266,7 +268,6 @@ async def job_morning_catchup():
             lines.append("\n⚽ Overnight Results:")
             for msg in pending_results:
                 lines.append(f"\n{msg}")
-            sheet.cache["pending_result_messages"] = []
 
         # Upcoming matches today
         if upcoming_lines:
@@ -281,9 +282,11 @@ async def job_morning_catchup():
                 name = _get_user_name(p["user_id"])
                 legs_str = "\n".join(f"• {label} ✅" for label in p["leg_labels"])
                 lines.append(f"\n🎰 {name} hit a {p['legs']}-leg parlay!\n{legs_str}\n{p['stake']}c → {p['payout']}c 🔥")
-            sheet.cache["pending_parlay_wins"] = []
 
         await send_group("\n".join(lines))
+        # Only clear pending messages after confirmed send
+        sheet.cache["pending_result_messages"] = []
+        sheet.cache["pending_parlay_wins"] = []
         logger.info("Morning catchup sent")
     except Exception as e:
         logger.error(f"Morning catchup job failed: {e}")
@@ -755,7 +758,7 @@ def register_static_jobs():
         trigger=CronTrigger(hour=NIGHT_REMINDER_HOUR, minute=NIGHT_REMINDER_MINUTE, timezone=SGT),
         id="night_reminder",
         replace_existing=True,
-        misfire_grace_time=60
+        misfire_grace_time=600
     )
 
     # Morning catchup — 7:30AM SGT daily
@@ -764,7 +767,7 @@ def register_static_jobs():
         trigger=CronTrigger(hour=MORNING_CATCHUP_HOUR, minute=MORNING_CATCHUP_MINUTE, timezone=SGT),
         id="morning_catchup",
         replace_existing=True,
-        misfire_grace_time=60
+        misfire_grace_time=600
     )
 
     # Cache refresh — staggered to avoid colliding with cron jobs at :00 and :30
@@ -876,6 +879,20 @@ async def on_startup(notify_fn=None):
         register_match_jobs(all_today_matches)
 
         scheduler.start()
+
+        # Startup recovery — fire missed scheduled messages if bot restarted during their window
+        now_sgt = datetime.now(SGT)
+        # Night reminder: fire if restart in the 11PM hour
+        if now_sgt.hour == NIGHT_REMINDER_HOUR:
+            logger.info("Startup during 11PM hour — firing night reminder immediately")
+            scheduler.add_job(job_night_reminder, trigger=DateTrigger(run_date=datetime.now(UTC) + timedelta(seconds=5)), id="night_reminder_recovery", replace_existing=True)
+        # Morning catchup: fire if restart between 7:30AM and 8:00AM SGT
+        elif now_sgt.hour == MORNING_CATCHUP_HOUR and now_sgt.minute >= MORNING_CATCHUP_MINUTE:
+            logger.info("Startup during morning catchup window — firing morning catchup immediately")
+            scheduler.add_job(job_morning_catchup, trigger=DateTrigger(run_date=datetime.now(UTC) + timedelta(seconds=5)), id="morning_catchup_recovery", replace_existing=True)
+        elif now_sgt.hour == MORNING_CATCHUP_HOUR + 1 and now_sgt.minute < 30:
+            logger.info("Startup shortly after morning catchup — firing morning catchup immediately")
+            scheduler.add_job(job_morning_catchup, trigger=DateTrigger(run_date=datetime.now(UTC) + timedelta(seconds=5)), id="morning_catchup_recovery", replace_existing=True)
 
         if _bot is not None:
             await dm_admin(
