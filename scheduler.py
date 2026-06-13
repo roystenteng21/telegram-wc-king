@@ -137,14 +137,14 @@ def _get_user_name(uid: int) -> str:
     return (user.get("first_name") or user.get("username") or "Someone")
 
 
-def format_result_message(match: dict, settlements: list) -> str:
+def format_result_message(match: dict, settlements: list, parlay_wins: list = None) -> str:
     home_display = format_team(match["home"])
     away_display = format_team(match["away"])
     ou_label = "Over 2.5" if match["ou_result"] == "over" else "Under 2.5"
 
     lines = [
-        f"{home_display} {match['home_score']}–{match['away_score']} {away_display}",
-        f"{_outcome_label(match['result'], match)} · {ou_label}",
+        f"{home_display} {match['home_score']}\u2013{match['away_score']} {away_display}",
+        f"{_outcome_label(match['result'], match)} \u00b7 {ou_label}",
         "",
     ]
 
@@ -152,15 +152,45 @@ def format_result_message(match: dict, settlements: list) -> str:
         lines.append("No bets placed on this match.")
         return "\n".join(lines)
 
-    def get_name(s):
+    def get_name_str(uid):
+        user = sheet.cache["users"].get(uid, {})
+        return (user.get("first_name") or user.get("username") or "?")[:10]
+
+    def sort_key(s):
         user = sheet.cache["users"].get(s["user_id"], {})
         return (user.get("first_name") or user.get("username") or "").lower()
 
-    for s in sorted(settlements, key=get_name):
-        user = sheet.cache["users"].get(s["user_id"], {})
-        name = (user.get("first_name") or user.get("username") or "?")[:10]
-        icon = "✅" if s["status"] == "won" else "❌"
-        lines.append(f"{name} — {_outcome_label(s['outcome'], match)} — {s['amount']}c {icon}")
+    # Separate singles from parlay legs
+    singles = [s for s in settlements if not s.get("parlay_id", "")]
+    parlay_legs = [s for s in settlements if s.get("parlay_id", "")]
+
+    for s in sorted(singles, key=sort_key):
+        name = get_name_str(s["user_id"])
+        icon = "\u2705" if s["status"] == "won" else "\u274c"
+        lines.append(f"{name} \u2014 {_outcome_label(s['outcome'], match)} \u2014 {s['amount']}c {icon}")
+
+    # Parlay shoutouts -- only winning parlays, grouped
+    if parlay_wins:
+        for pid, p in parlay_wins:
+            name = get_name_str(p["user_id"])
+            legs_str = "\n".join(f"\u2022 {label} \u2705" for label in p["leg_labels"])
+            lines.append(f"\n\U0001f3b0 {name}'s parlay ({p['legs']}-leg):\n{legs_str}\n{p['stake']}c \u2192 {p['payout']}c \U0001f525")
+    elif parlay_legs:
+        # Parlay legs exist but none won -- show grouped without shoutout
+        seen_pids = {}
+        for s in sorted(parlay_legs, key=sort_key):
+            pid = s.get("parlay_id", "")
+            if pid not in seen_pids:
+                seen_pids[pid] = []
+            seen_pids[pid].append(s)
+        for pid, legs in seen_pids.items():
+            name = get_name_str(legs[0]["user_id"])
+            leg_lines = "\n".join(
+                f"\u2022 {_outcome_label(l['outcome'], match)} {'\u2705' if l['status'] == 'won' else '\u274c'}"
+                for l in legs
+            )
+            stake = legs[0]["amount"]
+            lines.append(f"\n\U0001f3b0 {name}'s parlay:\n{leg_lines}\n{stake}c \u2192 lost")
 
     return "\n".join(lines)
 
@@ -224,7 +254,6 @@ async def job_morning_catchup():
             return
 
         lines = ["☀️ Good morning! Catch up from last night:\n"]
-        now_utc = datetime.now(UTC)
 
         overnight_match_ids = []
         upcoming_lines = []
@@ -233,70 +262,84 @@ async def job_morning_catchup():
             away_d = format_team(m["away"])
             if m["status"] == "FINISHED":
                 overnight_match_ids.append(m["match_id"])
-                # Only show score here if no pending result message (i.e. wasn't suppressed)
-                pending_results = sheet.cache.get("pending_result_messages", [])
-                if not pending_results:
-                    ou_label = "Over 2.5" if m["ou_result"] == "over" else "Under 2.5"
-                    lines.append(f"{home_d} {m['home_score']}–{m['away_score']} {away_d} · {ou_label}")
             elif m["status"] in ("IN_PLAY", "PAUSED", "HALFTIME"):
-                lines.append(f"{home_d} vs {away_d} — ● In Play")
+                upcoming_lines.append(f"{home_d} vs {away_d} — ● In Play")
             else:
                 time_str = kickoff_utc_dt.astimezone(SGT).strftime("%I:%M %p SGT").lstrip("0")
                 upcoming_lines.append(f"{home_d} vs {away_d} — {time_str}")
 
-        # Fun line based on overnight match results
+        # Overnight match results — use full post-match format
+        pending_results = sheet.cache.get("pending_result_messages", [])
+        if pending_results:
+            for msg in pending_results:
+                lines.append(msg)
+                lines.append("")
+        elif overnight_match_ids:
+            # No pending results (result wasn't suppressed) — show scores only
+            for mid in overnight_match_ids:
+                m = await sheet.get_match_by_id(mid)
+                if m and m["status"] == "FINISHED":
+                    home_d = format_team(m["home"])
+                    away_d = format_team(m["away"])
+                    ou_label = "Over 2.5" if m["ou_result"] == "over" else "Under 2.5"
+                    lines.append(f"{home_d} {m['home_score']}–{m['away_score']} {away_d} · {ou_label}")
+            lines.append("")
+
+        # Upcoming matches today
+        if upcoming_lines:
+            lines.append("📅 Coming up today:")
+            for ul in upcoming_lines:
+                lines.append(ul)
+            lines.append("")
+
+        # Parlay wins from silent hours
+        pending_parlay = sheet.cache.get("pending_parlay_wins", [])
+        if pending_parlay:
+            for pid, p in pending_parlay:
+                name = _get_user_name(p["user_id"])
+                legs_str = "\n".join(f"• {label} ✅" for label in p["leg_labels"])
+                lines.append(f"🎰 {name} hit a {p['legs']}-leg parlay!\n{legs_str}\n{p['stake']}c → {p['payout']}c 🔥")
+                lines.append("")
+
+        # Fun line + encouragement at the bottom
+        def get_name(uid):
+            user = sheet.cache["users"].get(uid, {})
+            return (user.get("first_name") or user.get("username") or "Someone")
+
         if overnight_match_ids:
             pl_map = sheet.get_daily_pl(overnight_match_ids)
             if pl_map:
                 best_uid = max(pl_map, key=lambda u: pl_map[u])
-                worst_uid = min(pl_map, key=lambda u: pl_map[u])
                 best_pl = pl_map[best_uid]
-                worst_pl = pl_map[worst_uid]
+                all_lost = all(v <= 0 for v in pl_map.values())
+                no_bets = all(v == 0 for v in pl_map.values())
 
-                def get_name(uid):
-                    user = sheet.cache["users"].get(uid, {})
-                    return (user.get("first_name") or user.get("username") or "Someone")
-
-                if best_pl > 0:
+                if no_bets or not pl_map:
+                    fun = random.choice([
+                        "No bets on last night's game. Don't sleep on today's matches. ⚽",
+                        "Quiet night on the bets. Today's matches are up — get involved. 👀",
+                    ])
+                elif all_lost:
+                    fun = random.choice([
+                        "Rough night for everyone. Day's not over — good luck! 🍀",
+                        "Nobody cashed in last night. Fresh start today. 💪",
+                        "The overnight shift was brutal. Make up for it today. ⚽",
+                        "Last night stung. Today's a clean slate — good luck. 🌅",
+                        "Not the night anyone wanted. Go get it back today. 💪",
+                    ])
+                elif best_pl > 0:
                     name = get_name(best_uid)
                     fun = random.choice([
-                        f"{name} won big while everyone was asleep! 💰",
-                        f"{name} woke up richer today! 😏",
-                        f"{name} had a good night's sleep and a good bet! 🤑",
-                    ])
-                elif worst_pl < 0:
-                    name = get_name(worst_uid)
-                    fun = random.choice([
-                        f"{name} woke up to a bad surprise! 😬",
-                        f"{name} lost big while everyone was sleeping! 😅",
-                        f"{name} might need more than coffee this morning! ☕",
+                        f"{name} cleaned up overnight (+{best_pl}c). Day's not over — good luck! 🍀",
+                        f"{name} cashed in while you were sleeping (+{best_pl}c). Make your move today. 💪",
+                        f"{name} had a good night (+{best_pl}c). Can anyone catch up today? 👀",
+                        f"Overnight winner: {name} with +{best_pl}c. Rest of you, today's another chance. 🌅",
+                        f"{name}'s already up +{best_pl}c before most of you had coffee. Good luck today. ☕",
                     ])
                 else:
-                    fun = None
+                    fun = "Day's not over — good luck today! 🍀"
 
-                if fun:
-                    lines.append(f"\n{fun}")
-
-        # Overnight match results held from silent hours (includes bet settlements)
-        pending_results = sheet.cache.get("pending_result_messages", [])
-        if pending_results:
-            lines.append("\n⚽ Overnight Results:")
-            for msg in pending_results:
-                lines.append(f"\n{msg}")
-
-        # Upcoming matches today
-        if upcoming_lines:
-            lines.append("\n📅 Coming up today:")
-            for ul in upcoming_lines:
-                lines.append(ul)
-
-        # Parlay wins from silent hours
-        pending = sheet.cache.get("pending_parlay_wins", [])
-        if pending:
-            for pid, p in pending:
-                name = _get_user_name(p["user_id"])
-                legs_str = "\n".join(f"• {label} ✅" for label in p["leg_labels"])
-                lines.append(f"\n🎰 {name} hit a {p['legs']}-leg parlay!\n{legs_str}\n{p['stake']}c → {p['payout']}c 🔥")
+                lines.append(fun)
 
         await send_group("\n".join(lines))
         # Only clear pending messages after confirmed send
@@ -503,15 +546,7 @@ async def job_poll_result(match_id: str, attempt: int = 1):
         parlay_wins = await check_parlay_completions(match_id)
 
         match = await sheet.get_match_by_id(match_id)
-        result_msg = format_result_message(match, settlements)
-
-        # Append parlay wins to result message
-        if parlay_wins:
-            result_msg += "\n"
-            for pid, p in parlay_wins:
-                name = _get_user_name(p["user_id"])
-                legs_str = "\n".join(f"• {label} ✅" for label in p["leg_labels"])
-                result_msg += f"\n🎰 {name} hit a {p['legs']}-leg parlay!\n{legs_str}\n{p['stake']}c → {p['payout']}c 🔥"
+        result_msg = format_result_message(match, settlements, parlay_wins=parlay_wins)
 
         if is_silent_hours() and not await is_last_match_of_day(match_id):
             logger.info(f"Match {match_id} result held — silent hours, not last match")
@@ -716,7 +751,22 @@ async def job_post_standings(match_ids: list):
             best_name = get_name(best_uid)
             worst_name = get_name(worst_uid)
 
-            if best_pl > 0 and worst_pl < 0 and best_uid != worst_uid:
+            all_lost = all(v <= 0 for v in pl_map.values())
+
+            if all_lost:
+                # Everyone lost or broke even — collective roast
+                roast = random.choice([
+                    f"Collective disaster today. Every single one of you lost credits. Impressive, in the worst possible way. 💀",
+                    f"Not one winner in the group today. Not one. You all managed to be wrong at the same time. That takes talent. 😂",
+                    f"The house didn't even need to try today. You all self-destructed. Goodnight. 🪦",
+                    f"Historic day. Everyone lost. Nobody read the game. The football read all of you instead. 📉",
+                    f"Group performance today: absolute zero. Every bet, every call, every read — wrong. See you tomorrow. 😐",
+                    f"A group of degens walked into a betting pool. Every single one of them lost. This is not a joke, this is your Tuesday. 💸",
+                    f"Today the group collectively donated to the void. No winners. Just vibes and losses. Regroup tomorrow. 😶",
+                    f"Clean sweep for the house today. Not one of you got it right. Remarkable levels of wrongness. 🎰",
+                ])
+                lines.append(f"\n{roast}")
+            elif best_pl > 0 and worst_pl < 0 and best_uid != worst_uid:
                 combined = random.choice([
                     f"{best_name} cleaned up today with +{best_pl}c while {worst_name} took a {worst_pl}c beating. Rough day to be {worst_name}. 😬",
                     f"{best_name} pocketed +{best_pl}c today. {worst_name} lost {worst_pl}c. One of these people is sleeping well tonight. 😏",
@@ -743,13 +793,28 @@ async def job_post_standings(match_ids: list):
                     f"Day goes to {best_name} (+{best_pl}c). Day takes from {worst_name} ({worst_pl}c). Such is the life of a degen. 🎲",
                     f"{best_name} read the game (+{best_pl}c). {worst_name} read the wrong game ({worst_pl}c). It happens. 📰",
                     f"Today's scorecard — {best_name}: +{best_pl}c ✅ {worst_name}: {worst_pl}c ❌. See everyone tomorrow.",
+                    f"{best_name} thriving at +{best_pl}c. {worst_name} surviving at {worst_pl}c. Two very different evenings ahead. 🌙",
+                    f"Sharp call from {best_name} today (+{best_pl}c). {worst_name} needs to go back to basics after that {worst_pl}c day. 📚",
+                    f"{best_name} is {best_pl}c richer. {worst_name} is {abs(worst_pl)}c poorer. The gap between them just got wider. 📏",
+                    f"If today were a match, {best_name} won and {worst_name} got relegated. +{best_pl}c vs {worst_pl}c. 🏟️",
+                    f"{best_name} trusted the process today (+{best_pl}c). {worst_name} trusted the wrong process ({worst_pl}c). 🔄",
+                    f"Easy day for {best_name} (+{best_pl}c). Rough night for {worst_name} ({worst_pl}c). That's the game. 🎯",
+                    f"{best_name} read it perfectly (+{best_pl}c). {worst_name} read it backwards ({worst_pl}c). Tomorrow's another chance. ⚽",
+                    f"Standings update: {best_name} climbing with +{best_pl}c, {worst_name} sliding with {worst_pl}c. Every match day counts. 📈",
+                    f"+{best_pl}c says {best_name} knows football. {worst_pl}c says {worst_name} is still learning. No shame in that. 😏",
+                    f"{best_name} cashed in today (+{best_pl}c). {worst_name} got cleaned out ({worst_pl}c). Same matches, very different outcomes. 🤯",
                 ])
                 lines.append(f"\n{combined}")
             elif best_pl > 0:
                 solo = random.choice([
-                    f"🎉 {best_name} had the best day with +{best_pl}c. Everyone else, better luck tomorrow.",
-                    f"🎉 {best_name} leads the day with +{best_pl}c. The rest of you know what to do tomorrow.",
-                    f"🎉 +{best_pl}c for {best_name} today. Nice work. 👏",
+                    f"{best_name} had the best day with +{best_pl}c. Everyone else broke even or stayed quiet. Smart. 🧠",
+                    f"Only {best_name} walked away up today with +{best_pl}c. The rest of you played it safe or paid for it. 😏",
+                    f"+{best_pl}c for {best_name} today. The only one who got it right. Noted. 👏",
+                    f"{best_name} is today's sole winner at +{best_pl}c. Sometimes one is enough. 🏆",
+                    f"One winner today: {best_name} with +{best_pl}c. Everyone else — same time tomorrow. ⏰",
+                    f"{best_name} goes home happy with +{best_pl}c. The rest of you go home. 😐",
+                    f"Quiet day for most, but {best_name} quietly pocketed +{best_pl}c. That's how it's done. 🤫",
+                    f"+{best_pl}c for {best_name} and nothing for the rest. Respectable. 🎯",
                 ])
                 lines.append(f"\n{solo}")
 
