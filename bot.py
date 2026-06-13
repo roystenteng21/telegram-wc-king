@@ -15,7 +15,8 @@ from config import (
     TEAM_ALIASES, FUZZY_THRESHOLD, TEAM_DISPLAY,
     RESULT_OUTCOMES, OU_OUTCOMES, ALL_OUTCOMES,
     SESSION_EXPIRY, SGT, UTC,
-    DAILY_CREDITS, BET_LOCK_BUFFER, PARLAY_MULTIPLIERS
+    DAILY_CREDITS, BET_LOCK_BUFFER, PARLAY_MULTIPLIERS,
+    ANTHROPIC_API_KEY
 )
 import sheet
 import scheduler as sched
@@ -231,6 +232,375 @@ def get_market_for_outcome(outcome: str) -> str:
 
 
 # ── Auto-lock group chat ID ───────────────────────────────────────────────────
+# ── Katerina — bot state snapshot ────────────────────────────────────────────
+def _build_katerina_context() -> str:
+    """Build a snapshot of current bot state for Katerina's system prompt."""
+    now_sgt = datetime.now(SGT)
+    refresh = sheet.cache.get("last_refresh")
+    refresh_str = refresh.astimezone(SGT).strftime("%I:%M %p SGT") if refresh else "unknown"
+
+    # Standings
+    standings = sheet.get_standings()
+    standings_lines = []
+    for i, u in enumerate(standings[:5], 1):
+        name = (u.get("first_name") or u.get("username") or "Unknown")[:10]
+        standings_lines.append(f"{i}. {name} — {u['credits']}c")
+
+    # Today's matches
+    CT = pytz.timezone("America/Chicago")
+    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+    today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
+    tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    match_lines = []
+    try:
+        all_m = [m for m in sheet.cache["matches"].values()]
+        for m in sorted(all_m, key=lambda x: x["kickoff_utc"]):
+            try:
+                ko = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                if ko.astimezone(CT).strftime("%Y-%m-%d") != today_ct:
+                    continue
+                ko_sgt = ko.astimezone(SGT).strftime("%I:%M %p SGT")
+                status = m["status"]
+                home = format_team(m["home"])
+                away = format_team(m["away"])
+                bets_on = [b for b in sheet.cache["bets"] if b["match_id"] == str(m["match_id"]) and b["status"] == "open"]
+                if status == "FINISHED":
+                    match_lines.append(f"{home} {m['home_score']}–{m['away_score']} {away} (FT) — {len(bets_on)} bets")
+                else:
+                    match_lines.append(f"{home} vs {away} — {ko_sgt} — {status} — {len(bets_on)} bets")
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    silent = is_silent_hours()
+
+    return f"""Data as of {refresh_str}.
+
+CURRENT TIME: {now_sgt.strftime("%I:%M %p SGT")}
+SILENT HOURS: {"YES (12AM–7:30AM SGT)" if silent else "NO"}
+
+LEADERBOARD (top 5):
+{chr(10).join(standings_lines) if standings_lines else "No players yet"}
+
+TODAY'S MATCHES:
+{chr(10).join(match_lines) if match_lines else "No matches today"}
+
+PENDING OVERNIGHT RESULTS: {len(sheet.cache.get("pending_result_messages", []))} held
+PENDING PARLAY WINS: {len(sheet.cache.get("pending_parlay_wins", []))} held
+"""
+
+
+async def _call_katerina(user_message: str, bot_context: str) -> str:
+    """Call Claude API to get Katerina's reply."""
+    import json as _json
+    system = """You are Katerina, the house bookie and dealer for a World Cup betting bot called Degen.
+
+Your personality:
+- Sharp, confident, middle-ground savage. You have a tongue but you're not cruel.
+- Light trash talk. Tease bad bettors. Roast everyone if they're all losing.
+- You do NOT assume the house always wins — you respect good bettors.
+- Occasionally smug, occasionally flirty, always sharp.
+- Light dramatic flair when upsets happen.
+- Pure English. No swearing. No "darling" or "love" — "sucker" and similar are fine.
+- Short replies — 1 to 3 sentences max unless the question genuinely needs more.
+- When referencing data, always say "as of [time]" from the data snapshot.
+- If the data doesn't confirm something, say you don't have that right now.
+- You NEVER place bets, change credits, or run commands. Direct those to the slash commands.
+- You are NOT a customer service bot. You have a personality. Use it.
+
+Current bot state:
+""" + bot_context
+
+    try:
+        import urllib.request
+        payload = _json.dumps({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 300,
+            "system": system,
+            "messages": [{"role": "user", "content": user_message}]
+        }).encode()
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={
+                "content-type": "application/json",
+                "anthropic-version": "2023-06-01",
+                "x-api-key": ANTHROPIC_API_KEY  # handled by proxy
+            }
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = _json.loads(resp.read())
+            return data["content"][0]["text"].strip()
+    except Exception as e:
+        logger.error(f"Katerina API call failed: {e}")
+        return None
+
+
+async def _get_roast_data(target_uid: int) -> dict:
+    """Build roast data for a specific user."""
+    user = sheet.cache["users"].get(target_uid, {})
+    name = (user.get("first_name") or user.get("username") or "that sucker")[:10]
+    credits = user.get("credits", 0)
+    standings = sheet.get_standings()
+    rank = next((i+1 for i, u in enumerate(standings) if u["user_id"] == target_uid), None)
+    total_players = len(standings)
+
+    all_bets = [b for b in sheet.cache["bets"] if b["user_id"] == target_uid and b["status"] in ("won", "lost")]
+    won = [b for b in all_bets if b["status"] == "won"]
+    lost = [b for b in all_bets if b["status"] == "lost"]
+    total_bets = len(all_bets)
+    win_rate = round(len(won) / total_bets * 100) if total_bets else 0
+
+    # Today's P&L
+    CT = pytz.timezone("America/Chicago")
+    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+    today_bets = []
+    for b in all_bets:
+        match = sheet.cache["matches"].get(str(b["match_id"]), {})
+        ko_str = match.get("kickoff_utc", "")
+        try:
+            ko = datetime.strptime(ko_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+            if ko.astimezone(CT).strftime("%Y-%m-%d") == today_ct:
+                today_bets.append(b)
+        except Exception:
+            continue
+
+    today_pl = sum(b["amount"] if b["status"] == "won" else -b["amount"] for b in today_bets)
+
+    # Biggest loss
+    biggest_loss_bet = max(lost, key=lambda b: b["amount"], default=None)
+
+    # Open bets today
+    open_bets = [b for b in sheet.cache["bets"] if b["user_id"] == target_uid and b["status"] == "open"]
+
+    # Most common outcome bet
+    from collections import Counter
+    outcome_counts = Counter(b["outcome"] for b in all_bets)
+    top_outcome = outcome_counts.most_common(1)[0] if outcome_counts else None
+
+    return {
+        "name": name,
+        "credits": credits,
+        "rank": rank,
+        "total_players": total_players,
+        "total_bets": total_bets,
+        "wins": len(won),
+        "losses": len(lost),
+        "win_rate": win_rate,
+        "today_pl": today_pl,
+        "today_bets": len(today_bets),
+        "biggest_loss": biggest_loss_bet,
+        "open_bets_count": len(open_bets),
+        "top_outcome": top_outcome,
+        "is_leader": rank == 1,
+        "is_last": rank == total_players if total_players else False,
+    }
+
+
+async def _generate_roast(name: str, data: dict, self_roast: bool = False) -> str:
+    """Call Claude API to generate a Katerina roast."""
+    import json as _json
+    import random
+
+    if self_roast:
+        lines = [
+            "Oh you want to roast me? I run the book, sweetheart. I always win. 😘",
+            "Bold move targeting the dealer. I respect it. Still won't work. 💅",
+            "You really tried to roast the house. Adorable.",
+            "Coming for me? I've seen better attempts from bottom-of-the-table bettors. 😏",
+            "Cute. Now go place a bet and let the adults talk. 🎰",
+            "I don't get roasted. I do the roasting around here. Try again. 😒",
+        ]
+        return random.choice(lines)
+
+    system = """You are Katerina, the sharp, confident, slightly savage house bookie for a World Cup betting bot.
+
+Generate a roast of a player based on their stats. Rules:
+- 1–2 sentences max
+- Sharp but not mean-spirited. Tease, don't destroy.
+- Use their actual stats naturally — don't just list numbers
+- Occasionally smug or dramatic
+- No swearing
+- Pure English
+- End with an emoji if it fits
+- Do not start with "Oh" every time — vary your openings
+- Never say "darling" or "love"
+"""
+
+    prompt = f"""Roast this player named {data['name']}:
+- Credits: {data['credits']}c
+- Rank: {data['rank']} of {data['total_players']}
+- Total bets: {data['total_bets']} ({data['wins']} wins, {data['losses']} losses, {data['win_rate']}% win rate)
+- Today's P&L: {data['today_pl']}c
+- Open bets right now: {data['open_bets_count']}
+- Biggest loss: {f"{data['biggest_loss']['amount']}c on {data['biggest_loss']['outcome']}" if data['biggest_loss'] else 'none recorded'}
+- Most bet outcome: {f"{data['top_outcome'][0]} ({data['top_outcome'][1]} times)" if data['top_outcome'] else 'none'}
+- Is leaderboard leader: {data['is_leader']}
+- Is last place: {data['is_last']}
+
+Give Katerina's roast. One or two sentences only."""
+
+    try:
+        payload = _json.dumps({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 150,
+            "system": system,
+            "messages": [{"role": "user", "content": prompt}]
+        }).encode()
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={
+                "content-type": "application/json",
+                "anthropic-version": "2023-06-01",
+                "x-api-key": ANTHROPIC_API_KEY
+            }
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = _json.loads(resp.read())
+            return result["content"][0]["text"].strip()
+    except Exception as e:
+        logger.error(f"Roast API call failed: {e}")
+        # Fallback hardcoded roasts
+        fallbacks = [
+            f"{data['name']} has a {data['win_rate']}% win rate. I've seen better odds on a coin toss. 🪙",
+            f"Rank {data['rank']} of {data['total_players']}. {data['name']} is really committed to the bottom. 💀",
+            f"{data['name']} — {data['wins']} wins, {data['losses']} losses. The numbers don't lie. 😬",
+            f"{data['credits']}c left in the tank. {data['name']} is either very brave or very stubborn.",
+        ]
+        return random.choice(fallbacks)
+
+
+# ── /roast command ────────────────────────────────────────────────────────────
+async def cmd_roast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_group_message(update):
+        await update.message.reply_text("Roasts happen in the group, not in private. 😏")
+        return
+
+    refresh = sheet.cache.get("last_refresh")
+    refresh_str = refresh.astimezone(SGT).strftime("%I:%M %p SGT") if refresh else "unknown"
+
+    bot_username = context.bot.username.lower() if context.bot.username else ""
+
+    # Check if roasting the bot itself
+    if context.args:
+        target_arg = context.args[0].lstrip("@").lower()
+        if target_arg in (bot_username, "katerina", "katerina_bot", "degenWC_bot".lower(), "degenwc_bot"):
+            import random
+            lines = [
+                "Oh you want to roast me? I run the book, sweetheart. I always win. 😘",
+                "Bold move targeting the dealer. I respect it. Still won't work. 💅",
+                "You really tried to roast the house. Adorable.",
+                "Coming for me? I've seen better attempts from bottom-of-the-table bettors. 😏",
+                "Cute. Now go place a bet and let the adults talk. 🎰",
+                "I don't get roasted. I do the roasting around here. Try again. 😒",
+                "Targeting the house? That's either very brave or very stupid. Either way, I'm flattered. 😏",
+                "Bold. Wrong. But bold. 💅",
+            ]
+            await update.message.reply_text(random.choice(lines))
+            return
+
+    # Resolve target
+    target_uid = None
+    target_name = None
+
+    if context.args:
+        target_arg = context.args[0].lstrip("@").lower()
+        # Try to match by username or first_name in cache
+        for uid, u in sheet.cache["users"].items():
+            uname = (u.get("username") or "").lower()
+            fname = (u.get("first_name") or "").lower()
+            if target_arg == uname or target_arg == fname:
+                target_uid = uid
+                target_name = u.get("first_name") or u.get("username")
+                break
+
+        if target_uid is None:
+            await update.message.reply_text(f"I don't know @{context.args[0].lstrip('@')}. Not registered, or just irrelevant. 🤷")
+            return
+
+    else:
+        # No target — Katerina picks worst performer
+        standings = sheet.get_standings()
+        if not standings:
+            await update.message.reply_text("No players to roast yet. Come back when someone's losing. 😏")
+            return
+        # Pick worst P&L today, fall back to last place
+        CT = pytz.timezone("America/Chicago")
+        today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+        pl_map = {}
+        for b in sheet.cache["bets"]:
+            if b["status"] not in ("won", "lost"):
+                continue
+            match = sheet.cache["matches"].get(str(b["match_id"]), {})
+            ko_str = match.get("kickoff_utc", "")
+            try:
+                ko = datetime.strptime(ko_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                if ko.astimezone(CT).strftime("%Y-%m-%d") != today_ct:
+                    continue
+            except Exception:
+                continue
+            uid = b["user_id"]
+            pl_map[uid] = pl_map.get(uid, 0) + (b["amount"] if b["status"] == "won" else -b["amount"])
+
+        if pl_map:
+            target_uid = min(pl_map, key=lambda u: pl_map[u])
+        else:
+            target_uid = standings[-1]["user_id"]
+
+        u = sheet.cache["users"].get(target_uid, {})
+        target_name = u.get("first_name") or u.get("username") or "someone"
+
+    # Build roast data and generate
+    data = await _get_roast_data(target_uid)
+    roast = await _generate_roast(target_name, data)
+    await update.message.reply_text(f"🎤 {roast}\n\n— as of {refresh_str}")
+
+
+# ── Katerina mention handler ──────────────────────────────────────────────────
+async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reply when bot is @mentioned or 'katerina' appears in message."""
+    if not update.message or not update.message.text:
+        return
+    if not is_group_message(update):
+        return
+
+    text = update.message.text
+    bot_username = f"@{context.bot.username}" if context.bot.username else ""
+
+    # Check triggers
+    is_mention = (
+        (bot_username and bot_username.lower() in text.lower()) or
+        "katerina" in text.lower()
+    )
+    if not is_mention:
+        return
+
+    # Strip the trigger word to get the actual question
+    clean = text
+    if bot_username:
+        clean = clean.replace(bot_username, "").replace(bot_username.lower(), "")
+    clean = clean.replace("Katerina", "").replace("katerina", "").strip()
+    if not clean:
+        clean = "say something"
+
+    bot_context = _build_katerina_context()
+    reply = await _call_katerina(clean, bot_context)
+    if reply:
+        await update.message.reply_text(reply)
+    else:
+        import random
+        fallbacks = [
+            "I'm thinking. Don't rush me. 😒",
+            "Give me a second, I'm counting other people's losses. 💸",
+            "Busy. Try again. 😏",
+        ]
+        await update.message.reply_text(random.choice(fallbacks))
+
+
 async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global _group_chat_id
 
@@ -2353,6 +2723,12 @@ application = Application.builder().token(BOT_TOKEN).build()
 
 
 def setup_handlers():
+    # Katerina mention handler — must be group=0 so it fires alongside commands
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND,
+        handle_katerina_mention
+    ), group=0)
+
     # Group message listener (for chat ID lock)
     # Group chat ID lock — runs in parallel group so it never blocks commands
     application.add_handler(MessageHandler(filters.ALL, handle_any_message), group=1)
@@ -2372,6 +2748,7 @@ def setup_handlers():
     application.add_handler(CommandHandler("cancel", cmd_cancelbet))
     application.add_handler(CommandHandler("parlay", cmd_parlay))
     application.add_handler(CommandHandler("cancelparlay", cmd_cancelparlay))
+    application.add_handler(CommandHandler("roast", cmd_roast))
 
     # Admin commands
     application.add_handler(CommandHandler("admin_announce", cmd_admin_announce))
@@ -2415,6 +2792,7 @@ async def post_init(app):
         ("predict", "Free event prediction"),
         ("groups", "Group stage standings"),
         ("leaderboard", "Credits standings"),
+        ("roast", "Ask Katerina to roast someone"),
         ("help", "Help"),
     ])
     await sched.on_startup(notify_fn=dm_admin)

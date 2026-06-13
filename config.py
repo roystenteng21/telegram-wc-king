@@ -17,6 +17,9 @@ FOOTBALL_API_KEY = os.environ["FOOTBALL_API_KEY"]
 FOOTBALL_API_BASE = "https://api.football-data.org/v4"
 WC_COMPETITION = "WC"
 
+# Anthropic API (for Katerina)
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
 # Timezone
 SGT = pytz.timezone("Asia/Singapore")
 UTC = pytz.utc
