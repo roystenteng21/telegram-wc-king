@@ -358,7 +358,30 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No matches today.")
         return
 
-    lines = ["📅 Today's Matches\n"]
+    # If all today's matches are done, show tomorrow's instead
+    all_done = all(m.get("status") in ("FINISHED", "CANCELLED", "POSTPONED") for m in day_matches)
+    if all_done:
+        tomorrow_ct = (datetime.now(CT) + timedelta(days=1)).strftime("%Y-%m-%d")
+        day_after_utc = (datetime.now(UTC) + timedelta(days=2)).strftime("%Y-%m-%d")
+        next_matches_raw = await sheet.get_matches_for_date(tomorrow_utc) + await sheet.get_matches_for_date(day_after_utc)
+        next_matches = []
+        for m in next_matches_raw:
+            try:
+                kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == tomorrow_ct:
+                    next_matches.append(m)
+            except Exception:
+                continue
+        if next_matches:
+            day_matches = next_matches
+            header = "📅 Tomorrow's Matches\n"
+        else:
+            await update.message.reply_text("No upcoming matches.")
+            return
+    else:
+        header = "📅 Today's Matches\n"
+
+    lines = [header]
     for m in sorted(day_matches, key=lambda x: x["kickoff_utc"]):
         kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
         kickoff_sgt = kickoff_utc_dt.astimezone(SGT)
