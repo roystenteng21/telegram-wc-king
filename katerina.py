@@ -480,6 +480,153 @@ async def check_and_send_stage_hype(notify_fn=None):
 
     logger.info(f"Stage transition detected: {current_stage} → {next_stage}, firing hype")
     await send_stage_hype(current_stage, next_stage, notify_fn=notify_fn)
+
+
+# ── Katerina mention handler ──────────────────────────────────────────────────
+async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reply when bot is @mentioned or 'katerina' appears in message."""
+    if not update.message or not update.message.text:
+        return
+    if not is_group_message(update):
+        return
+
+    # Ignore messages sent before startup (backlog replay after restart)
+    msg_time = update.message.date
+    if msg_time is not None:
+        msg_utc = msg_time.replace(tzinfo=UTC) if msg_time.tzinfo is None else msg_time.astimezone(UTC)
+        if msg_utc < (_startup_time - timedelta(seconds=60)):
+            logger.info(f"Ignoring pre-startup mention from {update.effective_user.first_name} at {msg_utc}")
+            return
+
+    text = update.message.text
+    bot_username = f"@{context.bot.username}" if context.bot.username else ""
+
+    # Check triggers
+    is_mention = (
+        (bot_username and bot_username.lower() in text.lower()) or
+        "katerina" in text.lower()
+    )
+    if not is_mention:
+        return
+
+    # Strip the trigger word to get the actual question
+    clean = text
+    if bot_username:
+        clean = clean.replace(bot_username, "").replace(bot_username.lower(), "")
+    clean = clean.replace("Katerina", "").replace("katerina", "").strip()
+    if not clean:
+        clean = "say something"
+
+    # Build sender context
+    sender = update.effective_user
+    sender_uid = sender.id
+    sender_cache = sheet.cache["users"].get(sender_uid, {})
+    sender_name = sender_cache.get("first_name") or sender_cache.get("username") or sender.first_name or sender.username or "someone"
+    sender_credits = sender_cache.get("credits", "unknown")
+
+    # Build sender stats for Katerina
+    all_sender_bets = [b for b in sheet.cache["bets"] if b["user_id"] == sender_uid and b["status"] in ("won", "lost")]
+    sender_wins = sum(1 for b in all_sender_bets if b["status"] == "won")
+    sender_losses = sum(1 for b in all_sender_bets if b["status"] == "lost")
+    standings = sheet.get_standings()
+    sender_rank = next((i+1 for i, u in enumerate(standings) if u["user_id"] == sender_uid), None)
+    sender_stats = (
+        f"Credits: {sender_credits}c | "
+        f"Record: {sender_wins}W-{sender_losses}L | "
+        f"Rank: {sender_rank} of {len(standings)}"
+    ) if sender_rank else f"Credits: {sender_credits}c (not yet ranked)"
+
+    # Check if this is a predictions/odds/analysis question — trigger web search
+    search_keywords = ["odds", "prediction", "predict", "outside world", "favourite", "favorite",
+                       "who will win", "analysis", "expert", "betting line", "what do you think",
+                       "chance", "likely", "bookie", "market"]
+    wants_analysis = any(kw in clean.lower() for kw in search_keywords)
+
+    web_results = ""
+    if wants_analysis:
+        match_query = clean
+        for team_name in sheet.cache.get("matches", {}).values():
+            home = team_name.get("home", "")
+            away = team_name.get("away", "")
+            if home.lower() in clean.lower() or away.lower() in clean.lower():
+                match_query = f"{home} vs {away} prediction 2026 World Cup"
+                break
+        else:
+            match_query = f"{clean} 2026 World Cup prediction"
+
+        try:
+            import urllib.request as _req
+            import urllib.parse as _parse
+            search_url = "https://api.anthropic.com/v1/messages"
+            import json as _json
+            search_payload = _json.dumps({
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 400,
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                "messages": [{
+                    "role": "user",
+                    "content": f"Search for current match predictions and odds for: {match_query}. Return a 2-3 sentence factual summary of what experts and bookmakers are saying. No fluff."
+                }]
+            }).encode()
+            req = urllib.request.Request(
+                search_url,
+                data=search_payload,
+                headers={
+                    "content-type": "application/json",
+                    "anthropic-version": "2023-06-01",
+                    "x-api-key": ANTHROPIC_API_KEY
+                }
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                result = _json.loads(resp.read())
+                for block in result.get("content", []):
+                    if block.get("type") == "text":
+                        web_results = block["text"].strip()
+                        break
+        except Exception as e:
+            logger.error(f"Katerina web search failed: {e}")
+            web_results = ""
+
+    bot_context = _build_katerina_context()
+    if web_results:
+        bot_context += f"\nWEB SEARCH RESULTS (use this to answer their question about predictions/odds):\n{web_results}"
+    elif wants_analysis:
+        bot_context += "\nWEB SEARCH: Failed to fetch current predictions/odds. Tell the user you couldn't pull live data right now, give your best take based on what you know, and keep it honest."
+
+    if _chat_history:
+        history_str = "\n".join(list(_chat_history)[-50:])
+        bot_context += f"\n\nRECENT GROUP CHAT (last {min(len(_chat_history), 50)} messages):\n{history_str}"
+
+    # During silent hours — DM sender instead of replying in group
+    if is_silent_hours():
+        import random
+        quiet_lines = [
+            "Quiet hours. Bets are still open but I'm not taking questions right now. Back at 7:30AM. 😌",
+            "I'm off the clock. Place your bets via /bet if you need to — I'll be back at 7:30AM. 🌙",
+            "Sleeping hours. The house is still open for bets, just not for chat. See you at 7:30AM. 😴",
+            "Quiet hours. Use /bet if you need to place one. Questions can wait till 7:30AM. 😌",
+            "Taking a break. Bets still work — just use /bet. I'm back at 7:30AM SGT. 🌙",
+        ]
+        try:
+            await application.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=random.choice(quiet_lines)
+            )
+        except Exception as e:
+            logger.warning(f"Could not DM {update.effective_user.id} during silent hours: {e}")
+        return
+
+    reply = await _call_katerina(clean, bot_context, sender_name=sender_name, sender_stats=sender_stats)
+    if reply:
+        await update.message.reply_text(reply)
+    else:
+        import random
+        fallbacks = [
+            "I'm thinking. Don't rush me. 😒",
+            "Give me a second, I'm counting other people's losses. 💸",
+            "Busy. Try again. 😏",
+        ]
+        await update.message.reply_text(random.choice(fallbacks))
     """Reply when bot is @mentioned or 'katerina' appears in message."""
     if not update.message or not update.message.text:
         return
