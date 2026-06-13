@@ -830,7 +830,7 @@ def register_match_jobs(matches: list):
             )
             logger.info(f"Scheduled kickoff message for {match_id} at {kickoff_utc}")
 
-        # Result polling — starts kickoff + 95 min
+        # Result polling — starts kickoff + 120 min
         is_knockout = m.get("round", "").upper() not in ("GROUP_STAGE", "")
         offset = POLL_START_OFFSET if not is_knockout else (KNOCKOUT_DURATION + 5 * 60)
         poll_start = kickoff_utc + timedelta(seconds=offset)

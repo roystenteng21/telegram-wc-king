@@ -56,24 +56,24 @@ async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         elif update.effective_chat.id != gid:
             return
 
-        # Append non-bot messages to Katerina's context history
+        # Append non-bot messages to Katerina's context history + player count check
         if (update.message and update.message.text and
                 not update.effective_user.is_bot):
             sender = update.effective_user
             sender_name = sender.first_name or sender.username or "Unknown"
             _chat_history.append(f"{sender_name}: {update.message.text}")
 
-        # Player count change detection — DM admin if unexpected
-        current_count = len(sheet.cache.get("users", {}))
-        if current_count > 0 and current_count != PRIZE_PLAYER_COUNT:
-            cache_key = f"_player_count_alerted_{current_count}"
-            if not sheet.cache.get(cache_key):
-                sheet.cache[cache_key] = True
-                await dm_admin(
-                    f"⚠️ Player count changed: {current_count} players in the sheet "
-                    f"(expected {PRIZE_PLAYER_COUNT}).\n"
-                    f"Please confirm the updated prize pool ($80 × {current_count} = ${80 * current_count})."
-                )
+            # Player count change detection — DM admin if unexpected
+            current_count = len(sheet.cache.get("users", {}))
+            if current_count > 0 and current_count != PRIZE_PLAYER_COUNT:
+                cache_key = f"_player_count_alerted_{current_count}"
+                if not sheet.cache.get(cache_key):
+                    sheet.cache[cache_key] = True
+                    await dm_admin(
+                        f"⚠️ Player count changed: {current_count} players in the sheet "
+                        f"(expected {PRIZE_PLAYER_COUNT}).\n"
+                        f"Please confirm the updated prize pool ($80 × {current_count} = ${80 * current_count})."
+                    )
 
 
 # ── Welcome new members ───────────────────────────────────────────────────────
@@ -134,11 +134,12 @@ def setup_handlers():
     application.add_handler(CommandHandler("cancel", cp.cmd_cancelbet))
     application.add_handler(CommandHandler("parlay", cp.cmd_parlay))
     application.add_handler(CommandHandler("cancelparlay", cp.cmd_cancelparlay))
-    application.add_handler(CommandHandler("predict", cp.cmd_predict))
+    application.add_handler(CommandHandler("predict", ca.cmd_predict))
     application.add_handler(CommandHandler("roast", katerina.cmd_roast))
 
     # Admin commands
     application.add_handler(CommandHandler("admin_announce", ca.cmd_admin_announce))
+    application.add_handler(CommandHandler("admin_katerina_back", ca.cmd_admin_katerina_back))
     application.add_handler(CommandHandler("admin_status", ca.cmd_admin_status))
     application.add_handler(CommandHandler("admin_refresh", ca.cmd_admin_refresh))
     application.add_handler(CommandHandler("admin_result", ca.cmd_admin_result))

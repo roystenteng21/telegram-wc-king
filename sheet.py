@@ -139,7 +139,22 @@ async def refresh_cache(notify_fn=None):
             _bet_rows[row["bet_id"]] = i + 2
 
         cache["last_refresh"] = datetime.now(UTC)
-        logger.info("Cache refreshed successfully")
+
+        # Rebuild paid_parlays from bets — any parlay where payout > 0 on a leg
+        # means it was already credited. Prevents double-payout on restart.
+        paid = set()
+        parlay_bets = [b for b in cache["bets"] if b.get("parlay_id")]
+        parlay_ids = set(b["parlay_id"] for b in parlay_bets)
+        for pid in parlay_ids:
+            legs = [b for b in parlay_bets if b["parlay_id"] == pid]
+            # If any leg has payout recorded, the parlay was already settled
+            if any(b.get("payout") and str(b["payout"]) not in ("", "0") for b in legs):
+                paid.add(pid)
+            # If all legs are non-open and none won, it lost — mark done
+            elif all(b["status"] in ("lost", "void") for b in legs):
+                paid.add(pid)
+        cache["paid_parlays"] = paid
+        logger.info(f"Cache refreshed successfully — {len(paid)} paid/settled parlays loaded")
 
         # Load events
         try:
@@ -511,6 +526,10 @@ async def settle_bets_for_match(match_id: str, result: str, ou_result: str, noti
             if row_num:
                 await with_retry(ws.update_cell, row_num, 7, status)
                 await with_retry(ws.update_cell, row_num, 8, 0 if is_parlay_leg else payout)
+            else:
+                logger.warning(f"Bet {bet['bet_id']} row not in cache — sheet not updated, memory only")
+                if notify_fn:
+                    await notify_fn(f"⚠️ Bet {bet['bet_id']} row missing from cache — status set in memory only, sheet NOT updated. Run /admin_refresh and re-settle if needed.")
             bet["status"] = status
             bet["payout"] = 0 if is_parlay_leg else payout
 

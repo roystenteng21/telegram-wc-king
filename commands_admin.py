@@ -809,6 +809,30 @@ async def cmd_admin_sim_result(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # ── Admin: /admin_announce ────────────────────────────────────────────────────
+async def cmd_admin_katerina_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send Katerina's 'I'm back' message to the group."""
+    import random
+    gid = get_group_chat_id()
+    if not gid:
+        await update.message.reply_text("Group chat ID not set yet.")
+        return
+    lines = [
+        "Brief intermission. The house is open again. 🎰",
+        "Technical difficulties. Very beneath me. Won't happen again. 💅",
+        "The house never closes for long. I'm back. 🎰",
+        "Sorry for the wait. I had credits to count. 😌",
+        "I'm back. Try not to make bad bets while I was away — oh wait, too late. 😏",
+        "Brief absence. The ledger still balanced. I'm back. 📒",
+        "Small interruption. The books are open. Place your bets. 🎰",
+        "Took a moment. The house is back in business. Don't read into it. 💅",
+        "I'm back, and the odds haven't changed. Neither has your form. 😏",
+        "Short break. Counted the losses. Back to counting more. 📒",
+    ]
+    msg = random.choice(lines)
+    await context.bot.send_message(chat_id=gid, text=msg)
+    await update.message.reply_text("✅ Katerina's back message sent.")
+
+
 async def cmd_admin_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return

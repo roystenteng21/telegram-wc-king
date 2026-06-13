@@ -12,9 +12,7 @@ from config import (
 import sheet
 from helpers import (
     application, dm_admin, is_silent_hours, is_group_message,
-    format_team, _chat_history, _sessions, _pending_bets, _admin_pending,
-    ensure_registered, truncate, session_expired, clear_session,
-    get_group_chat_id, ADMIN_TELEGRAM_ID as _ADMIN_ID
+    format_team, _chat_history, get_group_chat_id
 )
 
 logger = logging.getLogger(__name__)
@@ -153,7 +151,8 @@ Current bot state:
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = _json.loads(resp.read())
-            return data["content"][0]["text"].strip()
+            text_blocks = [b for b in data.get("content", []) if b.get("type") == "text"]
+            return text_blocks[0]["text"].strip() if text_blocks else None
     except Exception as e:
         logger.error(f"Katerina API call failed: {e}")
         return None
@@ -292,7 +291,8 @@ Give Katerina's roast. One or two sentences only. Mix up the angle — stats, be
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
             result = _json.loads(resp.read())
-            return result["content"][0]["text"].strip()
+            text_blocks = [b for b in result.get("content", []) if b.get("type") == "text"]
+            return text_blocks[0]["text"].strip() if text_blocks else None
     except Exception as e:
         logger.error(f"Roast API call failed: {e}")
         fallbacks_last = [
@@ -514,6 +514,8 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
     bot_context = _build_katerina_context()
     if web_results:
         bot_context += f"\nWEB SEARCH RESULTS (use this to answer their question about predictions/odds):\n{web_results}"
+    elif wants_analysis:
+        bot_context += "\nWEB SEARCH: Failed to fetch current predictions/odds. Tell the user you couldn't pull live data right now, give your best take based on what you know, and keep it honest."
 
     # Append recent chat history for contextual replies
     if _chat_history:
