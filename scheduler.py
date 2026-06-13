@@ -101,7 +101,7 @@ def _get_user_name(uid: int) -> str:
     return (user.get("first_name") or user.get("username") or "Someone")
 
 
-
+def format_result_message(match: dict, settlements: list) -> str:
     home_display = format_team(match["home"])
     away_display = format_team(match["away"])
     ou_label = "Over 2.5" if match["ou_result"] == "over" else "Under 2.5"
@@ -708,7 +708,8 @@ def register_static_jobs():
         job_night_reminder,
         trigger=CronTrigger(hour=NIGHT_REMINDER_HOUR, minute=NIGHT_REMINDER_MINUTE, timezone=SGT),
         id="night_reminder",
-        replace_existing=True
+        replace_existing=True,
+        misfire_grace_time=60
     )
 
     # Morning catchup — 7:30AM SGT daily
@@ -716,13 +717,14 @@ def register_static_jobs():
         job_morning_catchup,
         trigger=CronTrigger(hour=MORNING_CATCHUP_HOUR, minute=MORNING_CATCHUP_MINUTE, timezone=SGT),
         id="morning_catchup",
-        replace_existing=True
+        replace_existing=True,
+        misfire_grace_time=60
     )
 
-    # Cache refresh — every 10 minutes
+    # Cache refresh — staggered to avoid colliding with cron jobs at :00 and :30
     scheduler.add_job(
         job_refresh_cache,
-        trigger=CronTrigger(minute="*/10"),
+        trigger=CronTrigger(minute="5,15,25,35,45,55"),
         id="cache_refresh",
         replace_existing=True
     )
