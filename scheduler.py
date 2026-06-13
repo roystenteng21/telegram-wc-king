@@ -785,7 +785,13 @@ def register_match_jobs(matches: list):
         match_id = str(m["match_id"])
         status = m.get("status", "")
 
-        if status in ("FINISHED", "CANCELLED", "POSTPONED", "IN_PLAY", "PAUSED"):
+        if status in ("FINISHED", "CANCELLED", "POSTPONED"):
+            continue
+
+        if status in ("IN_PLAY", "PAUSED"):
+            # Bot restarted mid-match — schedule immediate poll
+            _schedule_poll(match_id, delay_seconds=10, attempt=1)
+            logger.info(f"Bot restarted mid-match {match_id} ({status}) — scheduling immediate poll")
             continue
 
         try:
