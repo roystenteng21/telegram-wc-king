@@ -31,7 +31,7 @@ OU_MARKET_PAYOUT = 1.0
 BET_LOCK_BUFFER = 30
 
 # Polling: seconds after expected match end before first poll
-POLL_START_OFFSET = 95 * 60   # 95 minutes in seconds
+POLL_START_OFFSET = 120 * 60   # 120 minutes (90min match + 15min HT + 15min buffer)
 POLL_INTERVAL = 5 * 60        # 5 minutes in seconds
 
 # Group stage match duration (seconds)

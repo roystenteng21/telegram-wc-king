@@ -208,18 +208,22 @@ async def job_morning_catchup():
         now_utc = datetime.now(UTC)
 
         overnight_match_ids = []
+        upcoming_lines = []
         for kickoff_utc_dt, m in sorted(today_matches, key=lambda x: x[0]):
             home_d = format_team(m["home"])
             away_d = format_team(m["away"])
             if m["status"] == "FINISHED":
-                ou_label = "Over 2.5" if m["ou_result"] == "over" else "Under 2.5"
-                lines.append(f"{home_d} {m['home_score']}–{m['away_score']} {away_d} · {ou_label}")
                 overnight_match_ids.append(m["match_id"])
+                # Only show score here if no pending result message (i.e. wasn't suppressed)
+                pending_results = sheet.cache.get("pending_result_messages", [])
+                if not pending_results:
+                    ou_label = "Over 2.5" if m["ou_result"] == "over" else "Under 2.5"
+                    lines.append(f"{home_d} {m['home_score']}–{m['away_score']} {away_d} · {ou_label}")
             elif m["status"] in ("IN_PLAY", "PAUSED", "HALFTIME"):
-                lines.append(f"{home_d} vs {away_d} — IN PLAY")
+                lines.append(f"{home_d} vs {away_d} — ● In Play")
             else:
                 time_str = kickoff_utc_dt.astimezone(SGT).strftime("%I:%M %p SGT").lstrip("0")
-                lines.append(f"{home_d} vs {away_d} — {time_str}")
+                upcoming_lines.append(f"{home_d} vs {away_d} — {time_str}")
 
         # Fun line based on overnight match results
         if overnight_match_ids:
@@ -254,13 +258,19 @@ async def job_morning_catchup():
                 if fun:
                     lines.append(f"\n{fun}")
 
-        # Overnight match results held from silent hours
+        # Overnight match results held from silent hours (includes bet settlements)
         pending_results = sheet.cache.get("pending_result_messages", [])
         if pending_results:
             lines.append("\n⚽ Overnight Results:")
             for msg in pending_results:
                 lines.append(f"\n{msg}")
             sheet.cache["pending_result_messages"] = []
+
+        # Upcoming matches today
+        if upcoming_lines:
+            lines.append("\n📅 Coming up today:")
+            for ul in upcoming_lines:
+                lines.append(ul)
 
         # Parlay wins from silent hours
         pending = sheet.cache.get("pending_parlay_wins", [])
