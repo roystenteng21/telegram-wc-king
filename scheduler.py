@@ -168,12 +168,25 @@ def format_result_message(match: dict, settlements: list) -> str:
 # ── Night reminder (11PM SGT) ────────────────────────────────────────────────
 async def job_night_reminder():
     try:
-        tomorrow = (datetime.now(SGT) + timedelta(days=1)).strftime("%Y-%m-%d")
+        tomorrow_sgt = (datetime.now(SGT) + timedelta(days=1)).strftime("%Y-%m-%d")
+        # Fetch two UTC dates to capture all matches that fall on tomorrow SGT
+        tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
+        day_after_utc = (datetime.now(UTC) + timedelta(days=2)).strftime("%Y-%m-%d")
         try:
-            matches = api.fetch_matches_for_date(tomorrow)
+            raw = api.fetch_matches_for_date(tomorrow_utc) + api.fetch_matches_for_date(day_after_utc)
         except RuntimeError as e:
             await dm_admin(f"⚠️ Night reminder: failed to fetch tomorrow's fixtures: {e}")
             return
+
+        # Filter to matches whose SGT kickoff date = tomorrow SGT
+        matches = []
+        for m in raw:
+            try:
+                ko = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                if ko.astimezone(SGT).strftime("%Y-%m-%d") == tomorrow_sgt:
+                    matches.append(m)
+            except Exception:
+                continue
 
         if not matches:
             logger.info("Night reminder: no matches tomorrow, skipping")
