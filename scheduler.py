@@ -221,7 +221,9 @@ async def _katerina_line(prompt: str, fallback: str, max_tokens: int = 120) -> s
             "model": "claude-sonnet-4-6",
             "max_tokens": max_tokens,
             "system": (
-                "You are Katerina, the sharp, confident, slightly savage house bookie for WC Kings 2026. "
+                "You are Katerina, the sharp, witty, confident house bookie for WC Kings 2026. "
+                "Light banter is your default — warm or playfully cheeky depending on the moment. "
+                "Savage mode only when the context clearly calls for it (e.g. everyone just lost). "
                 "Pure English. No markdown. No swearing. Short, punchy, personality-driven."
             ),
             "messages": [{"role": "user", "content": prompt}]
@@ -253,11 +255,38 @@ async def job_night_reminder():
         today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
         tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
         day_after_utc = (datetime.now(UTC) + timedelta(days=2)).strftime("%Y-%m-%d")
-        try:
-            raw = api.fetch_matches_for_date(today_utc) + api.fetch_matches_for_date(tomorrow_utc) + api.fetch_matches_for_date(day_after_utc)
-        except RuntimeError as e:
-            await dm_admin(f"⚠️ Night reminder: failed to fetch tomorrow's fixtures: {e}")
-            return
+
+        # Read from cache first — cache already holds today + tomorrow from startup
+        cached_today = list(sheet.cache.get("matches", {}).values())
+        raw_from_cache = [
+            m for m in cached_today
+            if m.get("kickoff_utc", "") >= today_utc
+        ]
+
+        raw = None
+        if raw_from_cache:
+            raw = raw_from_cache
+            logger.info("Night reminder: using cached fixtures")
+        else:
+            # Cache empty — fall back to API with 5-attempt retry
+            last_error = None
+            for attempt in range(1, 6):
+                try:
+                    raw = (
+                        api.fetch_matches_for_date(today_utc) +
+                        api.fetch_matches_for_date(tomorrow_utc) +
+                        api.fetch_matches_for_date(day_after_utc)
+                    )
+                    logger.info(f"Night reminder: API fetch succeeded on attempt {attempt}")
+                    break
+                except RuntimeError as e:
+                    last_error = e
+                    logger.warning(f"Night reminder: API fetch attempt {attempt} failed: {e}")
+                    if attempt < 5:
+                        await asyncio.sleep(5)
+            if raw is None:
+                await dm_admin(f"⚠️ Night reminder: failed to fetch fixtures after 5 attempts: {last_error}")
+                return
 
         matches = []
         for m in raw:
@@ -355,13 +384,13 @@ async def job_prematch_summary(match_id: str):
             )
             prompt = (
                 f"{match_label} kicks off in 15 minutes. Bets so far: {bet_summary}. "
-                f"Write one short last-call line — encourage anyone sitting out to get in. Slightly roasty. 1 sentence."
+                f"Write one short last-call line — light banter, encourage anyone sitting out to get in. 1 sentence."
             )
             closing = await _katerina_line(prompt, "Last chance — get your bets in before kickoff! ⚽")
         else:
             prompt = (
                 f"{match_label} kicks off in 15 minutes and nobody has bet yet. "
-                f"Write one short last-call line — slightly incredulous. 1 sentence."
+                f"Write one short last-call line — lightly cheeky, slightly incredulous. 1 sentence."
             )
             closing = await _katerina_line(prompt, "Nobody's bet yet? Last chance before kickoff! ⚽")
 
@@ -419,7 +448,7 @@ async def job_kickoff_message(match_id: str):
                 f"{match_label} has just kicked off. Bets placed: {bet_summary}. "
                 + (f"Sitting out: {', '.join(no_bet_names)}. " if no_bet_names else "")
                 + (f"Current standings: {standings_str}. " if standings_str else "")
-                + "Write one fun, slightly roasty good luck line. Reference specific names and their picks. "
+                + "Write one fun good luck line — light banter, reference specific names and their picks. "
                 "1-2 sentences. Sharp and punchy."
             )
             fun_line = await _katerina_line(prompt, "Good luck everyone. May the better bets win. ⚽", max_tokens=150)
@@ -526,10 +555,31 @@ async def job_poll_result(match_id: str, attempt: int = 1):
                 context += f" Singles: {settled_summary}."
             if parlay_summary:
                 context += f" Parlay wins: {parlay_summary}."
-            prompt = (
-                f"{context} Write 1-2 sharp, roasty sentences reacting to the result and bets. "
-                f"Reference specific names and outcomes. No markdown."
+
+            # Detect if everyone lost — singles + all parlay legs on this match
+            def _has_parlay(s):
+                pid = s.get("parlay_id", "")
+                return bool(pid) and str(pid) not in ("", "0")
+            singles_on_match = [s for s in settlements if not _has_parlay(s)]
+            parlay_legs_on_match = [s for s in settlements if _has_parlay(s)]
+            everyone_lost = (
+                bool(settlements) and
+                not parlay_wins and
+                all(s["status"] == "lost" for s in singles_on_match) and
+                all(s["status"] == "lost" for s in parlay_legs_on_match)
             )
+
+            if everyone_lost:
+                names = ", ".join(dict.fromkeys(_get_user_name(s["user_id"]) for s in settlements))
+                prompt = (
+                    f"{context} Every single person lost — {names}. "
+                    f"Go full savage. 1-2 sentences, no mercy. Reference specific names and their losing picks. No markdown."
+                )
+            else:
+                prompt = (
+                    f"{context} Write 1-2 sharp sentences reacting to the result and bets with light banter. "
+                    f"Reference specific names and outcomes. No markdown."
+                )
             commentary = await _katerina_line(prompt, "", max_tokens=150)
             if commentary:
                 result_msg = result_msg + f"\n\n{commentary}"
@@ -887,6 +937,56 @@ async def job_refresh_cache():
     await sheet.refresh_cache(notify_fn=dm_admin)
 
 
+# ── Health monitor job ────────────────────────────────────────────────────────
+async def job_health_monitor():
+    """
+    Periodic health check. Runs every 15min during peak (9PM-1AM SGT),
+    every 1h outside peak. DMs admin only if something looks wrong.
+    """
+    try:
+        issues = []
+        now_sgt = datetime.now(SGT)
+
+        # 1. Cache freshness — should have been refreshed within last 15 min
+        last_refresh = sheet.cache.get("last_refresh")
+        if last_refresh:
+            age_minutes = (datetime.now(UTC).replace(tzinfo=UTC) - last_refresh.astimezone(UTC)).total_seconds() / 60
+            if age_minutes > 15:
+                issues.append(f"Cache stale — last refresh {int(age_minutes)}min ago")
+        else:
+            issues.append("Cache has never been refreshed")
+
+        # 2. Scheduler jobs still registered
+        job_ids = {job.id for job in scheduler.get_jobs()}
+        if "night_reminder" not in job_ids:
+            issues.append("night_reminder job missing from scheduler")
+        if "cache_refresh" not in job_ids:
+            issues.append("cache_refresh job missing from scheduler")
+
+        # 3. Any match IN_PLAY or PAUSED with no poll job registered
+        for m in sheet.cache.get("matches", {}).values():
+            if m.get("status") in ("IN_PLAY", "PAUSED"):
+                mid = str(m["match_id"])
+                has_poll = any(mid in job.id and "poll" in job.id for job in scheduler.get_jobs())
+                if not has_poll:
+                    issues.append(f"Match {mid} is {m['status']} but no poll job found")
+
+        # 4. Bot can reach group chat — lightweight check via _group_chat_id
+        if _group_chat_id is None:
+            issues.append("Group chat ID not set — bot may not be connected to group")
+
+        if issues:
+            header = "⚠️ Health monitor:"
+            msg = header + "\n" + "\n".join(f"• {i}" for i in issues)
+            await dm_admin(msg)
+            logger.warning(f"Health monitor flagged {len(issues)} issue(s)")
+        else:
+            logger.info("Health monitor: all checks passed")
+
+    except Exception as e:
+        logger.error(f"Health monitor failed: {e}")
+
+
 # ── Register daily jobs ───────────────────────────────────────────────────────
 def register_static_jobs():
     """Register fixed-time daily jobs. Called on startup."""
@@ -905,6 +1005,20 @@ def register_static_jobs():
         job_refresh_cache,
         trigger=CronTrigger(minute="5,15,25,35,45,55"),
         id="cache_refresh",
+        replace_existing=True
+    )
+
+    # Health monitor — every 15min during peak hours (9PM-1AM SGT), every 1h outside
+    scheduler.add_job(
+        job_health_monitor,
+        trigger=CronTrigger(minute="0,15,30,45", hour="21,22,23,0,1", timezone=SGT),
+        id="health_monitor_peak",
+        replace_existing=True
+    )
+    scheduler.add_job(
+        job_health_monitor,
+        trigger=CronTrigger(minute="0", hour="2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20", timezone=SGT),
+        id="health_monitor_offpeak",
         replace_existing=True
     )
 

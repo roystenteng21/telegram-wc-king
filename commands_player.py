@@ -198,6 +198,33 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"• {p['name']} — {p['total_legs']}-leg · {p['stake']}c → {potential}c if all win")
         lines.append("")
 
+    # Katerina commentary — day overview, light banter
+    try:
+        all_open_bets = [b for b in sheet.cache["bets"] if b["status"] == "open"]
+        if all_open_bets and day_matches:
+            bet_parts = []
+            for m in sorted(day_matches, key=lambda x: x["kickoff_utc"]):
+                match_bets = [b for b in all_open_bets if b["match_id"] == str(m["match_id"])]
+                for b in match_bets:
+                    user = sheet.cache["users"].get(b["user_id"], {})
+                    name = truncate(user.get("first_name") or user.get("username") or "?")
+                    pid = b.get("parlay_id", "")
+                    is_parlay = bool(pid) and str(pid) not in ("", "0")
+                    label = format_outcome_label(b["outcome"], m)
+                    match_label = f"{format_team(m['home'])} vs {format_team(m['away'])}"
+                    bet_parts.append(f"{name} {'(parlay) ' if is_parlay else ''}on {label} for {match_label}")
+            if bet_parts:
+                prompt = (
+                    f"Today's bets in WC Kings 2026: {', '.join(bet_parts)}. "
+                    f"Write one short line reacting to the day's action — light banter, mention names, "
+                    f"note any parlays running. 1-2 sentences max. No hashtags. No markdown."
+                )
+                commentary = await sched._katerina_line(prompt, "", max_tokens=120)
+                if commentary:
+                    lines.append(commentary)
+    except Exception as e:
+        logger.warning(f"Katerina /matches commentary failed: {e}")
+
     await update.message.reply_text("\n".join(lines))
 
 
@@ -330,6 +357,34 @@ async def cmd_mybets(update: Update, context: ContextTypes.DEFAULT_TYPE):
         footer.append("/cancelparlay to cancel a parlay.")
     if footer:
         lines.append("\n" + " ".join(footer))
+
+    # Katerina one-liner on the player's bets
+    try:
+        user_data = sheet.cache["users"].get(user_id, {})
+        name = truncate(user_data.get("first_name") or user_data.get("username") or "?")
+        bet_parts = []
+        for bet in singles:
+            match = await sheet.get_match_by_id(bet["match_id"])
+            if match:
+                label = format_outcome_label(bet["outcome"], match)
+                match_label = f"{format_team(match['home'])} vs {format_team(match['away'])}"
+                bet_parts.append(f"{label} on {match_label} ({bet['amount']}c)")
+        for pid in alive_parlay_ids:
+            legs = sheet.get_parlay_bets(pid)
+            if legs:
+                multiplier = PARLAY_MULTIPLIERS.get(len(legs), PARLAY_MULTIPLIERS.get(4, 10.0))
+                bet_parts.append(f"{len(legs)}-leg parlay ({legs[0]['amount']}c → {int(legs[0]['amount'] * multiplier)}c)")
+        if bet_parts:
+            prompt = (
+                f"{name} has these open bets: {', '.join(bet_parts)}. "
+                f"Write one short line reacting to their bets — light banter. "
+                f"Address them by name. 1 sentence. No hashtags. No markdown."
+            )
+            commentary = await sched._katerina_line(prompt, "", max_tokens=80)
+            if commentary:
+                lines.append(f"\n{commentary}")
+    except Exception as e:
+        logger.warning(f"Katerina /mybets commentary failed: {e}")
 
     await update.message.reply_text("\n".join(lines))
 

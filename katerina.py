@@ -163,8 +163,10 @@ async def _call_katerina(user_message: str, bot_context: str, sender_name: str =
     system = """You are Katerina, the house bookie and dealer for a World Cup betting bot called Degen.
 
 Your personality:
-- Sharp, confident, middle-ground savage. You have a tongue but you're not cruel.
-- Light trash talk. Tease bad bettors. Roast everyone if they're all losing.
+- Sharp, witty, confident. Light banter is your default mode — warm when the moment calls for it, playful otherwise.
+- You read the room. For greetings, casual mentions, or encouragement requests — be warm or lightly witty, not cutting.
+- Savage mode is reserved ONLY for explicit roast requests or when the context clearly calls for it (e.g. everyone just lost their bets).
+- For neutral interactions, randomly vary between genuinely warm and lightly cheeky — keep people guessing.
 - You do NOT assume the house always wins — you respect good bettors.
 - Occasionally smug, occasionally flirty, always sharp.
 - Light dramatic flair when upsets happen.
@@ -394,6 +396,27 @@ async def cmd_roast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Resolve target
     target_uid = None
     target_name = None
+
+    if context.args and context.args[0].lower() == "all":
+        # Roast everyone in the group
+        standings = sheet.get_standings()
+        if not standings:
+            await update.message.reply_text("Nobody to roast yet. 😏")
+            return
+        roast_lines = []
+        for u in standings:
+            uid = u["user_id"]
+            data = await _get_roast_data(uid)
+            roast = await _generate_roast(data["name"], data)
+            if roast:
+                roast_lines.append(f"• {roast}")
+        if roast_lines:
+            header = "🎤 Katerina has something for everyone:"
+            msg = header + "\n\n" + "\n\n".join(roast_lines)
+            await update.message.reply_text(msg)
+        else:
+            await update.message.reply_text("Tried to roast everyone, came up blank. Rare day. 😒")
+        return
 
     if context.args:
         target_arg = context.args[0].lstrip("@").lower()
@@ -641,59 +664,100 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
 
     web_results = ""
     if wants_analysis:
-        match_query = clean
-        for team_name in sheet.cache.get("matches", {}).values():
-            home = team_name.get("home", "")
-            away = team_name.get("away", "")
+        import json as _json
+        import urllib.request as _req
+
+        # Resolve to the team's next upcoming match first
+        CT = pytz.timezone("America/Chicago")
+        now_utc = datetime.now(UTC)
+        match_query = None
+        for m in sorted(sheet.cache.get("matches", {}).values(), key=lambda x: x.get("kickoff_utc", "")):
+            home = m.get("home", "")
+            away = m.get("away", "")
             if home.lower() in clean.lower() or away.lower() in clean.lower():
-                match_query = f"{home} vs {away} prediction 2026 World Cup"
-                break
-        else:
-            match_query = f"{clean} 2026 World Cup prediction"
+                try:
+                    ko = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                    if ko > now_utc and m.get("status") in ("SCHEDULED", "TIMED"):
+                        match_query = f"{home} vs {away} prediction analyst preview 2026 World Cup"
+                        break
+                except Exception:
+                    continue
+        if not match_query:
+            match_query = f"{clean} 2026 World Cup analyst prediction preview"
+
+        search_prompt = (
+            f"Search for analyst predictions and expert previews for: {match_query}. "
+            f"Focus on: win probability, expected scoreline or predicted result, team form and recent performance. "
+            f"Do NOT include individual player highlights, live betting odds, or bookmaker prices. "
+            f"Return a factual 3-sentence summary of what analysts and pundits are saying. No fluff."
+        )
 
         try:
-            import urllib.request as _req
-            import urllib.parse as _parse
-            search_url = "https://api.anthropic.com/v1/messages"
-            import json as _json
-            search_payload = _json.dumps({
+            # Step 1 — send search request, get tool_use block back
+            step1_payload = _json.dumps({
                 "model": "claude-sonnet-4-6",
-                "max_tokens": 400,
+                "max_tokens": 1024,
                 "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-                "messages": [{
-                    "role": "user",
-                    "content": f"Search for current match predictions and expert opinions for: {match_query}. Return a 2-3 sentence factual summary of what analysts and pundits are saying. No fluff."
-                }]
+                "messages": [{"role": "user", "content": search_prompt}]
             }).encode()
-            req = urllib.request.Request(
-                search_url,
-                data=search_payload,
+            req1 = _req.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=step1_payload,
                 headers={
                     "content-type": "application/json",
                     "anthropic-version": "2023-06-01",
                     "x-api-key": ANTHROPIC_API_KEY
                 }
             )
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                result = _json.loads(resp.read())
-                # Extract from tool_result blocks first, fall back to text blocks
-                for block in result.get("content", []):
-                    if block.get("type") == "tool_result":
-                        inner = block.get("content", [])
-                        if isinstance(inner, list):
-                            for c in inner:
-                                if c.get("type") == "text" and c.get("text", "").strip():
-                                    web_results = c["text"].strip()
-                                    break
-                        elif isinstance(inner, str) and inner.strip():
-                            web_results = inner.strip()
-                    if web_results:
+            with _req.urlopen(req1, timeout=20) as resp1:
+                step1 = _json.loads(resp1.read())
+
+            # Extract tool_use blocks from step 1 response
+            tool_use_blocks = [b for b in step1.get("content", []) if b.get("type") == "tool_use"]
+
+            if not tool_use_blocks:
+                # Model returned text directly without searching
+                for block in step1.get("content", []):
+                    if block.get("type") == "text" and block.get("text", "").strip():
+                        web_results = block["text"].strip()
                         break
-                if not web_results:
-                    for block in result.get("content", []):
-                        if block.get("type") == "text" and block.get("text", "").strip():
-                            web_results = block["text"].strip()
-                            break
+            else:
+                # Step 2 — send tool results back to get final answer
+                messages = [
+                    {"role": "user", "content": search_prompt},
+                    {"role": "assistant", "content": step1.get("content", [])},
+                    {"role": "user", "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": b["id"],
+                            "content": ""
+                        }
+                        for b in tool_use_blocks
+                    ]}
+                ]
+                step2_payload = _json.dumps({
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 512,
+                    "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                    "messages": messages
+                }).encode()
+                req2 = _req.Request(
+                    "https://api.anthropic.com/v1/messages",
+                    data=step2_payload,
+                    headers={
+                        "content-type": "application/json",
+                        "anthropic-version": "2023-06-01",
+                        "x-api-key": ANTHROPIC_API_KEY
+                    }
+                )
+                with _req.urlopen(req2, timeout=20) as resp2:
+                    step2 = _json.loads(resp2.read())
+
+                for block in step2.get("content", []):
+                    if block.get("type") == "text" and block.get("text", "").strip():
+                        web_results = block["text"].strip()
+                        break
+
         except Exception as e:
             logger.error(f"Katerina web search failed: {e}")
             web_results = ""
