@@ -93,9 +93,7 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # If EOD has fired today, show tomorrow's matches instead
-    CT_check = pytz.timezone("America/Chicago")
-    today_ct_check = datetime.now(CT_check).strftime("%Y-%m-%d")
-    eod_fired = sheet.cache.get("eod_date") == today_ct_check
+    eod_fired = sheet.cache.get("eod_date") == today_ct
     if eod_fired:
         tomorrow_ct = (datetime.now(CT) + timedelta(days=1)).strftime("%Y-%m-%d")
         day_after_utc = (datetime.now(UTC) + timedelta(days=2)).strftime("%Y-%m-%d")
@@ -164,7 +162,7 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     icon = ""
 
                 pid = b.get("parlay_id", "")
-                if pid:
+                if pid and str(pid) not in ("", "0"):
                     # Skip legs whose parlay is already dead (a leg lost)
                     if not sheet.is_parlay_alive(pid):
                         continue

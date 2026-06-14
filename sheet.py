@@ -591,7 +591,7 @@ async def void_all_bets_for_match(match_id: str, notify_fn=None):
         for bet in open_bets:
             row_num = _bet_rows.get(bet["bet_id"])
             if row_num:
-                ws.update_cell(row_num, 7, "void")
+                await with_retry(ws.update_cell, row_num, 7, "void")
             bet["status"] = "void"
 
             async with get_user_lock(bet["user_id"]):
@@ -667,7 +667,7 @@ async def add_match_credits(match_amount: int, match_id: str, notify_fn=None):
             if not row_num:
                 continue
             new_credits = user["credits"] + match_amount
-            ws.update_cell(row_num, 4, new_credits)
+            await with_retry(ws.update_cell, row_num, 4, new_credits)
             cache["users"][user_id]["credits"] = new_credits
             await append_ledger(user_id, "match_credit", match_amount, new_credits, f"Post-match top-up ({match_id})", notify_fn)
         cache[cache_key] = True
@@ -695,7 +695,7 @@ async def add_daily_credits(daily_amount: int, notify_fn=None):
             if not row_num:
                 continue
             new_credits = user["credits"] + daily_amount
-            ws.update_cell(row_num, 4, new_credits)
+            await with_retry(ws.update_cell, row_num, 4, new_credits)
             cache["users"][user_id]["credits"] = new_credits
             await append_ledger(user_id, "daily_credit", daily_amount, new_credits, "Daily top-up", notify_fn)
         cache["daily_credits_date"] = today

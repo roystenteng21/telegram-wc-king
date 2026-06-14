@@ -101,7 +101,41 @@ async def cmd_admin_result_push(update: Update, context: ContextTypes.DEFAULT_TY
 
         bets = await sheet.get_bets_for_match(match_id)
         settlements = [b for b in bets if b["status"] in ("won", "lost")]
-        result_msg = sched.format_result_message(match, settlements)
+        parlay_wins = await sched.check_parlay_completions(match_id)
+        result_msg = sched.format_result_message(match, settlements, parlay_wins=parlay_wins)
+
+        # Katerina commentary
+        if settlements or parlay_wins:
+            def _has_parlay(s):
+                pid = s.get("parlay_id", "")
+                return bool(pid) and str(pid) not in ("", "0")
+            singles_on_match = [s for s in settlements if not _has_parlay(s)]
+            parlay_legs_on_match = [s for s in settlements if _has_parlay(s)]
+            everyone_lost = (
+                bool(settlements) and not parlay_wins and
+                all(s["status"] == "lost" for s in singles_on_match) and
+                all(s["status"] == "lost" for s in parlay_legs_on_match)
+            )
+            settled_summary = ", ".join(
+                f"{sheet.cache['users'].get(s['user_id'], {}).get('first_name') or '?'} "
+                f"{'won' if s['status'] == 'won' else 'lost'} {s['amount']}c"
+                for s in settlements if not _has_parlay(s)
+            )
+            context_str = f"Result: {sched.format_match_teams(match['home'], match['away'])} {match['home_score']}-{match['away_score']}."
+            if settled_summary:
+                context_str += f" Singles: {settled_summary}."
+            if everyone_lost:
+                names = ", ".join(dict.fromkeys(
+                    (sheet.cache["users"].get(s["user_id"], {}).get("first_name") or "?") for s in settlements
+                ))
+                prompt = (f"{context_str} Every single person lost — {names}. "
+                          f"Go full savage. 1-2 sentences, no mercy. No markdown.")
+            else:
+                prompt = (f"{context_str} Write 1-2 sharp sentences with light banter. No markdown.")
+            commentary = await sched._katerina_line(prompt, "", max_tokens=150)
+            if commentary:
+                result_msg = result_msg + f"\n\n{commentary}"
+
         await sched.send_group(result_msg)
         await update.message.reply_text("✅ Result message pushed to group.")
         return

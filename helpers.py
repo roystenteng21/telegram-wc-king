@@ -26,7 +26,6 @@ application = Application.builder().token(BOT_TOKEN).build()
 _group_chat_id: int | None = None
 
 _sessions: dict[int, dict] = {}
-_pending_bets: dict[int, dict] = {}
 _admin_pending: dict[int, dict] = {}
 _chat_history: deque = deque(maxlen=50)
 
@@ -123,9 +122,6 @@ def session_expired(session: dict) -> bool:
 
 def clear_session(user_id: int):
     _sessions.pop(user_id, None)
-
-def clear_pending_bet(user_id: int):
-    _pending_bets.pop(user_id, None)
 
 def clear_admin_pending():
     _admin_pending.pop(ADMIN_TELEGRAM_ID, None)

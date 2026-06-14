@@ -1,5 +1,7 @@
+import json
 import logging
 import asyncio
+import urllib.request
 from datetime import datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
@@ -11,11 +13,12 @@ from config import (
     NIGHT_REMINDER_HOUR, NIGHT_REMINDER_MINUTE,
     MORNING_CATCHUP_HOUR, MORNING_CATCHUP_MINUTE,
     PREMATCH_SUMMARY_MINUTES, POLL_START_OFFSET, POLL_INTERVAL,
-    GROUP_STAGE_DURATION, KNOCKOUT_DURATION,
+    KNOCKOUT_DURATION, ANTHROPIC_API_KEY,
     ADMIN_TELEGRAM_ID, BOT_VERSION, TEAM_DISPLAY, PARLAY_MULTIPLIERS
 )
 import sheet
 import api
+from helpers import format_team, format_match_teams
 
 logger = logging.getLogger(__name__)
 
@@ -25,17 +28,6 @@ scheduler = AsyncIOScheduler(timezone=UTC)
 _bot = None
 _group_chat_id = None
 
-
-def format_team(name: str) -> str:
-    if name in TEAM_DISPLAY:
-        code, flag = TEAM_DISPLAY[name]
-        return f"{flag} {code}"
-    logger.warning(f"Team not in TEAM_DISPLAY: '{name}'")
-    return name[:3].upper()
-
-
-def format_match_teams(home: str, away: str) -> str:
-    return f"{format_team(home)} vs {format_team(away)}"
 
 def init(bot, group_chat_id):
     global _bot, _group_chat_id
@@ -60,15 +52,8 @@ async def send_group(message: str, parse_mode: str = None):
         await dm_admin(f"⚠️ Failed to send group message: {e}")
 
 
-# ── Silent hours check ────────────────────────────────────────────────────────
-def is_silent_hours() -> bool:
-    """Returns True if current SGT time is between 12:00 AM and 7:30 AM AND silent hours are enabled."""
-    if sheet.cache.get("silent_hours_disabled", False):
-        return False
-    now_sgt = datetime.now(SGT)
-    start = now_sgt.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = now_sgt.replace(hour=7, minute=30, second=0, microsecond=0)
-    return start <= now_sgt < end
+# ── Silent hours — imported from helpers ─────────────────────────────────────
+from helpers import is_silent_hours
 
 
 # ── CT date helper ────────────────────────────────────────────────────────────
@@ -211,13 +196,10 @@ MATCH_TOPUP_LINES = [
 
 async def _katerina_line(prompt: str, fallback: str, max_tokens: int = 120) -> str:
     """Call Katerina API for a short scheduled message line. Returns fallback on failure."""
-    import json as _json
-    import urllib.request as _req
-    from config import ANTHROPIC_API_KEY
     if not ANTHROPIC_API_KEY:
         return fallback
     try:
-        payload = _json.dumps({
+        payload = json.dumps({
             "model": "claude-sonnet-4-6",
             "max_tokens": max_tokens,
             "system": (
@@ -228,7 +210,7 @@ async def _katerina_line(prompt: str, fallback: str, max_tokens: int = 120) -> s
             ),
             "messages": [{"role": "user", "content": prompt}]
         }).encode()
-        req = _req.Request(
+        req = urllib.request.Request(
             "https://api.anthropic.com/v1/messages",
             data=payload,
             headers={
@@ -237,8 +219,8 @@ async def _katerina_line(prompt: str, fallback: str, max_tokens: int = 120) -> s
                 "x-api-key": ANTHROPIC_API_KEY
             }
         )
-        with _req.urlopen(req, timeout=15) as resp:
-            data = _json.loads(resp.read())
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
             text_blocks = [b for b in data.get("content", []) if b.get("type") == "text"]
             result = text_blocks[0]["text"].strip() if text_blocks else ""
             return result if result else fallback
@@ -950,7 +932,7 @@ async def job_health_monitor():
         # 1. Cache freshness — should have been refreshed within last 15 min
         last_refresh = sheet.cache.get("last_refresh")
         if last_refresh:
-            age_minutes = (datetime.now(UTC).replace(tzinfo=UTC) - last_refresh.astimezone(UTC)).total_seconds() / 60
+            age_minutes = (datetime.now(UTC) - last_refresh.astimezone(UTC)).total_seconds() / 60
             if age_minutes > 15:
                 issues.append(f"Cache stale — last refresh {int(age_minutes)}min ago")
         else:

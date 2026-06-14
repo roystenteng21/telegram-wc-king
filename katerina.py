@@ -398,18 +398,17 @@ async def cmd_roast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_name = None
 
     if context.args and context.args[0].lower() == "all":
-        # Roast everyone in the group
+        # Roast everyone in the group — parallel API calls
         standings = sheet.get_standings()
         if not standings:
             await update.message.reply_text("Nobody to roast yet. 😏")
             return
-        roast_lines = []
-        for u in standings:
-            uid = u["user_id"]
-            data = await _get_roast_data(uid)
+        async def _roast_one(u):
+            data = await _get_roast_data(u["user_id"])
             roast = await _generate_roast(data["name"], data)
-            if roast:
-                roast_lines.append(f"• {roast}")
+            return f"• {roast}" if roast else None
+        results = await asyncio.gather(*[_roast_one(u) for u in standings])
+        roast_lines = [r for r in results if r]
         if roast_lines:
             header = "🎤 Katerina has something for everyone:"
             msg = header + "\n\n" + "\n\n".join(roast_lines)
@@ -723,6 +722,7 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
                         break
             else:
                 # Step 2 — send tool results back to get final answer
+                # web_search_20250305 is server-side; tool_result content="" is correct
                 messages = [
                     {"role": "user", "content": search_prompt},
                     {"role": "assistant", "content": step1.get("content", [])},
@@ -737,7 +737,7 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
                 ]
                 step2_payload = _json.dumps({
                     "model": "claude-sonnet-4-6",
-                    "max_tokens": 512,
+                    "max_tokens": 800,
                     "tools": [{"type": "web_search_20250305", "name": "web_search"}],
                     "messages": messages
                 }).encode()
@@ -752,6 +752,35 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
                 )
                 with _req.urlopen(req2, timeout=20) as resp2:
                     step2 = _json.loads(resp2.read())
+
+                # Extract text — may need another round if model searched again
+                step2_tool_use = [b for b in step2.get("content", []) if b.get("type") == "tool_use"]
+                if step2_tool_use:
+                    # Model searched again — do one more round
+                    messages2 = messages + [
+                        {"role": "assistant", "content": step2.get("content", [])},
+                        {"role": "user", "content": [
+                            {"type": "tool_result", "tool_use_id": b["id"], "content": ""}
+                            for b in step2_tool_use
+                        ]}
+                    ]
+                    step3_payload = _json.dumps({
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 800,
+                        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                        "messages": messages2
+                    }).encode()
+                    req3 = _req.Request(
+                        "https://api.anthropic.com/v1/messages",
+                        data=step3_payload,
+                        headers={
+                            "content-type": "application/json",
+                            "anthropic-version": "2023-06-01",
+                            "x-api-key": ANTHROPIC_API_KEY
+                        }
+                    )
+                    with _req.urlopen(req3, timeout=20) as resp3:
+                        step2 = _json.loads(resp3.read())
 
                 for block in step2.get("content", []):
                     if block.get("type") == "text" and block.get("text", "").strip():
