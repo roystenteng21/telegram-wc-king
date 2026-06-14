@@ -1142,6 +1142,35 @@ async def cmd_admin_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = context.args
 
+    # /admin_credits all [amount] — give everyone credits
+    if args and args[0].lower() == "all":
+        if len(args) < 2:
+            await update.message.reply_text("Format: /admin_credits all [amount]")
+            return
+        try:
+            amount = int(args[1])
+        except ValueError:
+            await update.message.reply_text("Amount must be a number.")
+            return
+
+        standings = sheet.get_standings()
+        if not standings:
+            await update.message.reply_text("No players registered.")
+            return
+
+        direction = "Add" if amount >= 0 else "Deduct"
+        names = ", ".join(truncate(u.get("first_name") or u.get("username") or "?") for u in standings)
+        _admin_pending[ADMIN_TELEGRAM_ID] = {
+            "action": "credits_all_confirm",
+            "data": {"users": standings, "amount": amount},
+            "expires": datetime.now(UTC) + timedelta(seconds=120)
+        }
+        await update.message.reply_text(
+            f"Confirm: {direction} {abs(amount)}c to ALL players?\n{names}\n\n"
+            f"/confirm_admin or /cancel_admin"
+        )
+        return
+
     if not args:
         standings = sheet.get_standings()
         if not standings:
@@ -1153,6 +1182,7 @@ async def cmd_admin_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name = truncate(user.get("first_name") or user.get("username") or "Unknown")
             lines.append(f"{i}. {name} — {user['credits']}c")
         lines.append("\nReply /admin_credits [number] [amount]\nPositive to add, negative to deduct.")
+        lines.append("\nTo give everyone credits: /admin_credits all [amount]")
 
         _admin_pending[ADMIN_TELEGRAM_ID] = {
             "action": "credits_select",
@@ -1275,6 +1305,37 @@ async def cmd_confirm_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ Done. {name}: {new_credits}c")
         except Exception as e:
             await update.message.reply_text(f"⚠️ Failed to adjust credits: {e}")
+
+    # Credits adjustment — all players
+    elif action == "credits_all_confirm":
+        users = data["users"]
+        amount = data["amount"]
+        failed = []
+        succeeded = []
+        for user in users:
+            try:
+                old = user["credits"]
+                new = max(0, old + amount)
+                await sheet.update_user_credits(user["user_id"], new, notify_fn=dm_admin)
+                await sheet.append_ledger(
+                    user["user_id"], "admin_adjustment", amount, new,
+                    "Admin bulk adjustment", notify_fn=dm_admin
+                )
+                name = truncate(user.get("first_name") or user.get("username") or "Unknown")
+                succeeded.append(f"{name}: {new}c")
+            except Exception as e:
+                failed.append(str(user.get("user_id")))
+
+        result_lines = ["✅ Credits updated:\n"] + succeeded
+        if failed:
+            result_lines.append(f"\n⚠️ Failed for: {', '.join(failed)}")
+        await update.message.reply_text("\n".join(result_lines))
+
+        # Auto-roast all players for needing a bailout
+        if amount > 0:
+            import asyncio
+            import katerina as _katerina
+            asyncio.create_task(_katerina.send_bailout_roast(users, amount, notify_fn=dm_admin))
 
     else:
         await update.message.reply_text("Unknown pending action.")

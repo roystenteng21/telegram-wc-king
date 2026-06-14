@@ -482,6 +482,35 @@ async def check_and_send_stage_hype(notify_fn=None):
     await send_stage_hype(current_stage, next_stage, notify_fn=notify_fn)
 
 
+async def send_bailout_roast(users: list, amount: int, notify_fn=None):
+    """Roast all players for needing a bailout credit top-up."""
+    try:
+        names = ", ".join(
+            (u.get("first_name") or u.get("username") or "Someone")[:10]
+            for u in users
+        )
+        prompt = (
+            f"The admin just gave every player in WC Kings 2026 a {amount} credit bailout. "
+            f"The players are: {names}. "
+            f"You are Katerina, savage and unfiltered. "
+            f"Roast all of them mercilessly for being so bad at betting that they needed a bank bailout. "
+            f"Name them individually if possible. Be brutal, funny, and specific. "
+            f"Keep it under 150 words. No hashtags."
+        )
+        bot_context = _build_katerina_context()
+        roast = await _call_katerina(prompt, bot_context)
+        if not roast:
+            if notify_fn:
+                await notify_fn("⚠️ Katerina bailout roast failed — no response from API.")
+            return
+        from scheduler import send_group
+        await send_group(f"💸 {roast}")
+    except Exception as e:
+        logger.error(f"Bailout roast failed: {e}")
+        if notify_fn:
+            await notify_fn(f"⚠️ Bailout roast failed: {e}")
+
+
 # ── Katerina mention handler ──────────────────────────────────────────────────
 async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Reply when bot is @mentioned or 'katerina' appears in message."""
