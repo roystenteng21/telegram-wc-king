@@ -394,8 +394,7 @@ async def job_prematch_summary(match_id: str):
         if sorted_bets:
             lines.append("Current bets:")
             for b in sorted_bets:
-                user = sheet.cache["users"].get(b["user_id"], {})
-                name = (user.get("first_name") or user.get("username") or "?")[:10]
+                name = _get_user_name(b["user_id"])
                 lines.append(f"{name} — {_outcome_label(b['outcome'], match)} — {b['amount']}c")
         else:
             lines.append("No bets placed yet.")
@@ -437,8 +436,7 @@ async def job_kickoff_message(match_id: str):
         ]
 
         for b in sorted_bets:
-            user = sheet.cache["users"].get(b["user_id"], {})
-            name = (user.get("first_name") or user.get("username") or "?")[:10]
+            name = _get_user_name(b["user_id"])
             lines.append(f"{name} — {_outcome_label(b['outcome'], match)} — {b['amount']}c")
 
         # Fun line
@@ -805,7 +803,7 @@ async def job_post_standings(match_ids: list):
         lines.append("\n🏆 Standings")
 
         for i, user in enumerate(standings_after, 1):
-            name = (user.get("first_name") or user.get("username") or "Unknown")[:10]
+            name = _get_user_name(user["user_id"])
             credits = user["credits"]
             pl = pl_map.get(user["user_id"], 0)
             pl_str = f"+{pl}c" if pl > 0 else f"{pl}c"
@@ -982,7 +980,8 @@ def register_match_jobs(matches: list):
                 trigger=DateTrigger(run_date=summary_time),
                 args=[match_id],
                 id=f"prematch_{match_id}",
-                replace_existing=True
+                replace_existing=True,
+                misfire_grace_time=60
             )
             logger.info(f"Scheduled pre-match summary for {match_id} at {summary_time}")
 

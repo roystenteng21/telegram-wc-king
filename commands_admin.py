@@ -1,5 +1,4 @@
 import logging
-import pytz
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -57,22 +56,8 @@ async def cmd_admin_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # /admin_poll — list today's unfinished matches
-    CT = pytz.timezone("America/Chicago")
-    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
-    today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
-    tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
-    all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
-
-    unfinished = []
-    for m in all_matches:
-        try:
-            kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-            if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") != today_ct:
-                continue
-            if m["status"] not in ("FINISHED", "CANCELLED", "POSTPONED"):
-                unfinished.append(m)
-        except Exception:
-            continue
+    all_matches = await sched.get_today_ct_matches()
+    unfinished = [m for m in all_matches if m["status"] not in ("FINISHED", "CANCELLED", "POSTPONED")]
 
     if not unfinished:
         await update.message.reply_text("No unfinished matches today.")
@@ -129,22 +114,8 @@ async def cmd_admin_result_push(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     # /admin_result_push — list today's finished matches
-    CT = pytz.timezone("America/Chicago")
-    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
-    today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
-    tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
-    all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
-
-    finished = []
-    for m in all_matches:
-        try:
-            kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-            if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") != today_ct:
-                continue
-            if m["status"] == "FINISHED":
-                finished.append(m)
-        except Exception:
-            continue
+    all_matches = await sched.get_today_ct_matches()
+    finished = [m for m in all_matches if m["status"] == "FINISHED"]
 
     if not finished:
         await update.message.reply_text("No finished matches today.")
@@ -190,20 +161,8 @@ async def cmd_admin_eod_push(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # Step 1: preview and ask for confirmation
     try:
-        CT = pytz.timezone("America/Chicago")
-        today_ct = datetime.now(CT).strftime("%Y-%m-%d")
-        today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
-        tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
-        all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
-
-        match_ids = []
-        for m in all_matches:
-            try:
-                kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-                if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct:
-                    match_ids.append(m["match_id"])
-            except Exception:
-                continue
+        all_matches = await sched.get_today_ct_matches()
+        match_ids = [m["match_id"] for m in all_matches]
 
         _admin_pending[ADMIN_TELEGRAM_ID] = {
             "action": "eod_push",
@@ -460,13 +419,13 @@ async def cmd_admin_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
             for b in winners:
                 user = sheet.cache["users"].get(b["user_id"], {})
-                name = (user.get("first_name") or user.get("username") or "?")[:10]
+                name = truncate(user.get("first_name") or user.get("username") or "?")
                 payout = event["reward"] if event["is_free"] else int(b["amount"] * event["multiplier"])
                 lines.append(f"• {name} → +{payout}c")
             lines.append("\nLosers:")
             for b in losers:
                 user = sheet.cache["users"].get(b["user_id"], {})
-                name = (user.get("first_name") or user.get("username") or "?")[:10]
+                name = truncate(user.get("first_name") or user.get("username") or "?")
                 lines.append(f"• {name} ❌")
             lines.append(f"\n/admin_event resolve {event_id} {winner_input} confirm")
             await update.message.reply_text("\n".join(lines))
@@ -483,7 +442,7 @@ async def cmd_admin_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return (user.get("first_name") or user.get("username") or "").lower()
             for s in sorted(settlements, key=get_sort_name):
                 user = sheet.cache["users"].get(s["user_id"], {})
-                name = (user.get("first_name") or user.get("username") or "?")[:10]
+                name = truncate(user.get("first_name") or user.get("username") or "?")
                 icon = "✅" if s["status"] == "won" else "❌"
                 option_str = event["options"][int(s["outcome"]) - 1] if s["outcome"].isdigit() else s["outcome"]
                 lines.append(f"{name} — {option_str} {icon}")
@@ -537,7 +496,7 @@ async def cmd_admin_simulate_eod(update: Update, context: ContextTypes.DEFAULT_T
     lines.append("\n🏆 Standings")
 
     for i, user in enumerate(standings, 1):
-        name = (user.get("first_name") or user.get("username") or "Unknown")[:10]
+        name = truncate(user.get("first_name") or user.get("username") or "Unknown")
         credits = user["credits"]
         badge = " 🏆" if i == 1 else ""
         lines.append(f"{i}. {name}{badge} — {credits}c (+50c today)")
@@ -556,20 +515,8 @@ async def cmd_admin_sim_night(update: Update, context: ContextTypes.DEFAULT_TYPE
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
 
-    CT = pytz.timezone("America/Chicago")
-    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
-    today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
-    tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
-    all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
-
-    upcoming = []
-    for m in all_matches:
-        try:
-            kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-            if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct and m["status"] in ("SCHEDULED", "TIMED"):
-                upcoming.append(m)
-        except Exception:
-            continue
+    all_matches = await sched.get_today_ct_matches()
+    upcoming = [m for m in all_matches if m["status"] in ("SCHEDULED", "TIMED")]
 
     if not upcoming:
         await update.message.reply_text("No upcoming matches to simulate.")
@@ -587,18 +534,12 @@ async def cmd_admin_sim_morning(update: Update, context: ContextTypes.DEFAULT_TY
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
 
-    CT = pytz.timezone("America/Chicago")
-    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
-    today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
-    tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
-    all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
-
+    raw_matches = await sched.get_today_ct_matches()
     today_matches = []
-    for m in all_matches:
+    for m in raw_matches:
         try:
             kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-            if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct:
-                today_matches.append((kickoff_utc_dt, m))
+            today_matches.append((kickoff_utc_dt, m))
         except Exception:
             continue
 
@@ -653,7 +594,7 @@ async def cmd_admin_sim_prematch(update: Update, context: ContextTypes.DEFAULT_T
             lines.append("Current bets:")
             for b in open_bets:
                 user = sheet.cache["users"].get(b["user_id"], {})
-                name = (user.get("first_name") or user.get("username") or "?")[:10]
+                name = truncate(user.get("first_name") or user.get("username") or "?")
                 lines.append(f"{name} — {sched._outcome_label(b['outcome'], match)} — {b['amount']}c")
         else:
             lines.append("No bets placed yet.")
@@ -661,20 +602,8 @@ async def cmd_admin_sim_prematch(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("\n".join(lines))
         return
 
-    CT = pytz.timezone("America/Chicago")
-    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
-    today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
-    tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
-    all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
-
-    upcoming = []
-    for m in all_matches:
-        try:
-            kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-            if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct and m["status"] in ("SCHEDULED", "TIMED"):
-                upcoming.append(m)
-        except Exception:
-            continue
+    all_matches = await sched.get_today_ct_matches()
+    upcoming = [m for m in all_matches if m["status"] in ("SCHEDULED", "TIMED")]
 
     if not upcoming:
         await update.message.reply_text("No upcoming matches today.")
@@ -717,20 +646,7 @@ async def cmd_admin_sim_kickoff(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("✅ Kickoff message simulation sent to group.")
         return
 
-    CT = pytz.timezone("America/Chicago")
-    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
-    today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
-    tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
-    all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
-
-    upcoming = []
-    for m in all_matches:
-        try:
-            kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-            if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct:
-                upcoming.append(m)
-        except Exception:
-            continue
+    upcoming = await sched.get_today_ct_matches()
 
     if not upcoming:
         await update.message.reply_text("No matches today.")
@@ -775,20 +691,8 @@ async def cmd_admin_sim_result(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"Simulation:\n\n{result_msg}")
         return
 
-    CT = pytz.timezone("America/Chicago")
-    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
-    today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
-    tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
-    all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
-
-    finished = []
-    for m in all_matches:
-        try:
-            kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-            if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct and m["status"] == "FINISHED":
-                finished.append(m)
-        except Exception:
-            continue
+    all_matches = await sched.get_today_ct_matches()
+    finished = [m for m in all_matches if m["status"] == "FINISHED"]
 
     if not finished:
         await update.message.reply_text("No finished matches today to simulate.")

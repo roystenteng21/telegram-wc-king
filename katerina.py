@@ -12,7 +12,7 @@ from config import (
 import sheet
 from helpers import (
     application, dm_admin, is_silent_hours, is_group_message,
-    format_team, _chat_history, get_group_chat_id
+    format_team, truncate, _chat_history, get_group_chat_id
 )
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ def _build_katerina_context() -> str:
     standings = sheet.get_standings()
     standings_lines = []
     for i, u in enumerate(standings, 1):
-        name = (u.get("first_name") or u.get("username") or "Unknown")[:10]
+        name = truncate(u.get("first_name") or u.get("username") or "Unknown")
         standings_lines.append(f"{i}. {name} — {u['credits']}c")
 
     CT = pytz.timezone("America/Chicago")
@@ -80,6 +80,48 @@ def _build_katerina_context() -> str:
 
     silent = is_silent_hours()
 
+    # Per-player bet summary
+    player_bet_lines = []
+    for uid, u in sheet.cache.get("users", {}).items():
+        name = truncate(u.get("first_name") or u.get("username") or "Unknown")
+        user_bets = [b for b in sheet.cache["bets"] if b["user_id"] == uid]
+
+        open_singles = [b for b in user_bets if b["status"] == "open" and not b.get("parlay_id")]
+        open_parlay_ids = list({b["parlay_id"] for b in user_bets if b["status"] == "open" and b.get("parlay_id")})
+        all_parlay_ids = list({b["parlay_id"] for b in user_bets if b.get("parlay_id")})
+        dead_parlay_ids = [
+            pid for pid in all_parlay_ids
+            if any(b["status"] == "lost" for b in user_bets if b.get("parlay_id") == pid)
+        ]
+
+        CT_local = pytz.timezone("America/Chicago")
+        today_ct_local = datetime.now(CT_local).strftime("%Y-%m-%d")
+        today_settled = []
+        for b in user_bets:
+            if b["status"] not in ("won", "lost"):
+                continue
+            m = sheet.cache["matches"].get(str(b["match_id"]), {})
+            try:
+                ko = datetime.strptime(m.get("kickoff_utc", ""), "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                if ko.astimezone(CT_local).strftime("%Y-%m-%d") == today_ct_local:
+                    today_settled.append(b)
+            except Exception:
+                continue
+
+        parts = []
+        if open_singles:
+            parts.append(f"{len(open_singles)} open single(s)")
+        if open_parlay_ids:
+            parts.append(f"{len(open_parlay_ids)} active parlay(s)")
+        if dead_parlay_ids:
+            parts.append(f"{len(dead_parlay_ids)} 🥀 dead parlay(s)")
+        if today_settled:
+            wins = sum(1 for b in today_settled if b["status"] == "won")
+            losses = sum(1 for b in today_settled if b["status"] == "lost")
+            parts.append(f"today: {wins}W {losses}L")
+        if parts:
+            player_bet_lines.append(f"{name}: {', '.join(parts)}")
+
     return f"""Data as of {refresh_str}.
 
 CURRENT TIME: {now_sgt.strftime("%I:%M %p SGT")}
@@ -97,6 +139,9 @@ LEADERBOARD:
 
 TODAY'S MATCHES:
 {chr(10).join(match_lines) if match_lines else "No matches today"}
+
+PLAYER BET STATUS:
+{chr(10).join(player_bet_lines) if player_bet_lines else "No bet activity"}
 
 PENDING OVERNIGHT RESULTS: {len(sheet.cache.get("pending_result_messages", []))} held
 PENDING PARLAY WINS: {len(sheet.cache.get("pending_parlay_wins", []))} held
@@ -128,9 +173,13 @@ Your personality:
 - Short replies — 1 to 3 sentences max unless the question genuinely needs more.
 - When referencing data, always say "as of [time]" from the data snapshot.
 - If the data doesn't confirm something, say you don't have that right now.
-- You NEVER place bets, change credits, or run commands. Direct those to the slash commands.
+- You NEVER place bets, change credits, or run commands. Direct to /bet only — NEVER mention /predict.
 - You are NOT a customer service bot. You have a personality. Use it.
 - When someone says "me" or "my", they are referring to the person identified in THE PERSON TALKING TO YOU RIGHT NOW. Address them by name.
+- NEVER use markdown formatting. No **bold**, no _italic_, no backticks. Plain text only.
+- NEVER mention match kickoff times in your replies.
+- When referencing a failed or dead parlay, always use the 🥀 emoji.
+- When asked about predictions and search results are unavailable, say you couldn't find current expert opinions and leave it there. Do NOT speculate, invent analysis, or make up facts.
 
 Current bot state:
 """ + bot_context + sender_block
@@ -164,7 +213,7 @@ Current bot state:
 async def _get_roast_data(target_uid: int) -> dict:
     """Build roast data for a specific user."""
     user = sheet.cache["users"].get(target_uid, {})
-    name = (user.get("first_name") or user.get("username") or "that sucker")[:10]
+    name = truncate(user.get("first_name") or user.get("username") or "that sucker")
     credits = user.get("credits", 0)
     standings = sheet.get_standings()
     rank = next((i+1 for i, u in enumerate(standings) if u["user_id"] == target_uid), None)
@@ -420,7 +469,7 @@ async def send_stage_hype(current_stage: str, next_stage: str, notify_fn=None) -
     try:
         standings = sheet.get_standings()
         leader = standings[0] if standings else None
-        leader_name = (leader.get("first_name") or leader.get("username") or "Someone")[:10] if leader else "Someone"
+        leader_name = truncate(leader.get("first_name") or leader.get("username") or "Someone") if leader else "Someone"
         from config import PRIZE_PLAYER_COUNT, PRIZE_PER_PLAYER
         prize_pool = PRIZE_PLAYER_COUNT * PRIZE_PER_PLAYER
 
@@ -487,16 +536,16 @@ async def send_bailout_roast(users: list, amount: int, notify_fn=None):
     try:
         standings = sheet.get_standings()
         zero_players = [
-            (s.get("first_name") or s.get("username") or "Someone")[:10]
+            truncate(s.get("first_name") or s.get("username") or "Someone")
             for s in standings if s.get("credits", 0) == 0
         ]
         bottom_players = [
-            f"{(s.get('first_name') or s.get('username') or '?')[:10]} ({s['credits']}c)"
+            f"{truncate(s.get('first_name') or s.get('username') or '?')} ({s['credits']}c)"
             for s in standings[-2:]
         ] if standings else []
 
         leaderboard_str = "\n".join(
-            f"{i+1}. {(s.get('first_name') or s.get('username') or '?')[:10]} — {s['credits']}c"
+            f"{i+1}. {truncate(s.get('first_name') or s.get('username') or '?')} — {s['credits']}c"
             for i, s in enumerate(standings)
         ) if standings else "No standings available."
 
@@ -611,7 +660,7 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
                 "tools": [{"type": "web_search_20250305", "name": "web_search"}],
                 "messages": [{
                     "role": "user",
-                    "content": f"Search for current match predictions and odds for: {match_query}. Return a 2-3 sentence factual summary of what experts and bookmakers are saying. No fluff."
+                    "content": f"Search for current match predictions and expert opinions for: {match_query}. Return a 2-3 sentence factual summary of what analysts and pundits are saying. No fluff."
                 }]
             }).encode()
             req = urllib.request.Request(
@@ -625,19 +674,33 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
             )
             with urllib.request.urlopen(req, timeout=20) as resp:
                 result = _json.loads(resp.read())
+                # Extract from tool_result blocks first, fall back to text blocks
                 for block in result.get("content", []):
-                    if block.get("type") == "text":
-                        web_results = block["text"].strip()
+                    if block.get("type") == "tool_result":
+                        inner = block.get("content", [])
+                        if isinstance(inner, list):
+                            for c in inner:
+                                if c.get("type") == "text" and c.get("text", "").strip():
+                                    web_results = c["text"].strip()
+                                    break
+                        elif isinstance(inner, str) and inner.strip():
+                            web_results = inner.strip()
+                    if web_results:
                         break
+                if not web_results:
+                    for block in result.get("content", []):
+                        if block.get("type") == "text" and block.get("text", "").strip():
+                            web_results = block["text"].strip()
+                            break
         except Exception as e:
             logger.error(f"Katerina web search failed: {e}")
             web_results = ""
 
     bot_context = _build_katerina_context()
     if web_results:
-        bot_context += f"\nWEB SEARCH RESULTS (use this to answer their question about predictions/odds):\n{web_results}"
+        bot_context += f"\nWEB SEARCH RESULTS (use this to answer their question about match predictions):\n{web_results}"
     elif wants_analysis:
-        bot_context += "\nWEB SEARCH: Failed to fetch current predictions/odds. Tell the user you couldn't pull live data right now, give your best take based on what you know, and keep it honest."
+        bot_context += "\nWEB SEARCH: Could not retrieve current expert predictions. Tell the user you couldn't find current opinions on this. Do NOT speculate, invent analysis, or fabricate any facts."
 
     if _chat_history:
         history_str = "\n".join(list(_chat_history)[-50:])
@@ -673,152 +736,3 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
             "Busy. Try again. 😏",
         ]
         await update.message.reply_text(random.choice(fallbacks))
-    """Reply when bot is @mentioned or 'katerina' appears in message."""
-    if not update.message or not update.message.text:
-        return
-    if not is_group_message(update):
-        return
-
-    # Ignore messages sent before startup (backlog replay after restart)
-    msg_time = update.message.date
-    if msg_time is not None:
-        msg_utc = msg_time.replace(tzinfo=UTC) if msg_time.tzinfo is None else msg_time.astimezone(UTC)
-        if msg_utc < (_startup_time - timedelta(seconds=60)):
-            logger.info(f"Ignoring pre-startup mention from {update.effective_user.first_name} at {msg_utc}")
-            return
-
-    text = update.message.text
-    bot_username = f"@{context.bot.username}" if context.bot.username else ""
-
-    # Check triggers
-    is_mention = (
-        (bot_username and bot_username.lower() in text.lower()) or
-        "katerina" in text.lower()
-    )
-    if not is_mention:
-        return
-
-    # Strip the trigger word to get the actual question
-    clean = text
-    if bot_username:
-        clean = clean.replace(bot_username, "").replace(bot_username.lower(), "")
-    clean = clean.replace("Katerina", "").replace("katerina", "").strip()
-    if not clean:
-        clean = "say something"
-
-    # Build sender context
-    sender = update.effective_user
-    sender_uid = sender.id
-    sender_cache = sheet.cache["users"].get(sender_uid, {})
-    sender_name = sender_cache.get("first_name") or sender_cache.get("username") or sender.first_name or sender.username or "someone"
-    sender_credits = sender_cache.get("credits", "unknown")
-
-    # Build sender stats for Katerina
-    all_sender_bets = [b for b in sheet.cache["bets"] if b["user_id"] == sender_uid and b["status"] in ("won", "lost")]
-    sender_wins = sum(1 for b in all_sender_bets if b["status"] == "won")
-    sender_losses = sum(1 for b in all_sender_bets if b["status"] == "lost")
-    standings = sheet.get_standings()
-    sender_rank = next((i+1 for i, u in enumerate(standings) if u["user_id"] == sender_uid), None)
-    sender_stats = (
-        f"Credits: {sender_credits}c | "
-        f"Record: {sender_wins}W-{sender_losses}L | "
-        f"Rank: {sender_rank} of {len(standings)}"
-    ) if sender_rank else f"Credits: {sender_credits}c (not yet ranked)"
-
-    # Check if this is a predictions/odds/analysis question — trigger web search
-    search_keywords = ["odds", "prediction", "predict", "outside world", "favourite", "favorite",
-                       "who will win", "analysis", "expert", "betting line", "what do you think",
-                       "chance", "likely", "bookie", "market"]
-    wants_analysis = any(kw in clean.lower() for kw in search_keywords)
-
-    web_results = ""
-    if wants_analysis:
-        # Extract match context from message
-        match_query = clean
-        # Try to find team names mentioned
-        for team_name in sheet.cache.get("matches", {}).values():
-            home = team_name.get("home", "")
-            away = team_name.get("away", "")
-            if home.lower() in clean.lower() or away.lower() in clean.lower():
-                match_query = f"{home} vs {away} prediction 2026 World Cup"
-                break
-        else:
-            match_query = f"{clean} 2026 World Cup prediction"
-
-        try:
-            import urllib.request as _req
-            import urllib.parse as _parse
-            search_url = f"https://api.anthropic.com/v1/messages"
-            # Use Anthropic web search tool
-            import json as _json
-            search_payload = _json.dumps({
-                "model": "claude-sonnet-4-6",
-                "max_tokens": 400,
-                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-                "messages": [{
-                    "role": "user",
-                    "content": f"Search for current match predictions and odds for: {match_query}. Return a 2-3 sentence factual summary of what experts and bookmakers are saying. No fluff."
-                }]
-            }).encode()
-            req = urllib.request.Request(
-                search_url,
-                data=search_payload,
-                headers={
-                    "content-type": "application/json",
-                    "anthropic-version": "2023-06-01",
-                    "x-api-key": ANTHROPIC_API_KEY
-                }
-            )
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                result = _json.loads(resp.read())
-                for block in result.get("content", []):
-                    if block.get("type") == "text":
-                        web_results = block["text"].strip()
-                        break
-        except Exception as e:
-            logger.error(f"Katerina web search failed: {e}")
-            web_results = ""
-
-    bot_context = _build_katerina_context()
-    if web_results:
-        bot_context += f"\nWEB SEARCH RESULTS (use this to answer their question about predictions/odds):\n{web_results}"
-    elif wants_analysis:
-        bot_context += "\nWEB SEARCH: Failed to fetch current predictions/odds. Tell the user you couldn't pull live data right now, give your best take based on what you know, and keep it honest."
-
-    # Append recent chat history for contextual replies
-    if _chat_history:
-        history_str = "\n".join(list(_chat_history)[-50:])
-        bot_context += f"\n\nRECENT GROUP CHAT (last {min(len(_chat_history), 50)} messages):\n{history_str}"
-
-    # During silent hours — DM sender instead of replying in group
-    if is_silent_hours():
-        import random
-        quiet_lines = [
-            "Quiet hours. Bets are still open but I'm not taking questions right now. Back at 7:30AM. 😌",
-            "I'm off the clock. Place your bets via /bet if you need to — I'll be back at 7:30AM. 🌙",
-            "Sleeping hours. The house is still open for bets, just not for chat. See you at 7:30AM. 😴",
-            "Quiet hours. Use /bet if you need to place one. Questions can wait till 7:30AM. 😌",
-            "Taking a break. Bets still work — just use /bet. I'm back at 7:30AM SGT. 🌙",
-        ]
-        try:
-            await application.bot.send_message(
-                chat_id=update.effective_user.id,
-                text=random.choice(quiet_lines)
-            )
-        except Exception as e:
-            logger.warning(f"Could not DM {update.effective_user.id} during silent hours: {e}")
-        return
-
-    reply = await _call_katerina(clean, bot_context, sender_name=sender_name, sender_stats=sender_stats)
-    if reply:
-        await update.message.reply_text(reply)
-    else:
-        import random
-        fallbacks = [
-            "I'm thinking. Don't rush me. 😒",
-            "Give me a second, I'm counting other people's losses. 💸",
-            "Busy. Try again. 😏",
-        ]
-        await update.message.reply_text(random.choice(fallbacks))
-
-

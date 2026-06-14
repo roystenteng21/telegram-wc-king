@@ -92,9 +92,11 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No matches today.")
         return
 
-    # If all today's matches are done, show tomorrow's instead
-    all_done = all(m.get("status") in ("FINISHED", "CANCELLED", "POSTPONED") for m in day_matches)
-    if all_done:
+    # If EOD has fired today, show tomorrow's matches instead
+    CT_check = pytz.timezone("America/Chicago")
+    today_ct_check = datetime.now(CT_check).strftime("%Y-%m-%d")
+    eod_fired = sheet.cache.get("eod_date") == today_ct_check
+    if eod_fired:
         tomorrow_ct = (datetime.now(CT) + timedelta(days=1)).strftime("%Y-%m-%d")
         day_after_utc = (datetime.now(UTC) + timedelta(days=2)).strftime("%Y-%m-%d")
         next_matches_raw = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc) + await sheet.get_matches_for_date(day_after_utc)
@@ -211,21 +213,8 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_registered(update)
     try:
-        CT = pytz.timezone("America/Chicago")
-        today_ct = datetime.now(CT).strftime("%Y-%m-%d")
-        today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
-        tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
-        all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
-
-        today_teams = set()
-        for m in all_matches:
-            try:
-                kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-                if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct:
-                    today_teams.add(m["home"])
-                    today_teams.add(m["away"])
-            except Exception:
-                continue
+        today_matches = await sched.get_today_ct_matches()
+        today_teams = {team for m in today_matches for team in (m["home"], m["away"])}
 
         all_standings = api.fetch_standings()
         if not all_standings:
