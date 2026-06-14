@@ -163,6 +163,9 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 pid = b.get("parlay_id", "")
                 if pid:
+                    # Skip legs whose parlay is already dead (a leg lost)
+                    if not sheet.is_parlay_alive(pid):
+                        continue
                     # Collect parlay info for summary
                     if pid not in parlay_summary:
                         all_legs = sheet.get_parlay_bets(pid)
@@ -290,6 +293,12 @@ async def cmd_mybets(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parlay_ids.append(pid)
             seen.add(pid)
 
+    alive_parlay_ids = [pid for pid in parlay_ids if sheet.is_parlay_alive(pid)]
+
+    if not singles and not alive_parlay_ids:
+        await update.message.reply_text("You have no open bets.")
+        return
+
     lines = ["📋 Your open bets:\n"]
 
     # Singles
@@ -307,7 +316,7 @@ async def cmd_mybets(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"{i}. {label} — {bet['amount']}c")
 
     # Parlays
-    for pid in parlay_ids:
+    for pid in alive_parlay_ids:
         legs = sheet.get_parlay_bets(pid)
         if not legs:
             continue
@@ -328,7 +337,7 @@ async def cmd_mybets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     footer = []
     if singles:
         footer.append("/cancel to cancel a single bet.")
-    if parlay_ids:
+    if alive_parlay_ids:
         footer.append("/cancelparlay to cancel a parlay.")
     if footer:
         lines.append("\n" + " ".join(footer))

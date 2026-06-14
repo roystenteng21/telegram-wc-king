@@ -401,6 +401,16 @@ def get_parlay_bets(parlay_id: str) -> list:
     return [b for b in cache["bets"] if b.get("parlay_id") == parlay_id]
 
 
+def is_parlay_alive(parlay_id: str) -> bool:
+    """Returns False if any leg is lost (parlay is bust) or all legs are settled without a win."""
+    legs = get_parlay_bets(parlay_id)
+    if not legs:
+        return False
+    if any(b["status"] == "lost" for b in legs):
+        return False
+    return True
+
+
 def get_user_active_parlays(user_id: int) -> list:
     """Return list of distinct active parlay_ids for a user (bets still open)."""
     seen = set()
