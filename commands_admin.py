@@ -808,6 +808,37 @@ async def cmd_admin_sim_result(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text("\n".join(lines))
 
 
+# ── Admin: /admin_credits_announcement ───────────────────────────────────────
+async def cmd_admin_credits_announcement(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send credits system explanation to the group."""
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+    gid = get_group_chat_id()
+    if not gid:
+        await update.message.reply_text("No group chat locked yet.")
+        return
+
+    msg = (
+        "💰 Credits System — How It Works\n\n"
+        "Everyone starts with 100 credits and gets topped up throughout the day:\n\n"
+        "⚽ +50c after each match (except the last one)\n"
+        "📅 +100c at end of day (after the last match)\n\n"
+        "On a day with 3 matches that's 50 + 50 + 100 = 200c total.\n"
+        "On a 1-match day it's just the 100c EOD top-up.\n\n"
+        "Bets pay 1:1 — stake 50c on a win, get 100c back.\n\n"
+        "🎰 Parlays\n"
+        "Combine 2–4 result bets on the same match day:\n"
+        "• 2 legs = 2.5x\n"
+        "• 3 legs = 5x\n"
+        "• 4 legs = 10x\n"
+        "All legs must win. One loss and the whole parlay is done.\n\n"
+        "Winner = highest credits after the Final on Jul 19. Good luck! 🍀"
+    )
+
+    await sched.send_group(msg)
+    await update.message.reply_text("✅ Credits announcement sent.")
+
+
 # ── Admin: /admin_announce ────────────────────────────────────────────────────
 async def cmd_admin_katerina_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send Katerina's 'I'm back' message to the group."""
