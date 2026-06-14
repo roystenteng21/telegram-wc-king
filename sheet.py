@@ -587,7 +587,8 @@ async def settle_bets_for_match(match_id: str, result: str, ou_result: str, noti
                 "outcome": bet["outcome"],
                 "amount": bet["amount"],
                 "status": status,
-                "pl": pl
+                "pl": pl,
+                "parlay_id": bet.get("parlay_id", "")
             })
 
         return settlements
