@@ -533,6 +533,8 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
         return
     if not is_group_message(update):
         return
+    if update.effective_user and update.effective_user.is_bot:
+        return
 
     # Ignore messages sent before startup (backlog replay after restart)
     msg_time = update.message.date
