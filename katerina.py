@@ -485,16 +485,31 @@ async def check_and_send_stage_hype(notify_fn=None):
 async def send_bailout_roast(users: list, amount: int, notify_fn=None):
     """Roast all players for needing a bailout credit top-up."""
     try:
-        names = ", ".join(
-            (u.get("first_name") or u.get("username") or "Someone")[:10]
-            for u in users
-        )
+        standings = sheet.get_standings()
+        zero_players = [
+            (s.get("first_name") or s.get("username") or "Someone")[:10]
+            for s in standings if s.get("credits", 0) == 0
+        ]
+        bottom_players = [
+            f"{(s.get('first_name') or s.get('username') or '?')[:10]} ({s['credits']}c)"
+            for s in standings[-2:]
+        ] if standings else []
+
+        leaderboard_str = "\n".join(
+            f"{i+1}. {(s.get('first_name') or s.get('username') or '?')[:10]} — {s['credits']}c"
+            for i, s in enumerate(standings)
+        ) if standings else "No standings available."
+
+        zero_note = f"Players with 0 credits: {', '.join(zero_players)}. " if zero_players else ""
+        bottom_note = f"Bottom of the leaderboard: {', '.join(bottom_players)}. " if bottom_players else ""
+
         prompt = (
             f"The admin just gave every player in WC Kings 2026 a {amount} credit bailout. "
-            f"The players are: {names}. "
+            f"Current leaderboard:\n{leaderboard_str}\n\n"
+            f"{zero_note}{bottom_note}"
             f"You are Katerina, savage and unfiltered. "
             f"Roast all of them mercilessly for being so bad at betting that they needed a bank bailout. "
-            f"Name them individually if possible. Be brutal, funny, and specific. "
+            f"Specifically call out anyone on 0 credits or near the bottom. Name them. Be brutal, funny, and specific. "
             f"Keep it under 150 words. No hashtags."
         )
         bot_context = _build_katerina_context()
