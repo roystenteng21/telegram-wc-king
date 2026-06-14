@@ -1012,12 +1012,10 @@ async def on_startup(notify_fn=None):
         if now_sgt.hour == NIGHT_REMINDER_HOUR:
             logger.info("Startup during 11PM hour — firing night reminder immediately")
             scheduler.add_job(job_night_reminder, trigger=DateTrigger(run_date=datetime.now(UTC) + timedelta(seconds=5)), id="night_reminder_recovery", replace_existing=True)
-        # Morning catchup: fire if restart between 7:30AM and 8:00AM SGT
-        elif now_sgt.hour == MORNING_CATCHUP_HOUR and now_sgt.minute >= MORNING_CATCHUP_MINUTE:
+        # Morning catchup: fire if restart between 7:30AM and 10:00AM SGT
+        elif (now_sgt.hour == MORNING_CATCHUP_HOUR and now_sgt.minute >= MORNING_CATCHUP_MINUTE) or \
+             (now_sgt.hour > MORNING_CATCHUP_HOUR and now_sgt.hour < 10):
             logger.info("Startup during morning catchup window — firing morning catchup immediately")
-            scheduler.add_job(job_morning_catchup, trigger=DateTrigger(run_date=datetime.now(UTC) + timedelta(seconds=5)), id="morning_catchup_recovery", replace_existing=True)
-        elif now_sgt.hour == MORNING_CATCHUP_HOUR + 1 and now_sgt.minute < 30:
-            logger.info("Startup shortly after morning catchup — firing morning catchup immediately")
             scheduler.add_job(job_morning_catchup, trigger=DateTrigger(run_date=datetime.now(UTC) + timedelta(seconds=5)), id="morning_catchup_recovery", replace_existing=True)
 
         if _bot is not None:

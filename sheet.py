@@ -733,16 +733,45 @@ def get_standings() -> list:
     )
 
 def get_daily_pl(match_ids: list) -> dict:
+    from config import PARLAY_MULTIPLIERS
+    match_ids_str = [str(m) for m in match_ids]
     pl = {}
+
+    # Singles only — parlay legs handled separately
     for bet in cache["bets"]:
-        if bet["match_id"] not in [str(m) for m in match_ids]:
+        if bet["match_id"] not in match_ids_str:
             continue
         if bet["status"] not in ("won", "lost"):
             continue
+        if bet.get("parlay_id", ""):
+            continue  # skip parlay legs here
         uid = bet["user_id"]
-        if uid not in pl:
-            pl[uid] = 0
-        pl[uid] += bet["amount"] if bet["status"] == "won" else -bet["amount"]
+        pl[uid] = pl.get(uid, 0) + (bet["amount"] if bet["status"] == "won" else -bet["amount"])
+
+    # Parlays — find all parlay_ids with any leg in today's matches
+    today_parlay_ids = set(
+        b["parlay_id"] for b in cache["bets"]
+        if b.get("parlay_id") and b["match_id"] in match_ids_str
+    )
+    for pid in today_parlay_ids:
+        legs = get_parlay_bets(pid)
+        if not legs:
+            continue
+        uid = legs[0]["user_id"]
+        stake = legs[0]["amount"]  # stake deducted once
+        settled = [b for b in legs if b["status"] in ("won", "lost")]
+        open_legs = [b for b in legs if b["status"] == "open"]
+        if open_legs:
+            continue  # parlay not fully settled yet — skip
+        all_won = all(b["status"] == "won" for b in settled)
+        effective = len(settled)
+        if all_won and effective >= 2:
+            multiplier = PARLAY_MULTIPLIERS.get(effective, PARLAY_MULTIPLIERS.get(4, 10.0))
+            payout = int(stake * multiplier)
+            pl[uid] = pl.get(uid, 0) + (payout - stake)
+        else:
+            pl[uid] = pl.get(uid, 0) - stake
+
     return pl
 
 # ── Event row cache ───────────────────────────────────────────────────────────

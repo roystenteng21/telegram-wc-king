@@ -509,15 +509,7 @@ async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Balance: {new_balance}c"
         )
 
-        # During silent hours — DM only
-        if is_silent_hours():
-            try:
-                dm_msg = confirm_msg + "\n\n🔕 Sent here to minimise group notifications (12AM–7:30AM SGT)."
-                await application.bot.send_message(chat_id=user.id, text=dm_msg)
-            except Exception:
-                await update.message.reply_text(confirm_msg)
-        else:
-            await update.message.reply_text(confirm_msg)
+        await send_confirmation(update, confirm_msg)
 
     except ValueError as e:
         await update.message.reply_text(str(e))
@@ -779,14 +771,7 @@ async def cmd_parlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"Balance: {new_balance}c")
 
         confirm_msg = "\n".join(lines)
-        if is_silent_hours():
-            try:
-                dm_msg = confirm_msg + "\n\n🔕 Sent here to minimise group notifications (12AM–7:30AM SGT)."
-                await application.bot.send_message(chat_id=user.id, text=dm_msg)
-            except Exception:
-                await update.message.reply_text(confirm_msg)
-        else:
-            await update.message.reply_text(confirm_msg)
+        await send_confirmation(update, confirm_msg)
 
     except ValueError as e:
         # Rollback — cancel first leg only (only leg that deducted credits)
