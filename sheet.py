@@ -697,6 +697,32 @@ async def clear_pending_msgs(notify_fn=None):
             await notify_fn(f"⚠️ Failed to clear pending_msgs sheet: {e}")
 
 # ── Daily credits ────────────────────────────────────────────────────────────
+async def add_match_credits(match_amount: int, match_id: str, notify_fn=None):
+    """Add post-match credits to all users. Uses match_id as dedup key."""
+    cache_key = f"match_credits_{match_id}"
+    if cache.get(cache_key):
+        logger.info(f"Match credits already added for {match_id}, skipping.")
+        return
+
+    try:
+        ws = get_sheet(SHEET_USERS)
+        for user_id, user in cache["users"].items():
+            row_num = _user_rows.get(user_id)
+            if not row_num:
+                continue
+            new_credits = user["credits"] + match_amount
+            ws.update_cell(row_num, 4, new_credits)
+            cache["users"][user_id]["credits"] = new_credits
+            await append_ledger(user_id, "match_credit", match_amount, new_credits, f"Post-match top-up ({match_id})", notify_fn)
+        cache[cache_key] = True
+        logger.info(f"Match credits added for match {match_id}")
+    except Exception as e:
+        logger.error(f"Failed to add match credits for {match_id}: {e}")
+        if notify_fn:
+            await notify_fn(f"⚠️ Failed to add match credits for match {match_id}: {e}")
+        raise
+
+
 async def add_daily_credits(daily_amount: int, notify_fn=None):
     """Add daily credits to all users. Skips if already credited today (in-memory check)."""
     today = datetime.now(UTC).strftime("%Y-%m-%d")

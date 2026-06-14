@@ -7,7 +7,7 @@ from apscheduler.triggers.cron import CronTrigger
 import pytz
 
 from config import (
-    SGT, UTC, DAILY_CREDITS,
+    SGT, UTC, DAILY_CREDITS, MATCH_CREDITS,
     NIGHT_REMINDER_HOUR, NIGHT_REMINDER_MINUTE,
     MORNING_CATCHUP_HOUR, MORNING_CATCHUP_MINUTE,
     PREMATCH_SUMMARY_MINUTES, POLL_START_OFFSET, POLL_INTERVAL,
@@ -194,6 +194,25 @@ def format_result_message(match: dict, settlements: list, parlay_wins: list = No
             lines.append(f"\n🎰 {name}'s parlay:\n{leg_lines}\n{stake}c → lost")
 
     return "\n".join(lines)
+
+
+MATCH_TOPUP_LINES = [
+    "+50c dropped into everyone's account. 🪙",
+    "Top-up time. +50c for the table. 💰",
+    "+50c added to all balances. Stay dangerous. 😤",
+    "Everyone gets +50c. Make it count. 🎯",
+    "+50c in the bank. Next one's on the house. 🏦",
+    "Intermission credits: +50c each. Don't waste them. 👀",
+    "+50c to all. The game's not over yet. ⚽",
+    "50 credits. All of you. Go do something with it. 💸",
+    "Top-up: +50c added to everyone's balance. 🔄",
+    "+50c each. The comeback starts now. 💪",
+    "Credits replenished. +50c for all. 🎲",
+    "+50c in. Use it wisely this time. 🧠",
+    "Post-match bonus: +50c. See you next kickoff. 🕐",
+    "+50c added. No excuses now. 🫵",
+    "Everyone's up +50c. The next match awaits. ⏳",
+]
 
 
 # ── Night reminder (11PM SGT) ────────────────────────────────────────────────
@@ -549,7 +568,23 @@ async def job_poll_result(match_id: str, attempt: int = 1):
         match = await sheet.get_match_by_id(match_id)
         result_msg = format_result_message(match, settlements, parlay_wins=parlay_wins)
 
-        if is_silent_hours() and not await is_last_match_of_day(match_id):
+        is_last = await is_last_match_of_day(match_id)
+
+        # Post-match top-up — all users except after last match (EOD handles that)
+        topup_line = ""
+        if not is_last:
+            try:
+                await sheet.add_match_credits(MATCH_CREDITS, match_id, notify_fn=dm_admin)
+                import random as _random
+                topup_line = "\n" + _random.choice(MATCH_TOPUP_LINES)
+            except Exception as e:
+                logger.error(f"Post-match top-up failed for {match_id}: {e}")
+                await dm_admin(f"⚠️ Post-match top-up failed for match {match_id}: {e}")
+
+        if topup_line:
+            result_msg = result_msg + topup_line
+
+        if is_silent_hours() and not is_last:
             logger.info(f"Match {match_id} result held — silent hours, not last match")
             # Store full result message for morning catchup
             if "pending_result_messages" not in sheet.cache:
@@ -698,6 +733,7 @@ async def job_post_standings(match_ids: list):
                 }
 
         # Credit parlay winners
+        parlay_losses = {}  # parlay_id -> {uid, legs, stake}
         if parlay_payouts:
             for pid, p in parlay_payouts.items():
                 uid = p["user_id"]
@@ -711,11 +747,49 @@ async def job_post_standings(match_ids: list):
                         notify_fn=dm_admin
                     )
 
+        # Collect losing parlays for display
+        # Do NOT skip paid_parlays here — losses are marked paid mid-day by settle_parlay
+        # and would otherwise never show the fallen rose at EOD
+        for pid in today_parlay_ids:
+            if pid in parlay_payouts:
+                continue  # already a winner, skip
+            legs = sheet.get_parlay_bets(pid)
+            if not legs:
+                continue
+            open_legs = [b for b in legs if b["status"] == "open"]
+            if open_legs:
+                continue  # still in play, skip
+            settled = [b for b in legs if b["status"] in ("won", "lost")]
+            if not settled:
+                continue
+            if any(b["status"] == "lost" for b in settled):
+                parlay_losses[pid] = {
+                    "user_id": legs[0]["user_id"],
+                    "legs": len(settled),
+                    "stake": legs[0]["amount"],
+                }
+
         # Add daily credits
         await sheet.add_daily_credits(DAILY_CREDITS, notify_fn=dm_admin)
 
         # Get standings AFTER credits added
         standings_after = sheet.get_standings()
+
+        # Helper
+        def get_name(uid):
+            user = sheet.cache["users"].get(uid, {})
+            return (user.get("first_name") or user.get("username") or "Someone")
+
+        # Overtakes — compute before building message
+        before_ranks = {u["user_id"]: i+1 for i, u in enumerate(standings_before)}
+        after_ranks = {u["user_id"]: i+1 for i, u in enumerate(standings_after)}
+        overtakes = []
+        for uid, new_rank in after_ranks.items():
+            old_rank = before_ranks.get(uid, new_rank)
+            if new_rank < old_rank:
+                passed = [u for u, r in after_ranks.items() if before_ranks.get(u, r) < old_rank and r >= new_rank and u != uid]
+                for passed_uid in passed:
+                    overtakes.append((uid, passed_uid))
 
         # Build EOD message
         lines = ["📅 End of Day\n"]
@@ -738,124 +812,88 @@ async def job_post_standings(match_ids: list):
             badge = " 🏆" if i == 1 else ""
             lines.append(f"{i}. {name}{badge} — {credits}c ({pl_str} today)")
 
-        # Dynamic commentary
-        def get_name(uid):
-            user = sheet.cache["users"].get(uid, {})
-            return (user.get("first_name") or user.get("username") or "Someone")
+        # Parlay section — right after standings
+        if parlay_payouts or parlay_losses:
+            lines.append("")
+            for pid, p in parlay_payouts.items():
+                name = get_name(p["user_id"])
+                lines.append(f"🎰 {name} hit a {p['legs']}-leg parlay! {p['stake']}c → {p['payout']}c 🔥")
+            for pid, p in parlay_losses.items():
+                name = get_name(p["user_id"])
+                lines.append(f"🥀 {name}'s {p['legs']}-leg parlay didn't make it. {p['stake']}c gone.")
 
-        # Biggest winner + biggest loser combined commentary
-        if pl_map:
+        # Commentary — winner hype + loser roast as separate lines
+        if not pl_map:
+            nobody = random.choice([
+                "Nobody put money down today. Bold strategy. \U0001f914",
+                "Not a single bet placed. The most disciplined day this group has ever had. \U0001f9d8",
+                "Zero bets today. Either you all forgot or you all know something. \U0001f440",
+                "Quiet day on the bets. Tomorrow\'s another chance. \u26bd",
+                "No action today. The credits just sat there, untouched, judging you. \U0001f4b8",
+            ])
+            lines.append("")
+            lines.append(nobody)
+        elif pl_map:
             best_uid = max(pl_map, key=lambda u: pl_map[u])
             worst_uid = min(pl_map, key=lambda u: pl_map[u])
             best_pl = pl_map[best_uid]
             worst_pl = pl_map[worst_uid]
             best_name = get_name(best_uid)
             worst_name = get_name(worst_uid)
-
             all_lost = all(v <= 0 for v in pl_map.values())
 
+            # Overtake note — appended to winner line if applicable
+            overtake_note = ""
+            if overtakes:
+                mover_name = get_name(overtakes[0][0])
+                passed_names = " and ".join(get_name(p) for _, p in overtakes)
+                overtake_note = f" {mover_name} overtook {passed_names} on the table."
+
+            lines.append("")
+
             if all_lost:
-                # Everyone lost or broke even — collective roast
                 roast = random.choice([
-                    f"Collective disaster today. Every single one of you lost credits. Impressive, in the worst possible way. 💀",
-                    f"Not one winner in the group today. Not one. You all managed to be wrong at the same time. That takes talent. 😂",
-                    f"The house didn't even need to try today. You all self-destructed. Goodnight. 🪦",
-                    f"Historic day. Everyone lost. Nobody read the game. The football read all of you instead. 📉",
-                    f"Group performance today: absolute zero. Every bet, every call, every read — wrong. See you tomorrow. 😐",
-                    f"A group of degens walked into a betting pool. Every single one of them lost. This is not a joke, this is your Tuesday. 💸",
-                    f"Today the group collectively donated to the void. No winners. Just vibes and losses. Regroup tomorrow. 😶",
-                    f"Clean sweep for the house today. Not one of you got it right. Remarkable levels of wrongness. 🎰",
+                    "Collective disaster today. Every single one of you lost credits. Impressive, in the worst possible way. 💀",
+                    "Not one winner in the group today. Not one. You all managed to be wrong at the same time. That takes talent. 😂",
+                    "The house didn't even need to try today. You all self-destructed. Goodnight. 🪦",
+                    "Historic day. Everyone lost. Nobody read the game. The football read all of you instead. 📉",
+                    "Group performance today: absolute zero. Every bet, every call, every read — wrong. See you tomorrow. 😐",
+                    "A group of degens walked into a betting pool. Every single one of them lost. This is not a joke, this is your Tuesday. 💸",
+                    "Today the group collectively donated to the void. No winners. Just vibes and losses. Regroup tomorrow. 😶",
+                    "Clean sweep for the house today. Not one of you got it right. Remarkable levels of wrongness. 🎰",
                 ])
-                lines.append(f"\n{roast}")
-            elif best_pl > 0 and worst_pl < 0 and best_uid != worst_uid:
-                combined = random.choice([
-                    f"{best_name} cleaned up today with +{best_pl}c while {worst_name} took a {worst_pl}c beating. Rough day to be {worst_name}. 😬",
-                    f"{best_name} pocketed +{best_pl}c today. {worst_name} lost {worst_pl}c. One of these people is sleeping well tonight. 😏",
-                    f"Big day for {best_name} (+{best_pl}c), terrible day for {worst_name} ({worst_pl}c). The leaderboard doesn't lie. 📊",
-                    f"{best_name}'s up +{best_pl}c, {worst_name}'s down {worst_pl}c. Someone's buying drinks, someone else is crying into theirs. 💸",
-                    f"+{best_pl}c for {best_name}, {worst_pl}c for {worst_name}. The gap between winner and loser is wider than their egos. 😅",
-                    f"{best_name} wins the day with +{best_pl}c. {worst_name} loses the day with {worst_pl}c. That's just how it goes. 🤷",
-                    f"{best_name} had a great read today (+{best_pl}c). {worst_name} did not ({worst_pl}c). Simple as that. 😌",
-                    f"Today's MVP: {best_name} with +{best_pl}c. Today's 🤡: {worst_name} with {worst_pl}c. Better luck tomorrow.",
-                    f"{best_name} is tonight's winner (+{best_pl}c). {worst_name} is tonight's cautionary tale ({worst_pl}c). 📖",
-                    f"Good news for {best_name}: +{best_pl}c. Bad news for {worst_name}: {worst_pl}c. Guess who's happier right now. 😏",
-                    f"{best_name} called it right and walked away +{best_pl}c richer. {worst_name} called it wrong and is {worst_pl}c poorer. Brutal. 😤",
-                    f"+{best_pl}c for {best_name}. {worst_pl}c for {worst_name}. The house always collects, and today {worst_name} paid the price. 💀",
-                    f"{best_name} ends the day up {best_pl}c. {worst_name} ends it down {abs(worst_pl)}c. Someone needs to rethink their strategy. 🤔",
-                    f"Today's leaderboard shift: {best_name} up +{best_pl}c, {worst_name} down {worst_pl}c. Football is cruel and so is this game. ⚽",
-                    f"{best_name} made the right calls today (+{best_pl}c). {worst_name} made all the wrong ones ({worst_pl}c). Difference is {best_pl + abs(worst_pl)}c. 📉",
-                    f"Congrats to {best_name} on a +{best_pl}c day. Condolences to {worst_name} on a {worst_pl}c day. The market has spoken. 🎰",
-                    f"{best_name} knew something today (+{best_pl}c). {worst_name} thought they knew something ({worst_pl}c). Big difference. 😂",
-                    f"Winner of the day: {best_name} +{best_pl}c. Loser of the day: {worst_name} {worst_pl}c. At least tomorrow's a fresh slate. 🌅",
-                    f"{best_name} is grinning at +{best_pl}c. {worst_name} is not at {worst_pl}c. That's football for you. 😬",
-                    f"Today {best_name} ate well (+{best_pl}c). Today {worst_name} did not ({worst_pl}c). The bets don't lie. 🍽️",
-                    f"+{best_pl}c to {best_name}, {worst_pl}c from {worst_name}. Credits don't care about feelings. 💳",
-                    f"{best_name} with a strong +{best_pl}c today. {worst_name} with a rough {worst_pl}c. Bounce back tomorrow. 💪",
-                    f"Day goes to {best_name} (+{best_pl}c). Day takes from {worst_name} ({worst_pl}c). Such is the life of a degen. 🎲",
-                    f"{best_name} read the game (+{best_pl}c). {worst_name} read the wrong game ({worst_pl}c). It happens. 📰",
-                    f"Today's scorecard — {best_name}: +{best_pl}c ✅ {worst_name}: {worst_pl}c ❌. See everyone tomorrow.",
-                    f"{best_name} thriving at +{best_pl}c. {worst_name} surviving at {worst_pl}c. Two very different evenings ahead. 🌙",
-                    f"Sharp call from {best_name} today (+{best_pl}c). {worst_name} needs to go back to basics after that {worst_pl}c day. 📚",
-                    f"{best_name} is {best_pl}c richer. {worst_name} is {abs(worst_pl)}c poorer. The gap between them just got wider. 📏",
-                    f"If today were a match, {best_name} won and {worst_name} got relegated. +{best_pl}c vs {worst_pl}c. 🏟️",
-                    f"{best_name} trusted the process today (+{best_pl}c). {worst_name} trusted the wrong process ({worst_pl}c). 🔄",
-                    f"Easy day for {best_name} (+{best_pl}c). Rough night for {worst_name} ({worst_pl}c). That's the game. 🎯",
-                    f"{best_name} read it perfectly (+{best_pl}c). {worst_name} read it backwards ({worst_pl}c). Tomorrow's another chance. ⚽",
-                    f"Standings update: {best_name} climbing with +{best_pl}c, {worst_name} sliding with {worst_pl}c. Every match day counts. 📈",
-                    f"+{best_pl}c says {best_name} knows football. {worst_pl}c says {worst_name} is still learning. No shame in that. 😏",
-                    f"{best_name} cashed in today (+{best_pl}c). {worst_name} got cleaned out ({worst_pl}c). Same matches, very different outcomes. 🤯",
-                ])
-                lines.append(f"\n{combined}")
-            elif best_pl > 0:
-                solo = random.choice([
-                    f"{best_name} had the best day with +{best_pl}c. Everyone else broke even or stayed quiet. Smart. 🧠",
-                    f"Only {best_name} walked away up today with +{best_pl}c. The rest of you played it safe or paid for it. 😏",
-                    f"+{best_pl}c for {best_name} today. The only one who got it right. Noted. 👏",
-                    f"{best_name} is today's sole winner at +{best_pl}c. Sometimes one is enough. 🏆",
-                    f"One winner today: {best_name} with +{best_pl}c. Everyone else — same time tomorrow. ⏰",
-                    f"{best_name} goes home happy with +{best_pl}c. The rest of you go home. 😐",
-                    f"Quiet day for most, but {best_name} quietly pocketed +{best_pl}c. That's how it's done. 🤫",
-                    f"+{best_pl}c for {best_name} and nothing for the rest. Respectable. 🎯",
-                ])
-                lines.append(f"\n{solo}")
+                lines.append(roast + overtake_note)
+            else:
+                # Winner hype line
+                if best_pl > 0:
+                    winner_line = random.choice([
+                        f"{best_name} takes the day with +{best_pl}c. Good read, good result. 💪",
+                        f"+{best_pl}c for {best_name}. Called it and cashed it. 🎯",
+                        f"{best_name} ends the day up {best_pl}c. That's how it's done. 👑",
+                        f"Day goes to {best_name} with +{best_pl}c. The rest of you took notes. 📝",
+                        f"{best_name} with a strong +{best_pl}c today. Sharp. 🧠",
+                        f"Today's winner: {best_name} with +{best_pl}c. Quietly collected and walked away. 🤫",
+                        f"{best_name} read the game today and walked away +{best_pl}c richer. 💰",
+                        f"+{best_pl}c to {best_name}. The leaderboard noticed. 📈",
+                    ])
+                    if worst_pl < 0 and worst_uid != best_uid:
+                        loser_line = random.choice([
+                            f"{worst_name} had a rough one at {worst_pl}c. The football was not kind. 😬",
+                            f"{worst_pl}c for {worst_name}. Sometimes the game just says no. 🤷",
+                            f"{worst_name} is {abs(worst_pl)}c lighter tonight. Comes with the territory. 💸",
+                            f"Rough day for {worst_name} ({worst_pl}c). The bounce back starts tomorrow. 💥",
+                            f"{worst_name} took a {abs(worst_pl)}c hit today. Back to the drawing board. ✏️",
+                            f"{worst_pl}c for {worst_name}. The picks didn't land. Happens to everyone. 😐",
+                            f"{worst_name} with a {worst_pl}c day. Not the result anyone wants. 😔",
+                            f"Tough one for {worst_name} at {worst_pl}c. Tomorrow's a clean slate. 🌅",
+                        ])
+                        lines.append(winner_line + overtake_note + " " + loser_line)
+                    else:
+                        lines.append(winner_line + overtake_note)
+                elif overtake_note:
+                    lines.append(overtake_note.strip())
 
-        # Overtakes — compare before and after rankings
-        before_ranks = {u["user_id"]: i+1 for i, u in enumerate(standings_before)}
-        after_ranks = {u["user_id"]: i+1 for i, u in enumerate(standings_after)}
-        overtakes = []
-        for uid, new_rank in after_ranks.items():
-            old_rank = before_ranks.get(uid, new_rank)
-            if new_rank < old_rank:
-                # This person moved up — find who they passed
-                passed = [u for u, r in after_ranks.items() if before_ranks.get(u, r) < old_rank and r >= new_rank and u != uid]
-                for passed_uid in passed:
-                    overtakes.append((get_name(uid), get_name(passed_uid)))
-        if overtakes:
-            parts = " and ".join([f"{loser} 🤡" for _, loser in overtakes])
-            winner_name = overtakes[0][0]
-            lines.append(f"📈 {winner_name} overtook {parts} today.")
-
-        # Gap warning — if 2nd is within 100c of 1st
-        if len(standings_after) >= 2:
-            first_credits = standings_after[0]["credits"]
-            second_credits = standings_after[1]["credits"]
-            gap = first_credits - second_credits
-            if 0 < gap <= 100:
-                first_name = get_name(standings_after[0]["user_id"])
-                second_name = get_name(standings_after[1]["user_id"])
-                lines.append(f"⚠️ {second_name} is {gap}c behind {first_name}. Watch out!")
-
-        # Parlay shoutout
-        if parlay_payouts:
-            def get_name_p(uid):
-                user = sheet.cache["users"].get(uid, {})
-                return (user.get("first_name") or user.get("username") or "Someone")
-            for pid, p in parlay_payouts.items():
-                name = get_name_p(p["user_id"])
-                lines.append(f"🎰 {name} hit a {p['legs']}-leg parlay! {p['stake']}c → {p['payout']}c 🔥")
-
-        lines.append(f"\nDaily credits added, good luck tomorrow! 🍀")
-        lines.append("Use /groups for today's group tables.")
+        lines.append("\nDaily credits added, good luck tomorrow! 🍀")
 
         await send_group("\n".join(lines))
         logger.info("End of day standings and daily credits posted")
@@ -1012,10 +1050,12 @@ async def on_startup(notify_fn=None):
         if now_sgt.hour == NIGHT_REMINDER_HOUR:
             logger.info("Startup during 11PM hour — firing night reminder immediately")
             scheduler.add_job(job_night_reminder, trigger=DateTrigger(run_date=datetime.now(UTC) + timedelta(seconds=5)), id="night_reminder_recovery", replace_existing=True)
-        # Morning catchup: fire if restart between 7:30AM and 10:00AM SGT
-        elif (now_sgt.hour == MORNING_CATCHUP_HOUR and now_sgt.minute >= MORNING_CATCHUP_MINUTE) or \
-             (now_sgt.hour > MORNING_CATCHUP_HOUR and now_sgt.hour < 10):
+        # Morning catchup: fire if restart between 7:30AM and 8:00AM SGT
+        elif now_sgt.hour == MORNING_CATCHUP_HOUR and now_sgt.minute >= MORNING_CATCHUP_MINUTE:
             logger.info("Startup during morning catchup window — firing morning catchup immediately")
+            scheduler.add_job(job_morning_catchup, trigger=DateTrigger(run_date=datetime.now(UTC) + timedelta(seconds=5)), id="morning_catchup_recovery", replace_existing=True)
+        elif now_sgt.hour == MORNING_CATCHUP_HOUR + 1 and now_sgt.minute < 30:
+            logger.info("Startup shortly after morning catchup — firing morning catchup immediately")
             scheduler.add_job(job_morning_catchup, trigger=DateTrigger(run_date=datetime.now(UTC) + timedelta(seconds=5)), id="morning_catchup_recovery", replace_existing=True)
 
         if _bot is not None:
