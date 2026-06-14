@@ -10,8 +10,6 @@ from config import (
     STARTING_CREDITS, UTC
 )
 
-SHEET_PENDING_MSGS = "pending_msgs"
-
 logger = logging.getLogger(__name__)
 
 SCOPES = [
@@ -29,8 +27,6 @@ cache = {
     "daily_credits_date": None,
     "eod_date": None,
     "paid_parlays": set(),          # parlay_ids already paid out, skip at EOD
-    "pending_parlay_wins": [],       # parlay wins during silent hours, shown in morning catchup
-    "pending_result_messages": [],   # FT result messages held during silent hours, shown in morning catchup
 }
 
 # Row index cache — tracks sheet row numbers to avoid re-reading
@@ -141,21 +137,6 @@ async def refresh_cache(notify_fn=None):
             _bet_rows[row["bet_id"]] = i + 2
 
         cache["last_refresh"] = datetime.now(UTC)
-
-        # Load pending_result_messages from sheet (persisted across restarts)
-        try:
-            pending_ws = spreadsheet.worksheet(SHEET_PENDING_MSGS)
-            pending_data = pending_ws.get_all_records()
-            # Only load if in-memory list is empty (don't overwrite if already populated)
-            if not cache.get("pending_result_messages"):
-                cache["pending_result_messages"] = [
-                    row["message"] for row in pending_data if row.get("message")
-                ]
-                if cache["pending_result_messages"]:
-                    logger.info(f"Loaded {len(cache['pending_result_messages'])} pending result messages from sheet")
-        except Exception as e:
-            logger.warning(f"Could not load pending_msgs tab: {e}")
-
 
         # Rebuild paid_parlays from ledger — any parlay_id that already has a payout
         # ledger entry was already credited. Prevents double-payout on restart.
@@ -670,32 +651,6 @@ async def append_ledger(user_id: int, type_: str, amount: int, balance_after: in
         logger.error(f"Failed to write ledger for {user_id} after retries: {e}")
         if notify_fn:
             await notify_fn(f"⚠️ Failed to write ledger entry for user {user_id} after retries: {e}")
-
-
-async def append_pending_msg(message: str, notify_fn=None):
-    """Write a pending result message to the sheet for restart persistence."""
-    timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        ws = get_sheet(SHEET_PENDING_MSGS)
-        await with_retry(ws.append_row, [timestamp, message])
-    except Exception as e:
-        logger.error(f"Failed to write pending_msg to sheet: {e}")
-        if notify_fn:
-            await notify_fn(f"⚠️ Failed to persist pending result message: {e}")
-
-
-async def clear_pending_msgs(notify_fn=None):
-    """Clear all rows from pending_msgs tab after morning catchup sends successfully."""
-    try:
-        ws = get_sheet(SHEET_PENDING_MSGS)
-        all_rows = ws.get_all_values()
-        if len(all_rows) > 1:  # keep header row
-            ws.delete_rows(2, len(all_rows))
-        logger.info("Cleared pending_msgs sheet")
-    except Exception as e:
-        logger.error(f"Failed to clear pending_msgs sheet: {e}")
-        if notify_fn:
-            await notify_fn(f"⚠️ Failed to clear pending_msgs sheet: {e}")
 
 # ── Daily credits ────────────────────────────────────────────────────────────
 async def add_match_credits(match_amount: int, match_id: str, notify_fn=None):

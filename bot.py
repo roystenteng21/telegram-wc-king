@@ -153,12 +153,6 @@ def setup_handlers():
     application.add_handler(CommandHandler("admin_result_push", ca.cmd_admin_result_push))
     application.add_handler(CommandHandler("admin_eod_push", ca.cmd_admin_eod_push))
     application.add_handler(CommandHandler("admin_event", ca.cmd_admin_event))
-    application.add_handler(CommandHandler("admin_simulate_eod", ca.cmd_admin_simulate_eod))
-    application.add_handler(CommandHandler("admin_sim_night", ca.cmd_admin_sim_night))
-    application.add_handler(CommandHandler("admin_sim_morning", ca.cmd_admin_sim_morning))
-    application.add_handler(CommandHandler("admin_sim_prematch", ca.cmd_admin_sim_prematch))
-    application.add_handler(CommandHandler("admin_sim_kickoff", ca.cmd_admin_sim_kickoff))
-    application.add_handler(CommandHandler("admin_sim_result", ca.cmd_admin_sim_result))
     application.add_handler(CommandHandler("confirm_admin", ca.cmd_confirm_admin))
     application.add_handler(CommandHandler("cancel_admin", ca.cmd_cancel_admin))
 
@@ -206,12 +200,6 @@ async def post_init(app):
         BotCommand("admin_credits_announcement", "Announce credits system to group"),
         BotCommand("admin_stage_hype", "Trigger Katerina stage transition hype"),
         BotCommand("admin_silent_hours", "Toggle silent hours on|off"),
-        BotCommand("admin_simulate_eod", "Preview EOD message"),
-        BotCommand("admin_sim_night", "Preview 11PM message"),
-        BotCommand("admin_sim_morning", "Preview 7:30AM message"),
-        BotCommand("admin_sim_prematch", "Preview pre-match summary"),
-        BotCommand("admin_sim_kickoff", "Test kickoff message"),
-        BotCommand("admin_sim_result", "Preview FT result message"),
         BotCommand("confirm_admin", "Confirm pending action"),
         BotCommand("cancel_admin", "Cancel pending action"),
     ]

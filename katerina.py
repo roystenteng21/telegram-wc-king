@@ -291,7 +291,7 @@ async def _generate_roast(name: str, data: dict, self_roast: bool = False) -> st
         return random.choice(lines)
 
     days_to_final = (TOURNAMENT_FINAL_DATE - date.today()).days
-    prize_context = f"There are {days_to_final} days left until the Final and $400 on the line."
+    prize_context = f"There are {days_to_final} days left until the Final. Winner takes the World Cup champion jersey."
 
     system = """You are Katerina, the sharp, confident, slightly savage house bookie for a World Cup betting bot called Degen.
 
@@ -299,7 +299,7 @@ Generate a roast of a player based on their stats. Rules:
 - 1–2 sentences max
 - Sharp but not mean-spirited. Tease, don't destroy.
 - Use their actual stats naturally — don't just list numbers
-- Reference the prize pool ($400, champion jersey, runner-up jersey) for extra sting — but vary it, don't always mention it
+- Reference the prize (World Cup champion jersey for 1st, runner-up jersey for 2nd) for extra sting — but vary it, don't always mention it
 - Last place players get slightly harsher treatment around the prize
 - Anyone can catch smoke — don't always go for the obvious angle
 - Occasionally smug or dramatic
@@ -348,10 +348,10 @@ Give Katerina's roast. One or two sentences only. Mix up the angle — stats, be
     except Exception as e:
         logger.error(f"Roast API call failed: {e}")
         fallbacks_last = [
-            f"{data['name']}'s at the bottom with $400 on the line. That champion jersey is not going to them. 💀",
+            f"{data['name']}'s at the bottom. That champion jersey is not going to them. 💀",
             f"Last place with {days_to_final} days left. {data['name']} needs a miracle and better bets. 🙏",
             f"The runner-up jersey is looking very out of reach for {data['name']} right now. Very. 😬",
-            f"{data['name']} is funding everyone else's prize pool contribution at this point. 📉",
+            f"{data['name']} has {data['credits']}c and is dead last. The champion jersey has other plans. 📉",
         ]
         fallbacks_general = [
             f"{data['name']} has a {data['win_rate']}% win rate. I've seen better odds on a coin toss. 🪙",
@@ -370,9 +370,6 @@ async def cmd_roast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_group_message(update):
         await update.message.reply_text("Roasts happen in the group, not in private. 😏")
         return
-
-    refresh = sheet.cache.get("last_refresh")
-    refresh_str = refresh.astimezone(SGT).strftime("%I:%M %p SGT") if refresh else "unknown"
 
     bot_username = context.bot.username.lower() if context.bot.username else ""
 
@@ -460,27 +457,32 @@ async def cmd_roast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Build roast data and generate
     data = await _get_roast_data(target_uid)
     roast = await _generate_roast(target_name, data)
-    await update.message.reply_text(f"🎤 {roast}\n\n— as of {refresh_str}")
+    await update.message.reply_text(f"🎤 {roast}")
 
 
 # ── Katerina mention handler ──────────────────────────────────────────────────
-async def send_stage_hype(current_stage: str, next_stage: str, notify_fn=None) -> bool:
+async def send_stage_hype(current_stage: str, next_stage: str, notify_fn=None, stage_pl_summary: str = "") -> bool:
     """Generate and send a Katerina stage transition hype message. Returns True if sent."""
     try:
         standings = sheet.get_standings()
         leader = standings[0] if standings else None
         leader_name = truncate(leader.get("first_name") or leader.get("username") or "Someone") if leader else "Someone"
-        from config import PRIZE_PLAYER_COUNT, PRIZE_PER_PLAYER
-        prize_pool = PRIZE_PLAYER_COUNT * PRIZE_PER_PLAYER
+
+        standings_str = "\n".join(
+            f"{i}. {truncate(u.get('first_name') or u.get('username') or 'Unknown')} — {u['credits']}c"
+            for i, u in enumerate(standings, 1)
+        ) if standings else "No standings yet"
 
         prompt = (
-            f"The {current_stage} has just ended. The {next_stage} begins tomorrow. "
+            f"The {current_stage} has just ended. The {next_stage} begins next. "
             f"You are Katerina, the savage, unfiltered hype bot for WC Kings 2026, a private betting group. "
-            f"Write a hype message that gets the group absolutely fired up. Be dramatic, ruthless, and exciting. "
-            f"Trash the teams that got eliminated if relevant. Hype the stakes. "
-            f"End with one line mentioning that {leader_name} is currently leading the pack, "
-            f"and that the prize pool is ${prize_pool} SGD — a jersey and dining vouchers on the line. "
-            f"Keep it under 180 words. No hashtags."
+            f"Write a 3-4 sentence hype message that gets the group fired up for the next stage. "
+            f"Be dramatic, ruthless, and exciting. Reference specific notable bets or P&L from the stage if provided. "
+            f"Mention who is leading the credits standings going into the next stage. "
+            f"The prize: 1st place wins the World Cup champion jersey. 2nd place wins the runner-up jersey. "
+            f"No hashtags. No markdown.\n\n"
+            f"CREDITS STANDINGS:\n{standings_str}\n\n"
+            f"STAGE HIGHLIGHTS:\n{stage_pl_summary if stage_pl_summary else 'No stage summary available.'}"
         )
 
         bot_context = _build_katerina_context()
