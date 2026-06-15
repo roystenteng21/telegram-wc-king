@@ -1,6 +1,12 @@
+import asyncio
+import json
 import logging
+import random
+import re
+import urllib.request
 import pytz
-from datetime import datetime, timedelta
+from collections import Counter
+from datetime import date, datetime, timedelta
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -17,12 +23,14 @@ from helpers import (
 
 logger = logging.getLogger(__name__)
 
+# Module-level timezone constant — avoid recreating on every call
+CT = pytz.timezone("America/Chicago")
+
 # Ignore mentions sent before this time — prevents backlog replay after restart
 _startup_time = datetime.now(UTC)
 
 def _get_current_stage() -> str:
     """Return current tournament stage name based on today's date."""
-    from datetime import date
     today = date.today()
     for stage in TOURNAMENT_STAGES:
         if stage["start"] <= today <= stage["end"]:
@@ -39,7 +47,6 @@ def _get_current_stage() -> str:
 
 def _build_katerina_context() -> str:
     """Build a snapshot of current bot state for Katerina's system prompt."""
-    from datetime import date
     now_sgt = datetime.now(SGT)
     refresh = sheet.cache.get("last_refresh")
     refresh_str = refresh.astimezone(SGT).strftime("%I:%M %p SGT") if refresh else "unknown"
@@ -54,7 +61,6 @@ def _build_katerina_context() -> str:
         name = truncate(u.get("first_name") or u.get("username") or "Unknown")
         standings_lines.append(f"{i}. {name} — {u['credits']}c")
 
-    CT = pytz.timezone("America/Chicago")
     today_ct = datetime.now(CT).strftime("%Y-%m-%d")
 
     match_lines = []
@@ -86,16 +92,18 @@ def _build_katerina_context() -> str:
         name = truncate(u.get("first_name") or u.get("username") or "Unknown")
         user_bets = [b for b in sheet.cache["bets"] if b["user_id"] == uid]
 
-        open_singles = [b for b in user_bets if b["status"] == "open" and not b.get("parlay_id")]
-        open_parlay_ids = list({b["parlay_id"] for b in user_bets if b["status"] == "open" and b.get("parlay_id")})
-        all_parlay_ids = list({b["parlay_id"] for b in user_bets if b.get("parlay_id")})
+        def _has_pid(b):
+            pid = b.get("parlay_id", "")
+            return bool(pid) and str(pid) not in ("", "0")
+        open_singles = [b for b in user_bets if b["status"] == "open" and not _has_pid(b)]
+        open_parlay_ids = list({b["parlay_id"] for b in user_bets if b["status"] == "open" and _has_pid(b)})
+        all_parlay_ids = list({b["parlay_id"] for b in user_bets if _has_pid(b)})
         dead_parlay_ids = [
             pid for pid in all_parlay_ids
             if any(b["status"] == "lost" for b in user_bets if b.get("parlay_id") == pid)
         ]
 
-        CT_local = pytz.timezone("America/Chicago")
-        today_ct_local = datetime.now(CT_local).strftime("%Y-%m-%d")
+        today_ct_local = datetime.now(CT).strftime("%Y-%m-%d")
         today_settled = []
         for b in user_bets:
             if b["status"] not in ("won", "lost"):
@@ -142,9 +150,6 @@ TODAY'S MATCHES:
 
 PLAYER BET STATUS:
 {chr(10).join(player_bet_lines) if player_bet_lines else "No bet activity"}
-
-PENDING OVERNIGHT RESULTS: {len(sheet.cache.get("pending_result_messages", []))} held
-PENDING PARLAY WINS: {len(sheet.cache.get("pending_parlay_wins", []))} held
 """
 
 
@@ -152,7 +157,6 @@ PENDING PARLAY WINS: {len(sheet.cache.get("pending_parlay_wins", []))} held
 
 async def _call_katerina(user_message: str, bot_context: str, sender_name: str = None, sender_stats: str = None) -> str:
     """Call Claude API to get Katerina's reply."""
-    import json as _json
 
     sender_block = ""
     if sender_name:
@@ -187,8 +191,7 @@ Current bot state:
 """ + bot_context + sender_block
 
     try:
-        import urllib.request
-        payload = _json.dumps({
+        payload = json.dumps({
             "model": "claude-sonnet-4-6",
             "max_tokens": 300,
             "system": system,
@@ -204,7 +207,7 @@ Current bot state:
             }
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
-            data = _json.loads(resp.read())
+            data = json.loads(resp.read())
             text_blocks = [b for b in data.get("content", []) if b.get("type") == "text"]
             return text_blocks[0]["text"].strip() if text_blocks else None
     except Exception as e:
@@ -228,7 +231,6 @@ async def _get_roast_data(target_uid: int) -> dict:
     win_rate = round(len(won) / total_bets * 100) if total_bets else 0
 
     # Today's P&L
-    CT = pytz.timezone("America/Chicago")
     today_ct = datetime.now(CT).strftime("%Y-%m-%d")
     today_bets = []
     for b in all_bets:
@@ -250,7 +252,6 @@ async def _get_roast_data(target_uid: int) -> dict:
     open_bets = [b for b in sheet.cache["bets"] if b["user_id"] == target_uid and b["status"] == "open"]
 
     # Most common outcome bet
-    from collections import Counter
     outcome_counts = Counter(b["outcome"] for b in all_bets)
     top_outcome = outcome_counts.most_common(1)[0] if outcome_counts else None
 
@@ -273,25 +274,8 @@ async def _get_roast_data(target_uid: int) -> dict:
     }
 
 
-async def _generate_roast(name: str, data: dict, self_roast: bool = False) -> str:
+async def _generate_roast(name: str, data: dict) -> str:
     """Call Claude API to generate a Katerina roast."""
-    import json as _json
-    import random
-    from datetime import date
-
-    if self_roast:
-        lines = [
-            "Oh you want to roast me? I run the book, sweetheart. I always win. 😘",
-            "Bold move targeting the dealer. I respect it. Still won't work. 💅",
-            "You really tried to roast the house. Adorable.",
-            "Coming for me? I've seen better attempts from bottom-of-the-table bettors. 😏",
-            "Cute. Now go place a bet and let the adults talk. 🎰",
-            "I don't get roasted. I do the roasting around here. Try again. 😒",
-            "Targeting the house? Brave. Wrong. But brave. 💅",
-            "I keep the ledger. You don't roast the ledger. 😒",
-        ]
-        return random.choice(lines)
-
     days_to_final = (TOURNAMENT_FINAL_DATE - date.today()).days
     prize_context = f"There are {days_to_final} days left until the Final. Winner takes the World Cup champion jersey."
 
@@ -327,13 +311,12 @@ Generate a roast of a player based on their stats. Rules:
 Give Katerina's roast. One or two sentences only. Mix up the angle — stats, behaviour, prize stakes, rank, whatever stings most for this player."""
 
     try:
-        payload = _json.dumps({
+        payload = json.dumps({
             "model": "claude-sonnet-4-6",
             "max_tokens": 150,
             "system": system,
             "messages": [{"role": "user", "content": prompt}]
         }).encode()
-        import urllib.request
         req = urllib.request.Request(
             "https://api.anthropic.com/v1/messages",
             data=payload,
@@ -344,7 +327,7 @@ Give Katerina's roast. One or two sentences only. Mix up the angle — stats, be
             }
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
-            result = _json.loads(resp.read())
+            result = json.loads(resp.read())
             text_blocks = [b for b in result.get("content", []) if b.get("type") == "text"]
             return text_blocks[0]["text"].strip() if text_blocks else None
     except Exception as e:
@@ -379,7 +362,6 @@ async def cmd_roast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         target_arg = context.args[0].lstrip("@").lower()
         if target_arg in (bot_username, "katerina", "katerina_bot", "degenWC_bot".lower(), "degenwc_bot"):
-            import random
             lines = [
                 "Oh you want to roast me? I run the book, sweetheart. I always win. 😘",
                 "Bold move targeting the dealer. I respect it. Still won't work. 💅",
@@ -429,10 +411,9 @@ async def cmd_roast(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             target_name = u.get("first_name") or u.get("username") or "you"
         else:
-            import re as _re
             def _clean(s):
                 # Strip emojis and non-alphanumeric for comparison
-                return _re.sub(r'[^\w]', '', s).lower()
+                return re.sub(r'[^\w]', '', s).lower()
 
             target_clean = _clean(target_arg)
             best_uid = None
@@ -466,7 +447,6 @@ async def cmd_roast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     else:
         # No target — Katerina picks someone at random
-        import random
         standings = sheet.get_standings()
         if not standings:
             await update.message.reply_text("No players to roast yet. Come back when someone's losing. 😏")
@@ -530,9 +510,6 @@ async def check_and_send_stage_hype(notify_fn=None):
     Called after EOD. Checks if today is the last day of a stage and tomorrow
     starts a new one. If so, fires Katerina hype. No-op if no transition detected.
     """
-    from datetime import date
-    import pytz as _pytz
-    CT = _pytz.timezone("America/Chicago")
     today_ct = datetime.now(CT).date()
     tomorrow_ct = today_ct + timedelta(days=1)
 
@@ -663,11 +640,8 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
 
     web_results = ""
     if wants_analysis:
-        import json as _json
-        import urllib.request as _req
 
         # Resolve to the team's next upcoming match first
-        CT = pytz.timezone("America/Chicago")
         now_utc = datetime.now(UTC)
         match_query = None
         for m in sorted(sheet.cache.get("matches", {}).values(), key=lambda x: x.get("kickoff_utc", "")):
@@ -693,13 +667,13 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
 
         try:
             # Step 1 — send search request, get tool_use block back
-            step1_payload = _json.dumps({
+            step1_payload = json.dumps({
                 "model": "claude-sonnet-4-6",
                 "max_tokens": 1024,
                 "tools": [{"type": "web_search_20250305", "name": "web_search"}],
                 "messages": [{"role": "user", "content": search_prompt}]
             }).encode()
-            req1 = _req.Request(
+            req1 = urllib.request.Request(
                 "https://api.anthropic.com/v1/messages",
                 data=step1_payload,
                 headers={
@@ -708,8 +682,8 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
                     "x-api-key": ANTHROPIC_API_KEY
                 }
             )
-            with _req.urlopen(req1, timeout=20) as resp1:
-                step1 = _json.loads(resp1.read())
+            with urllib.request.urlopen(req1, timeout=20) as resp1:
+                step1 = json.loads(resp1.read())
 
             # Extract tool_use blocks from step 1 response
             tool_use_blocks = [b for b in step1.get("content", []) if b.get("type") == "tool_use"]
@@ -735,13 +709,13 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
                         for b in tool_use_blocks
                     ]}
                 ]
-                step2_payload = _json.dumps({
+                step2_payload = json.dumps({
                     "model": "claude-sonnet-4-6",
                     "max_tokens": 800,
                     "tools": [{"type": "web_search_20250305", "name": "web_search"}],
                     "messages": messages
                 }).encode()
-                req2 = _req.Request(
+                req2 = urllib.request.Request(
                     "https://api.anthropic.com/v1/messages",
                     data=step2_payload,
                     headers={
@@ -750,8 +724,8 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
                         "x-api-key": ANTHROPIC_API_KEY
                     }
                 )
-                with _req.urlopen(req2, timeout=20) as resp2:
-                    step2 = _json.loads(resp2.read())
+                with urllib.request.urlopen(req2, timeout=20) as resp2:
+                    step2 = json.loads(resp2.read())
 
                 # Extract text — may need another round if model searched again
                 step2_tool_use = [b for b in step2.get("content", []) if b.get("type") == "tool_use"]
@@ -764,13 +738,13 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
                             for b in step2_tool_use
                         ]}
                     ]
-                    step3_payload = _json.dumps({
+                    step3_payload = json.dumps({
                         "model": "claude-sonnet-4-6",
                         "max_tokens": 800,
                         "tools": [{"type": "web_search_20250305", "name": "web_search"}],
                         "messages": messages2
                     }).encode()
-                    req3 = _req.Request(
+                    req3 = urllib.request.Request(
                         "https://api.anthropic.com/v1/messages",
                         data=step3_payload,
                         headers={
@@ -779,8 +753,8 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
                             "x-api-key": ANTHROPIC_API_KEY
                         }
                     )
-                    with _req.urlopen(req3, timeout=20) as resp3:
-                        step2 = _json.loads(resp3.read())
+                    with urllib.request.urlopen(req3, timeout=20) as resp3:
+                        step2 = json.loads(resp3.read())
 
                 for block in step2.get("content", []):
                     if block.get("type") == "text" and block.get("text", "").strip():
@@ -803,7 +777,6 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
 
     # During silent hours — DM sender instead of replying in group
     if is_silent_hours():
-        import random
         quiet_lines = [
             "Quiet hours. Bets are still open but I'm not taking questions right now. Back at 7:30AM. 😌",
             "I'm off the clock. Place your bets via /bet if you need to — I'll be back at 7:30AM. 🌙",
@@ -824,7 +797,6 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
     if reply:
         await update.message.reply_text(reply)
     else:
-        import random
         fallbacks = [
             "I'm thinking. Don't rush me. 😒",
             "Give me a second, I'm counting other people's losses. 💸",

@@ -77,10 +77,6 @@ def is_group_message(update: Update) -> bool:
 
 
 # ── Display helpers ───────────────────────────────────────────────────────────
-def get_display_name(user) -> str:
-    return (user.first_name or user.username or "Unknown")[:10]
-
-
 def format_team(name: str) -> str:
     if name in TEAM_DISPLAY:
         code, flag = TEAM_DISPLAY[name]

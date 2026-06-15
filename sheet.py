@@ -258,8 +258,8 @@ async def refresh_display_name(user_id: int, username: str, first_name: str, not
         if not row_num:
             return
         ws = get_sheet(SHEET_USERS)
-        ws.update_cell(row_num, 2, username or "")
-        ws.update_cell(row_num, 3, first_name or "")
+        await with_retry(ws.update_cell, row_num, 2, username or "")
+        await with_retry(ws.update_cell, row_num, 3, first_name or "")
         cache["users"][user_id]["username"] = username or ""
         cache["users"][user_id]["first_name"] = first_name or ""
     except Exception as e:
@@ -822,9 +822,9 @@ async def update_event_status(event_id: str, status: str, winner: str = "", noti
         if not row_num:
             raise ValueError(f"Event {event_id} row not in cache")
         ws = get_sheet(SHEET_EVENTS)
-        ws.update_cell(row_num, 7, status)   # col 7 = status
+        await with_retry(ws.update_cell, row_num, 7, status)   # col 7 = status
         if winner:
-            ws.update_cell(row_num, 8, winner)  # col 8 = winner
+            await with_retry(ws.update_cell, row_num, 8, winner)  # col 8 = winner
         cache["events"][event_id]["status"] = status
         if winner:
             cache["events"][event_id]["winner"] = winner
@@ -842,7 +842,7 @@ async def update_event_fields(event_id: str, question: str, options: list, multi
         if not row_num:
             raise ValueError(f"Event {event_id} row not in cache")
         ws = get_sheet(SHEET_EVENTS)
-        ws.update(f"B{row_num}:G{row_num}", [[question, ",".join(options), multiplier, str(is_free).lower(), reward, "draft"]])
+        await with_retry(ws.update, f"B{row_num}:G{row_num}", [[question, ",".join(options), multiplier, str(is_free).lower(), reward, "draft"]])
         event = cache["events"][event_id]
         event.update({"question": question, "options": options, "multiplier": multiplier, "is_free": is_free, "reward": reward})
     except Exception as e:

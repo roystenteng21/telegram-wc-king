@@ -147,14 +147,6 @@ def fetch_match_result(match_id: str) -> dict | None:
         raise RuntimeError(f"Failed to fetch match result: {e}")
 
 
-def fetch_upcoming_matches(days_ahead: int = 1) -> list:
-    """
-    Fetch matches for tomorrow (or N days ahead) for the night reminder.
-    Returns normalised match list.
-    """
-    target_date = (datetime.now(UTC) + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
-    return fetch_matches_for_date(target_date)
-
 
 def fetch_today_matches() -> list:
     """Fetch today's matches in UTC."""

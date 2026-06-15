@@ -22,6 +22,9 @@ from helpers import format_team, format_match_teams
 
 logger = logging.getLogger(__name__)
 
+# Module-level timezone constant
+CT = pytz.timezone("America/Chicago")
+
 scheduler = AsyncIOScheduler(timezone=UTC)
 
 # Will be set by bot.py on startup
@@ -59,7 +62,6 @@ from helpers import is_silent_hours
 # ── CT date helper ────────────────────────────────────────────────────────────
 async def get_today_ct_matches() -> list:
     """Return all matches whose kickoff falls on today's CT date."""
-    CT = pytz.timezone("America/Chicago")
     today_ct = datetime.now(CT).strftime("%Y-%m-%d")
     today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
     tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -120,6 +122,12 @@ def _outcome_label(outcome: str, match: dict) -> str:
 def _get_user_name(uid: int) -> str:
     user = sheet.cache["users"].get(uid, {})
     return (user.get("first_name") or user.get("username") or "Someone")
+
+
+def _get_sort_name(b: dict) -> str:
+    """Sort key for bets — alphabetical by player first name."""
+    user = sheet.cache["users"].get(b["user_id"], {})
+    return (user.get("first_name") or user.get("username") or "").lower()
 
 
 def format_result_message(match: dict, settlements: list, parlay_wins: list = None) -> str:
@@ -232,7 +240,6 @@ async def _katerina_line(prompt: str, fallback: str, max_tokens: int = 120) -> s
 # ── Night reminder (11PM SGT) ────────────────────────────────────────────────
 async def job_night_reminder():
     try:
-        CT = pytz.timezone("America/Chicago")
         tomorrow_ct = (datetime.now(CT) + timedelta(days=1)).strftime("%Y-%m-%d")
         today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
         tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -290,10 +297,7 @@ async def job_night_reminder():
             lines.append(f"  {format_match_line(m)}")
             open_bets = [b for b in sheet.cache["bets"] if b["match_id"] == str(m["match_id"]) and b["status"] == "open"]
             if open_bets:
-                def get_sort_name(b):
-                    user = sheet.cache["users"].get(b["user_id"], {})
-                    return (user.get("first_name") or user.get("username") or "").lower()
-                for b in sorted(open_bets, key=get_sort_name):
+                for b in sorted(open_bets, key=_get_sort_name):
                     name = _get_user_name(b["user_id"])
                     lines.append(f"  {name} — {_outcome_label(b['outcome'], m)} — {b['amount']}c")
                     bet_context_parts.append(f"{name} on {_outcome_label(b['outcome'], m)} for {format_match_teams(m['home'], m['away'])}")
@@ -343,11 +347,7 @@ async def job_prematch_summary(match_id: str):
         open_bets = [b for b in bets if b["status"] == "open"]
         match_label = format_match_teams(match["home"], match["away"])
 
-        def get_name(b):
-            user = sheet.cache["users"].get(b["user_id"], {})
-            return (user.get("first_name") or user.get("username") or "").lower()
-
-        sorted_bets = sorted(open_bets, key=get_name)
+        sorted_bets = sorted(open_bets, key=_get_sort_name)
 
         lines = [f"⚽ {match_label} kicks off in 15 mins!\n"]
         if sorted_bets:
@@ -395,11 +395,7 @@ async def job_kickoff_message(match_id: str):
         open_bets = [b for b in bets if b["status"] == "open"]
         match_label = format_match_teams(match["home"], match["away"])
 
-        def get_sort_name(b):
-            user = sheet.cache["users"].get(b["user_id"], {})
-            return (user.get("first_name") or user.get("username") or "").lower()
-
-        sorted_bets = sorted(open_bets, key=get_sort_name)
+        sorted_bets = sorted(open_bets, key=_get_sort_name)
 
         lines = [
             f"{match_label} has kicked off!",
@@ -410,6 +406,11 @@ async def job_kickoff_message(match_id: str):
         for b in sorted_bets:
             name = _get_user_name(b["user_id"])
             lines.append(f"{name} — {_outcome_label(b['outcome'], match)} — {b['amount']}c")
+
+        # Suppress during silent hours unless this is the last match
+        if is_silent_hours() and not await is_last_match_of_day(match_id):
+            logger.info(f"Kickoff message suppressed for {match_id} — silent hours, not last match")
+            return
 
         # Katerina good luck / roast line
         if open_bets:
@@ -435,10 +436,6 @@ async def job_kickoff_message(match_id: str):
             )
             fun_line = await _katerina_line(prompt, "Good luck everyone. May the better bets win. ⚽", max_tokens=150)
             lines.append(f"\n{fun_line}")
-
-        if is_silent_hours() and not await is_last_match_of_day(match_id):
-            logger.info(f"Kickoff message suppressed for {match_id} — silent hours, not last match")
-            return
 
         await send_group("\n".join(lines))
         logger.info(f"Kickoff message sent for {match_id}")
@@ -632,10 +629,7 @@ async def _send_coming_up_today():
 
             open_bets = [b for b in sheet.cache["bets"] if b["match_id"] == str(m["match_id"]) and b["status"] == "open"]
             if open_bets:
-                def get_sort_name(b):
-                    user = sheet.cache["users"].get(b["user_id"], {})
-                    return (user.get("first_name") or user.get("username") or "").lower()
-                for b in sorted(open_bets, key=get_sort_name):
+                for b in sorted(open_bets, key=_get_sort_name):
                     name = _get_user_name(b["user_id"])
                     lines.append(f"{name} — {_outcome_label(b['outcome'], m)} — {b['amount']}c")
 
@@ -643,6 +637,7 @@ async def _send_coming_up_today():
         logger.info("Coming up today sent")
     except Exception as e:
         logger.error(f"_send_coming_up_today failed: {e}")
+        await dm_admin(f"⚠️ Coming up today message failed: {e}")
 
 
 def trigger_poll(match_id: str):
@@ -668,7 +663,6 @@ def _schedule_poll(match_id: str, delay_seconds: int, attempt: int):
 # ── Check all matches done → fire standings ───────────────────────────────────
 async def check_all_matches_done():
     try:
-        CT = pytz.timezone("America/Chicago")
         today_ct = datetime.now(CT).strftime("%Y-%m-%d")
         today_matches = await get_today_ct_matches()
 
@@ -812,11 +806,6 @@ async def job_post_standings(match_ids: list):
         # Get standings AFTER credits added
         standings_after = sheet.get_standings()
 
-        # Helper
-        def get_name(uid):
-            user = sheet.cache["users"].get(uid, {})
-            return (user.get("first_name") or user.get("username") or "Someone")
-
         # Overtakes — compute before building message
         before_ranks = {u["user_id"]: i+1 for i, u in enumerate(standings_before)}
         after_ranks = {u["user_id"]: i+1 for i, u in enumerate(standings_after)}
@@ -853,27 +842,27 @@ async def job_post_standings(match_ids: list):
         if parlay_payouts or parlay_losses:
             lines.append("")
             for pid, p in parlay_payouts.items():
-                name = get_name(p["user_id"])
+                name = _get_user_name(p["user_id"])
                 lines.append(f"🎰 {name} hit a {p['legs']}-leg parlay! {p['stake']}c → {p['payout']}c 🔥")
             for pid, p in parlay_losses.items():
-                name = get_name(p["user_id"])
+                name = _get_user_name(p["user_id"])
                 lines.append(f"🥀 {name}'s {p['legs']}-leg parlay didn't make it. {p['stake']}c gone.")
 
         # Commentary — Katerina generates 2-3 sentences
         standings_str = "\n".join(
-            f"{i}. {get_name(u['user_id'])} — {u['credits']}c ({'+' if pl_map.get(u['user_id'],0)>0 else ''}{pl_map.get(u['user_id'],0)}c today)"
+            f"{i}. {_get_user_name(u['user_id'])} — {u['credits']}c ({'+' if pl_map.get(u['user_id'],0)>0 else ''}{pl_map.get(u['user_id'],0)}c today)"
             for i, u in enumerate(standings_after, 1)
         )
         parlay_win_str = ", ".join(
-            f"{get_name(p['user_id'])} hit {p['legs']}-leg parlay {p['stake']}c→{p['payout']}c"
+            f"{_get_user_name(p['user_id'])} hit {p['legs']}-leg parlay {p['stake']}c→{p['payout']}c"
             for p in parlay_payouts.values()
         ) if parlay_payouts else ""
         parlay_loss_str = ", ".join(
-            f"{get_name(p['user_id'])}'s {p['legs']}-leg parlay busted"
+            f"{_get_user_name(p['user_id'])}'s {p['legs']}-leg parlay busted"
             for p in parlay_losses.values()
         ) if parlay_losses else ""
         overtake_str = ", ".join(
-            f"{get_name(uid)} overtook {get_name(passed)}"
+            f"{_get_user_name(uid)} overtook {_get_user_name(passed)}"
             for uid, passed in overtakes
         ) if overtakes else ""
 
@@ -927,7 +916,6 @@ async def job_health_monitor():
     """
     try:
         issues = []
-        now_sgt = datetime.now(SGT)
 
         # 1. Cache freshness — should have been refreshed within last 15 min
         last_refresh = sheet.cache.get("last_refresh")

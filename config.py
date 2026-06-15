@@ -54,8 +54,6 @@ UTC = pytz.utc
 DAILY_CREDITS = 100
 MATCH_CREDITS = 50
 STARTING_CREDITS = 100
-RESULT_MARKET_PAYOUT = 1.0
-OU_MARKET_PAYOUT = 1.0
 
 # Bet lock: seconds after kickoff
 BET_LOCK_BUFFER = 30
@@ -75,8 +73,6 @@ MORNING_CATCHUP_HOUR = 7
 MORNING_CATCHUP_MINUTE = 30
 PREMATCH_SUMMARY_MINUTES = 15
 
-# Cache refresh interval (seconds)
-CACHE_REFRESH_INTERVAL = 5 * 60
 
 # Session expiry (seconds)
 SESSION_EXPIRY = 120
@@ -258,18 +254,7 @@ STATUS_POSTPONED = "POSTPONED"
 # Parlay multipliers by number of legs
 PARLAY_MULTIPLIERS = {2: 2.5, 3: 5.0, 4: 10.0}
 
-# Bet status values
-BET_OPEN = "open"
-BET_WON = "won"
-BET_LOST = "lost"
-BET_VOID = "void"
 
-# Ledger types
-LEDGER_BET = "bet"
-LEDGER_PAYOUT = "payout"
-LEDGER_DAILY = "daily_credit"
-LEDGER_ADMIN = "admin_adjustment"
-LEDGER_REFUND = "refund"
 
 # Team display: API name → (short code, flag emoji)
 TEAM_DISPLAY = {
