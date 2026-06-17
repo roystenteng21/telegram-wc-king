@@ -1,3 +1,4 @@
+import time
 import requests
 import logging
 from datetime import datetime, timezone, timedelta
@@ -101,50 +102,58 @@ def fetch_match_result(match_id: str) -> dict | None:
     Returns match dict if FINISHED, None if still in progress.
     Raises RuntimeError on API failure.
     """
-    try:
-        data = _get(f"/matches/{match_id}")
-        if not data:
-            return None
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            data = _get(f"/matches/{match_id}")
+            if not data:
+                return None
 
-        status = data.get("status", "")
-        if status != STATUS_FINISHED:
-            logger.info(f"Match {match_id} status: {status} — not yet finished")
-            return None
+            status = data.get("status", "")
+            if status != STATUS_FINISHED:
+                logger.info(f"Match {match_id} status: {status} — not yet finished")
+                return None
 
-        score = data.get("score", {})
-        full_time = score.get("fullTime", {})
-        home_score = full_time.get("home")
-        away_score = full_time.get("away")
+            score = data.get("score", {})
+            full_time = score.get("fullTime", {})
+            home_score = full_time.get("home")
+            away_score = full_time.get("away")
 
-        if home_score is None or away_score is None:
-            logger.warning(f"Match {match_id} finished but scores missing")
-            return None
+            if home_score is None or away_score is None:
+                logger.warning(f"Match {match_id} finished but scores missing")
+                return None
 
-        if home_score > away_score:
-            result = "home"
-        elif away_score > home_score:
-            result = "away"
-        else:
-            result = "draw"
+            if home_score > away_score:
+                result = "home"
+            elif away_score > home_score:
+                result = "away"
+            else:
+                result = "draw"
 
-        total = home_score + away_score
-        ou_result = "over" if total > 2 else "under"
+            total = home_score + away_score
+            ou_result = "over" if total > 2 else "under"
 
-        logger.info(f"Match {match_id} finished: {home_score}-{away_score} ({result}, {ou_result})")
-        return {
-            "match_id": match_id,
-            "home_score": home_score,
-            "away_score": away_score,
-            "result": result,
-            "ou_result": ou_result,
-            "status": STATUS_FINISHED
-        }
+            logger.info(f"Match {match_id} finished: {home_score}-{away_score} ({result}, {ou_result})")
+            return {
+                "match_id": match_id,
+                "home_score": home_score,
+                "away_score": away_score,
+                "result": result,
+                "ou_result": ou_result,
+                "status": STATUS_FINISHED
+            }
 
-    except RuntimeError:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to fetch result for match {match_id}: {e}")
-        raise RuntimeError(f"Failed to fetch match result: {e}")
+        except RuntimeError as e:
+            last_error = e
+            if attempt < 3:
+                logger.warning(f"fetch_match_result attempt {attempt} failed for {match_id}: {e} — retrying")
+                time.sleep(3)
+        except Exception as e:
+            last_error = RuntimeError(f"Failed to fetch match result: {e}")
+            if attempt < 3:
+                logger.warning(f"fetch_match_result attempt {attempt} failed for {match_id}: {e} — retrying")
+                time.sleep(3)
+    raise last_error or RuntimeError(f"fetch_match_result failed after 3 attempts for {match_id}")
 
 
 

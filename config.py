@@ -238,6 +238,12 @@ TEAM_ALIASES = {
     "cape verde": "Cape Verde",
     "cur": "Curaçao",
     "curacao": "Curaçao",
+    "jor": "Jordan",
+    "jordan": "Jordan",
+    "uzb": "Uzbekistan",
+    "uzbekistan": "Uzbekistan",
+    "gha": "Ghana",
+    "ghana": "Ghana",
 }
 
 # Valid bet outcomes
@@ -325,4 +331,7 @@ TEAM_DISPLAY = {
     "Ukraine": ("UKR", "🇺🇦"),
     "Chile": ("CHI", "🇨🇱"),
     "Costa Rica": ("CRC", "🇨🇷"),
+    "Jordan": ("JOR", "🇯🇴"),
+    "Uzbekistan": ("UZB", "🇺🇿"),
+    "Ghana": ("GHA", "🇬🇭"),
 }

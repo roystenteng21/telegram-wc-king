@@ -130,6 +130,12 @@ def _get_sort_name(b: dict) -> str:
     return (user.get("first_name") or user.get("username") or "").lower()
 
 
+def _is_parlay_leg(s: dict) -> bool:
+    """Returns True if this bet is a parlay leg (not a single)."""
+    pid = s.get("parlay_id", "")
+    return bool(pid) and str(pid) not in ("", "0")
+
+
 def format_result_message(match: dict, settlements: list, parlay_wins: list = None) -> str:
     home_display = format_team(match["home"])
     away_display = format_team(match["away"])
@@ -153,13 +159,9 @@ def format_result_message(match: dict, settlements: list, parlay_wins: list = No
         user = sheet.cache["users"].get(s["user_id"], {})
         return (user.get("first_name") or user.get("username") or "").lower()
 
-    def _has_parlay(s):
-        pid = s.get("parlay_id", "")
-        return bool(pid) and str(pid) not in ("", "0")
-
     # Separate singles from parlay legs
-    singles = [s for s in settlements if not _has_parlay(s)]
-    parlay_legs = [s for s in settlements if _has_parlay(s)]
+    singles = [s for s in settlements if not _is_parlay_leg(s)]
+    parlay_legs = [s for s in settlements if _is_parlay_leg(s)]
 
     for s in sorted(singles, key=sort_key):
         name = get_name_str(s["user_id"])
@@ -193,13 +195,6 @@ def format_result_message(match: dict, settlements: list, parlay_wins: list = No
     return "\n".join(lines)
 
 
-MATCH_TOPUP_LINES = [
-    "+50c dropped into everyone's account. 🪙",
-    "Top-up time. +50c for the table. 💰",
-    "+50c added to all balances. Stay dangerous. 😤",
-    "Everyone gets +50c. Make it count. 🎯",
-    "+50c in the bank. Next one's on the house. 🏦",
-]
 
 
 async def _katerina_line(prompt: str, fallback: str, max_tokens: int = 120) -> str:
@@ -511,8 +506,7 @@ async def job_poll_result(match_id: str, attempt: int = 1):
         if not is_last:
             try:
                 await sheet.add_match_credits(MATCH_CREDITS, match_id, notify_fn=dm_admin)
-                import random as _random
-                topup_line = "\n" + _random.choice(MATCH_TOPUP_LINES)
+                topup_line = f"\n\n+{MATCH_CREDITS}c added to everyone's account. 🪙"
             except Exception as e:
                 logger.error(f"Post-match top-up failed for {match_id}: {e}")
                 await dm_admin(f"⚠️ Post-match top-up failed for match {match_id}: {e}")
@@ -536,11 +530,8 @@ async def job_poll_result(match_id: str, attempt: int = 1):
                 context += f" Parlay wins: {parlay_summary}."
 
             # Detect if everyone lost — singles + all parlay legs on this match
-            def _has_parlay(s):
-                pid = s.get("parlay_id", "")
-                return bool(pid) and str(pid) not in ("", "0")
-            singles_on_match = [s for s in settlements if not _has_parlay(s)]
-            parlay_legs_on_match = [s for s in settlements if _has_parlay(s)]
+            singles_on_match = [s for s in settlements if not _is_parlay_leg(s)]
+            parlay_legs_on_match = [s for s in settlements if _is_parlay_leg(s)]
             everyone_lost = (
                 bool(settlements) and
                 not parlay_wins and
@@ -567,22 +558,26 @@ async def job_poll_result(match_id: str, attempt: int = 1):
             result_msg = result_msg + topup_line
 
         if is_silent_hours() and not is_last:
-            logger.info(f"Match {match_id} result held — silent hours, scheduling 7:30AM send")
-            # Schedule delayed send at 7:30AM SGT
-            now_sgt = datetime.now(SGT)
-            send_time_sgt = now_sgt.replace(hour=MORNING_CATCHUP_HOUR, minute=MORNING_CATCHUP_MINUTE, second=0, microsecond=0)
-            if send_time_sgt <= now_sgt:
-                send_time_sgt = send_time_sgt + timedelta(days=1)
-            send_time_utc = send_time_sgt.astimezone(UTC)
-            morning_msg = f"Good morning lads! 🌅\n\n{result_msg}"
-            scheduler.add_job(
-                _send_delayed_result,
-                trigger=DateTrigger(run_date=send_time_utc),
-                args=[morning_msg, match_id],
-                id=f"delayed_result_{match_id}",
-                replace_existing=True
-            )
-            logger.info(f"Delayed result scheduled for {match_id} at {send_time_utc}")
+            logger.info(f"Match {match_id} result held — silent hours, appending to morning flush")
+            # Append to held results — morning flush sends all at once at 7:30AM
+            if "held_results" not in sheet.cache:
+                sheet.cache["held_results"] = []
+            sheet.cache["held_results"].append(result_msg)
+
+            # Schedule morning flush if not already scheduled
+            if not scheduler.get_job("morning_flush"):
+                now_sgt = datetime.now(SGT)
+                send_time_sgt = now_sgt.replace(hour=MORNING_CATCHUP_HOUR, minute=MORNING_CATCHUP_MINUTE, second=0, microsecond=0)
+                if send_time_sgt <= now_sgt:
+                    send_time_sgt = send_time_sgt + timedelta(days=1)
+                send_time_utc = send_time_sgt.astimezone(UTC)
+                scheduler.add_job(
+                    _send_morning_flush,
+                    trigger=DateTrigger(run_date=send_time_utc),
+                    id="morning_flush",
+                    replace_existing=True
+                )
+                logger.info(f"Morning flush scheduled at {send_time_utc}")
         else:
             await send_group(result_msg)
             # Fire "Coming up today" follow-up if more matches remain
@@ -597,15 +592,52 @@ async def job_poll_result(match_id: str, attempt: int = 1):
         await dm_admin(f"⚠️ Poll result job failed for match {match_id}: {e}")
 
 
-async def _send_delayed_result(message: str, match_id: str):
-    """Send a held silent-hours result at 7:30AM, then fire coming up today."""
+async def _send_morning_flush():
+    """Send all held overnight results as one combined message at 7:30AM, then fire coming up today."""
     try:
-        await send_group(message)
-        logger.info(f"Delayed result sent for {match_id}")
+        held = sheet.cache.pop("held_results", [])
+        if not held:
+            logger.info("Morning flush: no held results to send")
+            await _send_coming_up_today()
+            return
+
+        match_count = len(held)
+        total_topup = MATCH_CREDITS * match_count
+
+        # Build combined message
+        lines = ["Good morning lads! 🌅"]
+        for i, result_block in enumerate(held):
+            lines.append("")
+            lines.append(result_block)
+
+        # Single Katerina commentary covering all overnight results
+        all_results_summary = f"{match_count} overnight results: " + " | ".join(
+            r.split("\n")[0] for r in held  # first line of each result block = scoreline
+        )
+        prompt = (
+            f"{all_results_summary}. Write one sharp line reacting to the overnight results overall — "
+            f"light banter. Reference names if notable outcomes. 1-2 sentences. No markdown."
+        )
+        commentary = await _katerina_line(prompt, "", max_tokens=120)
+        if commentary:
+            lines.append("")
+            lines.append(commentary)
+
+        # Combined top-up line
+        if match_count == 1:
+            lines.append(f"\n\n+{MATCH_CREDITS}c added to everyone's account. 🪙")
+        else:
+            lines.append(f"\n\n+{MATCH_CREDITS}c × {match_count} added to everyone's account. 🪙")
+
+        await send_group("\n".join(lines))
+        logger.info(f"Morning flush sent: {match_count} result(s)")
+
+        # Fire coming up today once
         await _send_coming_up_today()
+
     except Exception as e:
-        logger.error(f"Delayed result send failed for {match_id}: {e}")
-        await dm_admin(f"⚠️ Delayed result send failed for {match_id}: {e}")
+        logger.error(f"Morning flush failed: {e}")
+        await dm_admin(f"⚠️ Morning flush failed: {e}")
 
 
 async def _send_coming_up_today():
@@ -663,7 +695,6 @@ def _schedule_poll(match_id: str, delay_seconds: int, attempt: int):
 # ── Check all matches done → fire standings ───────────────────────────────────
 async def check_all_matches_done():
     try:
-        today_ct = datetime.now(CT).strftime("%Y-%m-%d")
         today_matches = await get_today_ct_matches()
 
         if not today_matches:
@@ -678,6 +709,7 @@ async def check_all_matches_done():
             return
 
         # Guard against double-fire — check if EOD already ran today
+        today_ct = datetime.now(CT).strftime("%Y-%m-%d")
         eod_date = sheet.cache.get("eod_date")
         if eod_date == today_ct:
             logger.info("EOD already fired today, skipping duplicate")
@@ -906,6 +938,19 @@ async def job_post_standings(match_ids: list):
 # ── Cache refresh job ─────────────────────────────────────────────────────────
 async def job_refresh_cache():
     await sheet.refresh_cache(notify_fn=dm_admin)
+    # Re-fetch yesterday/today/tomorrow from API to catch UTC boundary matches
+    try:
+        yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
+        for date_str in [yesterday, today, tomorrow]:
+            try:
+                for m in api.fetch_matches_for_date(date_str):
+                    await sheet.upsert_match(m, notify_fn=dm_admin)
+            except RuntimeError:
+                pass  # Individual date failure — skip, don't break full refresh
+    except Exception as e:
+        logger.warning(f"Cache refresh API upsert failed: {e}")
 
 
 # ── Health monitor job ────────────────────────────────────────────────────────
@@ -1075,12 +1120,14 @@ async def on_startup(notify_fn=None):
     try:
         await sheet.refresh_cache(notify_fn=dm_admin)
 
+        yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         tomorrow = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
         try:
+            yesterday_matches = api.fetch_matches_for_date(yesterday)
             matches = api.fetch_today_matches()
             tomorrow_matches = api.fetch_matches_for_date(tomorrow)
-            for m in matches + tomorrow_matches:
+            for m in yesterday_matches + matches + tomorrow_matches:
                 await sheet.upsert_match(m, notify_fn=dm_admin)
             # No second refresh needed — upsert_match updates cache directly
         except RuntimeError as e:
@@ -1088,9 +1135,10 @@ async def on_startup(notify_fn=None):
 
         register_static_jobs()
 
+        yesterday_cached = await sheet.get_matches_for_date(yesterday)
         today_matches = await sheet.get_matches_for_date(today)
         tomorrow_matches_cached = await sheet.get_matches_for_date(tomorrow)
-        all_today_matches = today_matches + tomorrow_matches_cached
+        all_today_matches = yesterday_cached + today_matches + tomorrow_matches_cached
         register_match_jobs(all_today_matches)
 
         scheduler.start()
