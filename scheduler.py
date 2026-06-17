@@ -1119,6 +1119,7 @@ async def on_startup(notify_fn=None):
     """
     try:
         await sheet.refresh_cache(notify_fn=dm_admin)
+        await asyncio.sleep(2)  # Brief pause after cache read to avoid Sheets rate limit
 
         yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
         today = datetime.now(UTC).strftime("%Y-%m-%d")

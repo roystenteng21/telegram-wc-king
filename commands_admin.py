@@ -670,6 +670,7 @@ async def cmd_admin_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Refreshing fixtures from API...")
     try:
+        await asyncio.sleep(1)  # Brief pause to avoid Sheets rate limit
         yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
         tomorrow = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
         yesterday_matches = api.fetch_matches_for_date(yesterday)
