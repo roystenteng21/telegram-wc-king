@@ -109,6 +109,8 @@ TEAM_ALIASES = {
     "drc": "DR Congo",
     "drcongo": "DR Congo",
     "dr congo": "DR Congo",
+    "congo dr": "DR Congo",
+    "cod": "DR Congo",
 
     # Common teams
     "bra": "Brazil",
@@ -311,6 +313,7 @@ TEAM_DISPLAY = {
     "Portugal": ("POR", "🇵🇹"),
     "Colombia": ("COL", "🇨🇴"),
     "DR Congo": ("COD", "🇨🇩"),
+    "Congo DR": ("COD", "🇨🇩"),
     "Serbia": ("SRB", "🇷🇸"),
     "Hungary": ("HUN", "🇭🇺"),
     "Panama": ("PAN", "🇵🇦"),
