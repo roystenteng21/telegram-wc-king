@@ -670,12 +670,17 @@ async def cmd_admin_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Refreshing fixtures from API...")
     try:
-        matches = api.fetch_today_matches()
-        for m in matches:
+        yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
+        yesterday_matches = api.fetch_matches_for_date(yesterday)
+        today_matches = api.fetch_today_matches()
+        tomorrow_matches = api.fetch_matches_for_date(tomorrow)
+        all_matches = yesterday_matches + today_matches + tomorrow_matches
+        for m in all_matches:
             await sheet.upsert_match(m, notify_fn=dm_admin)
         await sheet.refresh_cache(notify_fn=dm_admin)
-        sched.register_match_jobs(matches)
-        await update.message.reply_text(f"✅ Done. {len(matches)} matches loaded.")
+        sched.register_match_jobs(all_matches)
+        await update.message.reply_text(f"✅ Done. {len(all_matches)} matches loaded.")
     except RuntimeError as e:
         await update.message.reply_text(f"⚠️ API error: {e}")
 
