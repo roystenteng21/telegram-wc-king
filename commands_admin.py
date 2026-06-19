@@ -100,6 +100,13 @@ async def cmd_admin_result_push(update: Update, context: ContextTypes.DEFAULT_TY
         match = matches[index]
         match_id = match["match_id"]
 
+        # Auto-settle if bets are still open (e.g. match was force-marked FINISHED via /admin_refresh)
+        open_bets = [b for b in await sheet.get_bets_for_match(match_id) if b["status"] == "open"]
+        if open_bets and match.get("result"):
+            await sheet.settle_bets_for_match(
+                match_id, match["result"], match.get("ou_result", ""), notify_fn=dm_admin
+            )
+
         bets = await sheet.get_bets_for_match(match_id)
         settlements = [b for b in bets if b["status"] in ("won", "lost")]
         parlay_wins = await sched.check_parlay_completions(match_id)

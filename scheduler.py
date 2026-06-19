@@ -460,6 +460,30 @@ async def check_parlay_completions(match_id: str) -> list:
     return payouts
 
 
+async def _auto_settle_stuck_match(match_id: str):
+    """
+    Settle bets for a match that's FINISHED in cache but still has open bets
+    (e.g. force-synced via /admin_refresh, bypassing the normal poll flow).
+    Does NOT send the result message — admin uses /admin_result_push for that.
+    """
+    try:
+        match = await sheet.get_match_by_id(match_id)
+        if not match or not match.get("result"):
+            return
+        open_bets = [b for b in sheet.cache["bets"] if b["match_id"] == match_id and b["status"] == "open"]
+        if not open_bets:
+            return
+        await sheet.settle_bets_for_match(match_id, match["result"], match.get("ou_result", ""), notify_fn=dm_admin)
+        await dm_admin(
+            f"⚠️ Match {match_id} was FINISHED with open bets — auto-settled just now. "
+            f"Use /admin_result_push to send the result to the group."
+        )
+        logger.info(f"Auto-settled stuck match {match_id}")
+    except Exception as e:
+        logger.error(f"Auto-settle failed for {match_id}: {e}")
+        await dm_admin(f"⚠️ Auto-settle failed for match {match_id}: {e}")
+
+
 async def job_poll_result(match_id: str, attempt: int = 1):
     MAX_POLL_ATTEMPTS = 36  # 36 x 5min = 3 hours max
     try:
@@ -1052,6 +1076,18 @@ def register_match_jobs(matches: list):
         status = m.get("status", "")
 
         if status in ("FINISHED", "CANCELLED", "POSTPONED"):
+            if status == "FINISHED":
+                # Match marked FINISHED but bets may still be open (e.g. force-synced via /admin_refresh)
+                open_bets = [b for b in sheet.cache["bets"] if b["match_id"] == match_id and b["status"] == "open"]
+                if open_bets and m.get("result"):
+                    scheduler.add_job(
+                        _auto_settle_stuck_match,
+                        trigger=DateTrigger(run_date=datetime.now(UTC) + timedelta(seconds=5)),
+                        args=[match_id],
+                        id=f"auto_settle_{match_id}",
+                        replace_existing=True
+                    )
+                    logger.info(f"Match {match_id} FINISHED with open bets — scheduled auto-settle")
             continue
 
         if status in ("IN_PLAY", "PAUSED"):
