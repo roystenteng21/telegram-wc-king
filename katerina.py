@@ -365,11 +365,9 @@ Generate a roast of a player based on their stats. Rules:
 - Tournament context: {prize_context}
 """
     if roast_angle:
-        prompt += f"
-Specific roast angle requested: {roast_angle}. Lead with this angle, use the stats as supporting ammunition."
+        prompt += f"\nSpecific roast angle requested: {roast_angle}. Lead with this angle, use the stats as supporting ammunition."
     else:
-        prompt += "
-Give Katerina's roast. One or two sentences only. Mix up the angle — stats, behaviour, bet sizing, prize stakes, rank, whatever stings most for this player."
+        prompt += "\nGive Katerina's roast. One or two sentences only. Mix up the angle — stats, behaviour, bet sizing, prize stakes, rank, whatever stings most for this player."
 
     try:
         payload = json.dumps({
