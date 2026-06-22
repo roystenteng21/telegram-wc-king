@@ -63,10 +63,15 @@ from helpers import is_silent_hours
 async def get_today_ct_matches() -> list:
     """Return all matches whose kickoff falls on today's CT date."""
     today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+    yesterday_utc = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
     today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
     tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    all_matches = await sheet.get_matches_for_date(today_utc) + await sheet.get_matches_for_date(tomorrow_utc)
+    all_matches = (
+        await sheet.get_matches_for_date(yesterday_utc) +
+        await sheet.get_matches_for_date(today_utc) +
+        await sheet.get_matches_for_date(tomorrow_utc)
+    )
     result = []
     for m in all_matches:
         try:
@@ -235,16 +240,17 @@ async def _katerina_line(prompt: str, fallback: str, max_tokens: int = 120) -> s
 # ── Night reminder (11PM SGT) ────────────────────────────────────────────────
 async def job_night_reminder():
     try:
-        tomorrow_ct = (datetime.now(CT) + timedelta(days=1)).strftime("%Y-%m-%d")
-        today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
-        tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
-        day_after_utc = (datetime.now(UTC) + timedelta(days=2)).strftime("%Y-%m-%d")
+        today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+        now_utc = datetime.now(UTC)
+        yesterday_utc = (now_utc - timedelta(days=1)).strftime("%Y-%m-%d")
+        today_utc = now_utc.strftime("%Y-%m-%d")
+        tomorrow_utc = (now_utc + timedelta(days=1)).strftime("%Y-%m-%d")
 
-        # Read from cache first — cache already holds today + tomorrow from startup
-        cached_today = list(sheet.cache.get("matches", {}).values())
+        # Read from cache first — cache already holds yesterday + today + tomorrow from startup
+        cached_all = list(sheet.cache.get("matches", {}).values())
         raw_from_cache = [
-            m for m in cached_today
-            if m.get("kickoff_utc", "") >= today_utc
+            m for m in cached_all
+            if m.get("kickoff_utc", "") >= yesterday_utc
         ]
 
         raw = None
@@ -257,9 +263,9 @@ async def job_night_reminder():
             for attempt in range(1, 6):
                 try:
                     raw = (
+                        api.fetch_matches_for_date(yesterday_utc) +
                         api.fetch_matches_for_date(today_utc) +
-                        api.fetch_matches_for_date(tomorrow_utc) +
-                        api.fetch_matches_for_date(day_after_utc)
+                        api.fetch_matches_for_date(tomorrow_utc)
                     )
                     logger.info(f"Night reminder: API fetch succeeded on attempt {attempt}")
                     break
@@ -276,16 +282,20 @@ async def job_night_reminder():
         for m in raw:
             try:
                 ko = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-                if ko.astimezone(CT).strftime("%Y-%m-%d") == tomorrow_ct:
+                if (
+                    ko.astimezone(CT).strftime("%Y-%m-%d") == today_ct
+                    and ko > now_utc
+                    and m.get("status") not in ("FINISHED", "CANCELLED", "POSTPONED")
+                ):
                     matches.append(m)
             except Exception:
                 continue
 
         if not matches:
-            logger.info("Night reminder: no matches tomorrow, skipping")
+            logger.info("Night reminder: no upcoming matches today CT, skipping")
             return
 
-        lines = ["🌙 Good evening gents! Matches tomorrow:\n"]
+        lines = ["🌙 Good evening gents! Matches tonight:\n"]
 
         bet_context_parts = []
         for m in sorted(matches, key=lambda x: x["kickoff_utc"]):
@@ -304,14 +314,14 @@ async def job_night_reminder():
         if bet_context_parts:
             bet_summary = ", ".join(bet_context_parts)
             prompt = (
-                f"It's 11PM. Tomorrow's WC matches are set. Current bets placed: {bet_summary}. "
+                f"It's 11PM. Tonight's WC matches are set. Current bets placed: {bet_summary}. "
                 f"Write one short punchy good night line — acknowledge who's bet, maybe a light dig. "
                 f"1 sentence max. No hashtags."
             )
             closing = await _katerina_line(prompt, "Get your bets in before kickoff. Good night! 🌛")
         else:
             prompt = (
-                f"It's 11PM. Tomorrow's WC matches are set but nobody has bet yet. "
+                f"It's 11PM. Tonight's WC matches are set but nobody has bet yet. "
                 f"Write one short punchy good night line encouraging bets. 1 sentence max."
             )
             closing = await _katerina_line(prompt, "No bets placed yet. Get on it before kickoff. Good night! 🌛")
@@ -479,6 +489,7 @@ async def _auto_settle_stuck_match(match_id: str):
             f"Use /admin_result_push to send the result to the group."
         )
         logger.info(f"Auto-settled stuck match {match_id}")
+        await check_all_matches_done()
     except Exception as e:
         logger.error(f"Auto-settle failed for {match_id}: {e}")
         await dm_admin(f"⚠️ Auto-settle failed for match {match_id}: {e}")
@@ -536,7 +547,8 @@ async def job_poll_result(match_id: str, attempt: int = 1):
                 await dm_admin(f"⚠️ Post-match top-up failed for match {match_id}: {e}")
 
         # Build result message — Katerina commentary injected before top-up line
-        result_msg = format_result_message(match, settlements, parlay_wins=parlay_wins)
+        base_result_msg = format_result_message(match, settlements, parlay_wins=parlay_wins)
+        result_msg = base_result_msg
 
         if settlements or parlay_wins:
             settled_summary = ", ".join(
@@ -578,15 +590,12 @@ async def job_poll_result(match_id: str, attempt: int = 1):
             if commentary:
                 result_msg = result_msg + f"\n\n{commentary}"
 
-        if topup_line:
-            result_msg = result_msg + topup_line
-
         if is_silent_hours() and not is_last:
             logger.info(f"Match {match_id} result held — silent hours, appending to morning flush")
-            # Append to held results — morning flush sends all at once at 7:30AM
+            # Hold only base result (score + bets) — morning flush adds one combined Katerina + top-up
             if "held_results" not in sheet.cache:
                 sheet.cache["held_results"] = []
-            sheet.cache["held_results"].append(result_msg)
+            sheet.cache["held_results"].append(base_result_msg)
 
             # Schedule morning flush if not already scheduled
             if not scheduler.get_job("morning_flush"):
@@ -603,6 +612,8 @@ async def job_poll_result(match_id: str, attempt: int = 1):
                 )
                 logger.info(f"Morning flush scheduled at {send_time_utc}")
         else:
+            if topup_line:
+                result_msg = result_msg + topup_line
             await send_group(result_msg)
             # Fire "Coming up today" follow-up if more matches remain
             if not is_last:
@@ -648,10 +659,11 @@ async def _send_morning_flush():
             lines.append(commentary)
 
         # Combined top-up line
+        lines.append("")
         if match_count == 1:
-            lines.append(f"\n\n+{MATCH_CREDITS}c added to everyone's account. 🪙")
+            lines.append(f"+{MATCH_CREDITS}c added to everyone's account. 🪙")
         else:
-            lines.append(f"\n\n+{MATCH_CREDITS}c × {match_count} added to everyone's account. 🪙")
+            lines.append(f"+{MATCH_CREDITS}c × {match_count} added to everyone's account. 🪙")
 
         await send_group("\n".join(lines))
         logger.info(f"Morning flush sent: {match_count} result(s)")
@@ -1008,7 +1020,8 @@ async def job_health_monitor():
                 mid = str(m["match_id"])
                 has_poll = any(mid in job.id and "poll" in job.id for job in scheduler.get_jobs())
                 if not has_poll:
-                    issues.append(f"Match {mid} is {m['status']} but no poll job found")
+                    _schedule_poll(mid, delay_seconds=10, attempt=1)
+                    issues.append(f"Match {mid} is {m['status']} — no poll job found, scheduled emergency poll")
 
         # 4. Bot can reach group chat — lightweight check via _group_chat_id
         if _group_chat_id is None:
