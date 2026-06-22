@@ -473,9 +473,8 @@ async def check_parlay_completions(match_id: str) -> list:
 
 async def _auto_settle_stuck_match(match_id: str):
     """
-    Settle bets for a match that's FINISHED in cache but still has open bets
-    (e.g. force-synced via /admin_refresh, bypassing the normal poll flow).
-    Does NOT send the result message — admin uses /admin_result_push for that.
+    Settle bets for a match that's FINISHED in cache but still has open bets.
+    Sends the result message to the group automatically — no manual push needed.
     """
     try:
         match = await sheet.get_match_by_id(match_id)
@@ -483,14 +482,92 @@ async def _auto_settle_stuck_match(match_id: str):
             return
         open_bets = [b for b in sheet.cache["bets"] if b["match_id"] == match_id and b["status"] == "open"]
         if not open_bets:
+            await check_all_matches_done()
             return
-        await sheet.settle_bets_for_match(match_id, match["result"], match.get("ou_result", ""), notify_fn=dm_admin)
-        await dm_admin(
-            f"⚠️ Match {match_id} was FINISHED with open bets — auto-settled just now. "
-            f"Use /admin_result_push to send the result to the group."
-        )
+
+        # Settle bets
+        settlements = await sheet.settle_bets_for_match(match_id, match["result"], match.get("ou_result", ""), notify_fn=dm_admin)
+
+        # Check parlay completions
+        parlay_wins = await check_parlay_completions(match_id)
+
+        # Is this the last match of the day?
+        is_last = await is_last_match_of_day(match_id)
+
+        # Post-match top-up
+        topup_line = ""
+        if not is_last:
+            try:
+                await sheet.add_match_credits(MATCH_CREDITS, match_id, notify_fn=dm_admin)
+                topup_line = f"\n\n+{MATCH_CREDITS}c added to everyone's account. 🪙"
+            except Exception as e:
+                logger.error(f"Auto-settle top-up failed for {match_id}: {e}")
+
+        # Build result message
+        base_result_msg = format_result_message(match, settlements, parlay_wins=parlay_wins)
+        result_msg = base_result_msg
+
+        if settlements or parlay_wins:
+            home_score = match.get("home_score", "?")
+            away_score = match.get("away_score", "?")
+            settled_summary = ", ".join(
+                f"{_get_user_name(s['user_id'])} {'won' if s['status'] == 'won' else 'lost'} {s['amount']}c on {_outcome_label(s['outcome'], match)}"
+                for s in settlements if not _is_parlay_leg(s)
+            )
+            context = f"Result: {format_match_teams(match['home'], match['away'])} {home_score}-{away_score}."
+            if settled_summary:
+                context += f" Singles: {settled_summary}."
+
+            singles_on_match = [s for s in settlements if not _is_parlay_leg(s)]
+            parlay_legs_on_match = [s for s in settlements if _is_parlay_leg(s)]
+            everyone_lost = (
+                bool(settlements) and not parlay_wins and
+                all(s["status"] == "lost" for s in singles_on_match) and
+                all(s["status"] == "lost" for s in parlay_legs_on_match)
+            )
+            if everyone_lost:
+                names = ", ".join(dict.fromkeys(_get_user_name(s["user_id"]) for s in settlements))
+                prompt = (
+                    f"{context} Every single person lost — {names}. "
+                    f"Go full savage. 1-2 sentences, no mercy. No markdown."
+                )
+            else:
+                prompt = (
+                    f"{context} Write 1-2 sharp sentences reacting to the result and bets with light banter. "
+                    f"Reference specific names and outcomes. No markdown."
+                )
+            commentary = await _katerina_line(prompt, "", max_tokens=150)
+            if commentary:
+                result_msg = result_msg + f"\n\n{commentary}"
+
+        # Send or hold for morning flush
+        if is_silent_hours() and not is_last:
+            if "held_results" not in sheet.cache:
+                sheet.cache["held_results"] = []
+            sheet.cache["held_results"].append(base_result_msg)
+            if not scheduler.get_job("morning_flush"):
+                now_sgt = datetime.now(SGT)
+                send_time_sgt = now_sgt.replace(hour=MORNING_CATCHUP_HOUR, minute=MORNING_CATCHUP_MINUTE, second=0, microsecond=0)
+                if send_time_sgt <= now_sgt:
+                    send_time_sgt = send_time_sgt + timedelta(days=1)
+                send_time_utc = send_time_sgt.astimezone(UTC)
+                scheduler.add_job(
+                    _send_morning_flush,
+                    trigger=DateTrigger(run_date=send_time_utc),
+                    id="morning_flush",
+                    replace_existing=True
+                )
+        else:
+            if topup_line:
+                result_msg = result_msg + topup_line
+            await send_group(result_msg)
+            if not is_last:
+                await _send_coming_up_today()
+
+        await dm_admin(f"ℹ️ Match {match_id} was auto-settled and result posted to group.")
         logger.info(f"Auto-settled stuck match {match_id}")
         await check_all_matches_done()
+
     except Exception as e:
         logger.error(f"Auto-settle failed for {match_id}: {e}")
         await dm_admin(f"⚠️ Auto-settle failed for match {match_id}: {e}")
@@ -505,10 +582,11 @@ async def job_poll_result(match_id: str, attempt: int = 1):
         except RuntimeError as e:
             error_msg = str(e)
             if "429" in error_msg or "rate limit" in error_msg.lower():
-                await dm_admin(
-                    f"⚠️ API limit reached. Cannot fetch result for match {match_id}.\n"
-                    f"Use /admin_result to update manually."
-                )
+                if attempt < MAX_POLL_ATTEMPTS:
+                    await dm_admin(f"⚠️ API rate limit hit polling match {match_id} — retrying in 10 minutes.")
+                    _schedule_poll(match_id, delay_seconds=10 * 60, attempt=attempt + 1)
+                else:
+                    await dm_admin(f"⚠️ Match {match_id} polling gave up after {MAX_POLL_ATTEMPTS} attempts. Use /admin_result to settle manually.")
                 return
             await dm_admin(f"⚠️ API error polling match {match_id}: {e}")
             if attempt < MAX_POLL_ATTEMPTS:
@@ -1083,17 +1161,11 @@ def register_static_jobs():
         replace_existing=True
     )
 
-    # Health monitor — every 15min during peak hours (9PM-1AM SGT), every 1h outside
+    # Health monitor — every 10 minutes all day
     scheduler.add_job(
         job_health_monitor,
-        trigger=CronTrigger(minute="0,15,30,45", hour="21,22,23,0,1", timezone=SGT),
-        id="health_monitor_peak",
-        replace_existing=True
-    )
-    scheduler.add_job(
-        job_health_monitor,
-        trigger=CronTrigger(minute="0", hour="2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20", timezone=SGT),
-        id="health_monitor_offpeak",
+        trigger=CronTrigger(minute="0,10,20,30,40,50"),
+        id="health_monitor",
         replace_existing=True
     )
 
