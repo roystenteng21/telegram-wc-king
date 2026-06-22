@@ -706,6 +706,36 @@ async def add_daily_credits(daily_amount: int, notify_fn=None):
             await notify_fn(f"⚠️ Failed to add daily credits: {e}")
         raise
 
+async def add_tiered_daily_credits(tier_map: dict, notify_fn=None):
+    """Add tiered daily credits. tier_map = {user_id: amount}. Skips if already credited today."""
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    if cache.get("daily_credits_date") == today:
+        logger.info(f"Daily credits already added today ({today}), skipping.")
+        if notify_fn:
+            await notify_fn("⚠️ Daily credits already added today — skipped.")
+        return
+    try:
+        ws = get_sheet(SHEET_USERS)
+        for user_id, amount in tier_map.items():
+            row_num = _user_rows.get(user_id)
+            if not row_num:
+                continue
+            user = cache["users"].get(user_id)
+            if not user:
+                continue
+            new_credits = user["credits"] + amount
+            await with_retry(ws.update_cell, row_num, 4, new_credits)
+            cache["users"][user_id]["credits"] = new_credits
+            await append_ledger(user_id, "daily_credit", amount, new_credits, "Daily top-up (tiered)", notify_fn)
+        cache["daily_credits_date"] = today
+        logger.info("Tiered daily credits added to all users")
+    except Exception as e:
+        logger.error(f"Failed to add tiered daily credits: {e}")
+        if notify_fn:
+            await notify_fn(f"⚠️ Failed to add tiered daily credits: {e}")
+        raise
+
+
 # ── Standings ────────────────────────────────────────────────────────────────
 def get_standings() -> list:
     return sorted(

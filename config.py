@@ -260,7 +260,11 @@ STATUS_CANCELLED = "CANCELLED"
 STATUS_POSTPONED = "POSTPONED"
 
 # Parlay multipliers by number of legs
-PARLAY_MULTIPLIERS = {2: 2.5, 3: 5.0, 4: 10.0}
+PARLAY_MULTIPLIERS = {2: 4.5, 3: 8.0, 4: 16.0}
+
+# Tiered daily credits by rank (rank 1 = best = lowest top-up, rank N = worst = highest)
+# Tied players all receive the most generous tier in their tied group
+DAILY_CREDIT_TIERS = [50, 75, 100, 150, 175]
 
 
 

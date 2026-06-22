@@ -14,7 +14,8 @@ from config import (
     MORNING_CATCHUP_HOUR, MORNING_CATCHUP_MINUTE,
     PREMATCH_SUMMARY_MINUTES, POLL_START_OFFSET, POLL_INTERVAL,
     KNOCKOUT_DURATION, ANTHROPIC_API_KEY,
-    ADMIN_TELEGRAM_ID, BOT_VERSION, TEAM_DISPLAY, PARLAY_MULTIPLIERS
+    ADMIN_TELEGRAM_ID, BOT_VERSION, TEAM_DISPLAY, PARLAY_MULTIPLIERS,
+    DAILY_CREDIT_TIERS
 )
 import sheet
 import api
@@ -868,8 +869,22 @@ async def job_post_standings(match_ids: list):
                     "stake": legs[0]["amount"],
                 }
 
-        # Add daily credits
-        await sheet.add_daily_credits(DAILY_CREDITS, notify_fn=dm_admin)
+        # Add tiered daily credits — lower ranks get more, tied players get most generous tier
+        tier_amounts = DAILY_CREDIT_TIERS
+        tier_map = {}
+        i = 0
+        rank_pos = 0
+        while i < len(standings_before):
+            j = i
+            while j < len(standings_before) and standings_before[j]["credits"] == standings_before[i]["credits"]:
+                j += 1
+            worst_idx = min(rank_pos + (j - i) - 1, len(tier_amounts) - 1)
+            amount = tier_amounts[worst_idx]
+            for k in range(i, j):
+                tier_map[standings_before[k]["user_id"]] = amount
+            rank_pos += (j - i)
+            i = j
+        await sheet.add_tiered_daily_credits(tier_map, notify_fn=dm_admin)
 
         # Get standings AFTER credits added
         standings_after = sheet.get_standings()
@@ -957,7 +972,11 @@ async def job_post_standings(match_ids: list):
             lines.append("")
             lines.append(commentary)
 
-        lines.append("\nDaily credits added, good luck tomorrow! 🍀")
+        tier_values = sorted(set(tier_map.values()))
+        if len(tier_values) > 1:
+            lines.append(f"\n+{tier_values[0]}c–{tier_values[-1]}c daily credits added (by rank), good luck tomorrow! 🍀")
+        else:
+            lines.append(f"\n+{tier_values[0]}c daily credits added, good luck tomorrow! 🍀")
 
         await send_group("\n".join(lines))
         logger.info("End of day standings and daily credits posted")
@@ -982,9 +1001,13 @@ async def job_refresh_cache():
         for date_str in [yesterday, today, tomorrow]:
             try:
                 for m in api.fetch_matches_for_date(date_str):
-                    await sheet.upsert_match(m, notify_fn=dm_admin)
+                    try:
+                        await sheet.upsert_match(m, notify_fn=dm_admin)
+                    except Exception:
+                        pass  # Individual upsert failure — skip, don't break full refresh
+                    await asyncio.sleep(0.3)  # Rate limit: space out sheet writes
             except RuntimeError:
-                pass  # Individual date failure — skip, don't break full refresh
+                pass  # API fetch failure — skip date, don't break full refresh
     except Exception as e:
         logger.warning(f"Cache refresh API upsert failed: {e}")
 
@@ -1168,7 +1191,7 @@ async def on_startup(notify_fn=None):
     """
     try:
         await sheet.refresh_cache(notify_fn=dm_admin)
-        await asyncio.sleep(2)  # Brief pause after cache read to avoid Sheets rate limit
+        await asyncio.sleep(5)  # Brief pause after cache read to avoid Sheets rate limit
 
         yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
         today = datetime.now(UTC).strftime("%Y-%m-%d")
@@ -1178,8 +1201,11 @@ async def on_startup(notify_fn=None):
             matches = api.fetch_today_matches()
             tomorrow_matches = api.fetch_matches_for_date(tomorrow)
             for m in yesterday_matches + matches + tomorrow_matches:
-                await sheet.upsert_match(m, notify_fn=dm_admin)
-            # No second refresh needed — upsert_match updates cache directly
+                try:
+                    await sheet.upsert_match(m, notify_fn=dm_admin)
+                except Exception as e:
+                    logger.warning(f"Startup: upsert skipped for match {m.get('match_id', '?')}: {e}")
+                await asyncio.sleep(0.5)  # Rate limit: space out sheet writes
         except RuntimeError as e:
             await dm_admin(f"⚠️ Startup: failed to fetch today's fixtures: {e}\nUse /admin_refresh to retry.")
 

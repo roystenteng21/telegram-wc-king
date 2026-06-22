@@ -12,6 +12,33 @@ from config import (
 import sheet
 import scheduler as sched
 import api
+
+
+# ── Portugal intervention helper ──────────────────────────────────────────────
+def _is_portugal_win(match: dict, outcome: str) -> bool:
+    return (
+        (match.get("home") == "Portugal" and outcome == "home") or
+        (match.get("away") == "Portugal" and outcome == "away")
+    )
+
+
+async def _send_por_intervention(update, user_id: int, amount: int, match: dict):
+    """Fire Katerina Portugal intervention to the group after a POR win bet."""
+    try:
+        user = sheet.cache["users"].get(user_id, {})
+        name = user.get("first_name") or user.get("username") or "Someone"
+        prompt = (
+            f"{name} just bet {amount}c on Portugal to win. "
+            f"Roast them for it — Ronaldo hasn't won a major tournament since Euro 2016 and he's coasting on legacy. "
+            f"Tell them to run /cancel to save their credits. 1-2 sentences, savage but fun. No markdown."
+        )
+        msg = await sched._katerina_line(
+            prompt,
+            f"⚠️ {name} just put {amount}c on Portugal. Ronaldo's been collecting paychecks, not trophies, since 2016. Run /cancel before kickoff — I'm trying to save you here. 🙏"
+        )
+        await sched.send_group(f"⚠️ {msg}")
+    except Exception as e:
+        logger.error(f"POR intervention failed: {e}")
 from helpers import (
     dm_admin, is_silent_hours, is_group_message,
     send_confirmation, format_team, format_match_teams, format_outcome_label,
@@ -553,6 +580,10 @@ async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await send_confirmation(update, confirm_msg)
 
+        # POR rule — warn if betting on Portugal to win
+        if _is_portugal_win(match, internal_outcome):
+            await _send_por_intervention(update, user.id, amount, match)
+
     except ValueError as e:
         await update.message.reply_text(str(e))
     except Exception as e:
@@ -814,6 +845,11 @@ async def cmd_parlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         confirm_msg = "\n".join(lines)
         await send_confirmation(update, confirm_msg)
+
+        # POR rule — warn if any leg bets on Portugal to win
+        por_legs = [leg for leg in validated_legs if _is_portugal_win(leg["match"], leg["outcome"])]
+        if por_legs:
+            await _send_por_intervention(update, user.id, amount, por_legs[0]["match"])
 
     except ValueError as e:
         # Rollback — cancel first leg only (only leg that deducted credits)

@@ -255,6 +255,43 @@ async def _get_roast_data(target_uid: int) -> dict:
     outcome_counts = Counter(b["outcome"] for b in all_bets)
     top_outcome = outcome_counts.most_common(1)[0] if outcome_counts else None
 
+    # Avg bet size as % of current credits (bet cowardice indicator)
+    avg_bet = round(sum(b["amount"] for b in all_bets) / total_bets) if total_bets else 0
+    avg_bet_pct = round(avg_bet / credits * 100, 1) if credits > 0 else 0
+
+    # OU market participation
+    ou_bets = len([b for b in all_bets if b["market"] == "ou"])
+    ou_pct = round(ou_bets / total_bets * 100) if total_bets else 0
+
+    # Parlay record
+    all_user_bets = sheet.cache["bets"]
+    parlay_ids = set(
+        b["parlay_id"] for b in all_user_bets
+        if b["user_id"] == target_uid
+        and b.get("parlay_id") and str(b.get("parlay_id")) not in ("", "0")
+    )
+    parlays_attempted = len(parlay_ids)
+    parlays_won = len([pid for pid in parlay_ids if pid in sheet.cache.get("paid_parlays", set())])
+
+    # Current streak (positive = win streak, negative = loss streak)
+    sorted_settled = sorted(all_bets, key=lambda b: b.get("placed_at", ""), reverse=True)
+    streak = 0
+    if sorted_settled:
+        streak_status = sorted_settled[0]["status"]
+        for b in sorted_settled:
+            if b["status"] == streak_status:
+                streak += 1 if streak_status == "won" else -1
+            else:
+                break
+
+    # Matches skipped (finished matches with no bet from this user)
+    finished_match_ids = {m["match_id"] for m in sheet.cache["matches"].values() if m.get("status") == "FINISHED"}
+    bet_match_ids = {b["match_id"] for b in all_user_bets if b["user_id"] == target_uid}
+    skipped_matches = len(finished_match_ids - bet_match_ids)
+
+    # All-time net P&L from betting
+    all_time_pl = sum(b["amount"] if b["status"] == "won" else -b["amount"] for b in all_bets)
+
     return {
         "name": name,
         "credits": credits,
@@ -271,10 +308,18 @@ async def _get_roast_data(target_uid: int) -> dict:
         "top_outcome": top_outcome,
         "is_leader": rank == 1,
         "is_last": rank == total_players if total_players else False,
+        "avg_bet": avg_bet,
+        "avg_bet_pct": avg_bet_pct,
+        "ou_pct": ou_pct,
+        "parlays_attempted": parlays_attempted,
+        "parlays_won": parlays_won,
+        "streak": streak,
+        "skipped_matches": skipped_matches,
+        "all_time_pl": all_time_pl,
     }
 
 
-async def _generate_roast(name: str, data: dict) -> str:
+async def _generate_roast(name: str, data: dict, roast_angle: str = None) -> str:
     """Call Claude API to generate a Katerina roast."""
     days_to_final = (TOURNAMENT_FINAL_DATE - date.today()).days
     prize_context = f"There are {days_to_final} days left until the Final. Winner takes the World Cup champion jersey."
@@ -287,6 +332,7 @@ Generate a roast of a player based on their stats. Rules:
 - Use their actual stats naturally — don't just list numbers
 - Reference the prize (World Cup champion jersey for 1st, runner-up jersey for 2nd) for extra sting — but vary it, don't always mention it
 - Last place players get slightly harsher treatment around the prize
+- The leader is also fair game — especially for playing it safe, making tiny bets, or coasting on their lead
 - Anyone can catch smoke — don't always go for the obvious angle
 - Occasionally smug or dramatic
 - No swearing
@@ -296,19 +342,34 @@ Generate a roast of a player based on their stats. Rules:
 - "sucker" only for bad bettors/losers, not as generic address
 """
 
+    streak_str = (
+        f"{data['streak']}-win streak" if data['streak'] > 1
+        else f"{abs(data['streak'])}-loss streak" if data['streak'] < -1
+        else "no notable streak"
+    )
+
     prompt = f"""Roast this player named {data['name']}:
-- Credits: {data['credits']}c
-- Rank: {data['rank']} of {data['total_players']}
+- Credits: {data['credits']}c (rank {data['rank']} of {data['total_players']})
 - Total bets: {data['total_bets']} ({data['wins']} wins, {data['losses']} losses, {data['win_rate']}% win rate)
+- Average bet: {data['avg_bet']}c ({data['avg_bet_pct']}% of current credits) — low % = playing it safe
+- OU market usage: {data['ou_pct']}% of bets are over/under
+- Parlay record: {data['parlays_attempted']} attempted, {data['parlays_won']} won
+- Current streak: {streak_str}
+- Matches skipped (no bet placed): {data['skipped_matches']}
+- All-time net P&L from betting: {data['all_time_pl']}c
 - Today's P&L: {data['today_pl']}c
-- Open bets right now: {data['open_bets_count']}
 - Biggest loss: {f"{data['biggest_loss']['amount']}c on {data['biggest_loss']['outcome']}" if data['biggest_loss'] else 'none recorded'}
 - Most bet outcome: {f"{data['top_outcome'][0]} ({data['top_outcome'][1]} times)" if data['top_outcome'] else 'none'}
 - Is leaderboard leader: {data['is_leader']}
 - Is last place: {data['is_last']}
 - Tournament context: {prize_context}
-
-Give Katerina's roast. One or two sentences only. Mix up the angle — stats, behaviour, prize stakes, rank, whatever stings most for this player."""
+"""
+    if roast_angle:
+        prompt += f"
+Specific roast angle requested: {roast_angle}. Lead with this angle, use the stats as supporting ammunition."
+    else:
+        prompt += "
+Give Katerina's roast. One or two sentences only. Mix up the angle — stats, behaviour, bet sizing, prize stakes, rank, whatever stings most for this player."
 
     try:
         payload = json.dumps({
@@ -457,8 +518,9 @@ async def cmd_roast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_name = u.get("first_name") or u.get("username") or "someone"
 
     # Build roast data and generate
+    roast_angle = " ".join(context.args[1:]) if context.args and len(context.args) > 1 else None
     data = await _get_roast_data(target_uid)
-    roast = await _generate_roast(target_name, data)
+    roast = await _generate_roast(target_name, data, roast_angle=roast_angle)
     await update.message.reply_text(f"🎤 {roast}")
 
 
