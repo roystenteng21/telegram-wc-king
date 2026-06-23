@@ -188,46 +188,55 @@ def format_result_message(match: dict, settlements: list, parlay_wins: list = No
         lines.append("No bets placed on this match.")
         return "\n".join(lines)
 
-    def get_name_str(uid):
-        user = sheet.cache["users"].get(uid, {})
-        return (user.get("first_name") or user.get("username") or "?")[:10]
-
     def sort_key(s):
-        user = sheet.cache["users"].get(s["user_id"], {})
-        return (user.get("first_name") or user.get("username") or "").lower()
+        return _get_user_name(s["user_id"]).lower()
 
     # Separate singles from parlay legs
     singles = [s for s in settlements if not _is_parlay_leg(s)]
     parlay_legs = [s for s in settlements if _is_parlay_leg(s)]
 
     for s in sorted(singles, key=sort_key):
-        name = get_name_str(s["user_id"])
+        name = _get_user_name(s["user_id"])
         icon = "\u2705" if s["status"] == "won" else "\u274c"
-        lines.append(f"{name} \u2014 {_outcome_label(s['outcome'], match)} \u2014 {s['amount']}c {icon}")
+        lines.append(f"{name} \u2014 {_outcome_label(s['outcome'], match)} \u2014 {s['amount']:,}c {icon}")
 
-    # Parlay display — one line per parlay
+    # Parlay display — compact one-line format with icon sequence
+    parlay_section = []
+
+    # Won parlays (last leg just settled)
+    won_pids = set()
     if parlay_wins:
         for pid, p in parlay_wins:
-            name = get_name_str(p["user_id"])
-            legs_str = " \u00b7 ".join(f"{label} \u2705" for label in p["leg_labels"])
-            lines.append(f"\U0001f3b0 {name}: {legs_str} \u2014 {p['stake']}c \u2192 {p['payout']}c \U0001f525")
-    elif parlay_legs:
-        seen_pids = {}
-        for s in sorted(parlay_legs, key=sort_key):
-            pid = str(s.get("parlay_id", ""))
-            if pid not in seen_pids:
-                seen_pids[pid] = []
-            seen_pids[pid].append(s)
-        for pid, legs in seen_pids.items():
-            name = get_name_str(legs[0]["user_id"])
-            legs_str = " \u00b7 ".join(
-                f"{_outcome_label(l['outcome'], match)} {'✅' if l['status'] == 'won' else '❌'}"
-                for l in legs
-            )
-            stake = legs[0]["amount"]
-            all_lost = all(l["status"] == "lost" for l in legs)
-            suffix = "\u2014 dead \U0001f940" if all_lost else "\u2014 in play"
-            lines.append(f"\U0001f3b0 {name}: {legs_str} \u2014 {stake}c {suffix}")
+            won_pids.add(str(pid))
+            name = _get_user_name(p["user_id"])
+            icons = "\u2705" * p["legs"]
+            parlay_section.append(f"\U0001f3b0 {name} {icons} \u2014 {p['stake']:,}c \u2192 {p['payout']:,}c \U0001f525")
+
+    # In-play and bust parlays
+    seen_pids = set()
+    for s in sorted(parlay_legs, key=sort_key):
+        pid = str(s.get("parlay_id", ""))
+        if pid in seen_pids or pid in won_pids:
+            continue
+        seen_pids.add(pid)
+        name = _get_user_name(s["user_id"])
+        all_legs = sorted(sheet.get_parlay_bets(pid), key=lambda x: x.get("placed_at", ""))
+        icons = "".join(
+            "\u2705" if l["status"] == "won" else "\u274c" if l["status"] == "lost" else ""
+            for l in all_legs
+        )
+        settled_count = sum(1 for l in all_legs if l["status"] in ("won", "lost"))
+        total = len(all_legs)
+        stake = all_legs[0]["amount"] if all_legs else s["amount"]
+        is_bust = any(l["status"] == "lost" for l in all_legs)
+        if is_bust:
+            parlay_section.append(f"\U0001f940 {name} {icons} \u2014 parlay bust, {stake:,}c gone")
+        else:
+            parlay_section.append(f"\U0001f3b0 {name} {icons} \u2014 {settled_count}/{total} in play \u23f3")
+
+    if parlay_section:
+        lines.append("")
+        lines.extend(parlay_section)
 
     return "\n".join(lines)
 
