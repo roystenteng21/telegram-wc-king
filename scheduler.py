@@ -138,9 +138,12 @@ def _outcome_label(outcome: str, match: dict) -> str:
     return outcome.capitalize()
 
 
+_NAME_OVERRIDES = {"Shunnnnnn": "Shun", "Roysten": "Roy"}
+
 def _get_user_name(uid: int) -> str:
     user = sheet.cache["users"].get(uid, {})
-    return (user.get("first_name") or user.get("username") or "Someone")
+    name = user.get("first_name") or user.get("username") or "Someone"
+    return _NAME_OVERRIDES.get(name, name)
 
 
 def _get_sort_name(b: dict) -> str:
@@ -902,11 +905,9 @@ async def job_post_standings(match_ids: list):
         )
         today_parlay_ids.discard("")
 
-        for pid in today_parlay_ids:
-            # Skip already paid out (settled after last leg)
-            if pid in sheet.cache.get("paid_parlays", set()):
-                continue
+        parlay_already_paid = {}  # won parlays settled mid-day — display only, don't pay again
 
+        for pid in today_parlay_ids:
             legs = sheet.get_parlay_bets(pid)
             if not legs:
                 continue
@@ -925,7 +926,6 @@ async def job_post_standings(match_ids: list):
             if not settled_legs:
                 continue  # nothing settled yet
 
-            # Drop voided legs — recalculate multiplier on remaining settled legs
             all_won = all(b["status"] == "won" for b in settled_legs)
             effective_legs = len(settled_legs)
 
@@ -935,7 +935,7 @@ async def job_post_standings(match_ids: list):
                     continue
                 payout = int(stake * multiplier)
                 net = payout - stake
-                parlay_payouts[pid] = {
+                parlay_info = {
                     "user_id": uid,
                     "legs": effective_legs,
                     "stake": stake,
@@ -943,6 +943,10 @@ async def job_post_standings(match_ids: list):
                     "payout": payout,
                     "net": net
                 }
+                if pid in sheet.cache.get("paid_parlays", set()):
+                    parlay_already_paid[pid] = parlay_info  # already paid — display only
+                else:
+                    parlay_payouts[pid] = parlay_info  # pay + display
 
         # Credit parlay winners
         parlay_losses = {}  # parlay_id -> {uid, legs, stake}
@@ -960,10 +964,8 @@ async def job_post_standings(match_ids: list):
                     )
 
         # Collect losing parlays for display
-        # Do NOT skip paid_parlays here — losses are marked paid mid-day by settle_parlay
-        # and would otherwise never show the fallen rose at EOD
         for pid in today_parlay_ids:
-            if pid in parlay_payouts:
+            if pid in parlay_payouts or pid in parlay_already_paid:
                 continue  # already a winner, skip
             legs = sheet.get_parlay_bets(pid)
             if not legs:
@@ -1017,7 +1019,7 @@ async def job_post_standings(match_ids: list):
         sgt_date = datetime.now(SGT).strftime("%d %b")
         lines = [f"📅 End of Day — {sgt_date}\n"]
 
-        # Match results
+        # Match results with compact bet summary
         for m in sorted(today_matches, key=lambda x: x["kickoff_utc"]):
             if m["status"] == "FINISHED":
                 home_d = format_team(m["home"])
@@ -1025,20 +1027,42 @@ async def job_post_standings(match_ids: list):
                 ou_label = "Over 2.5" if m["ou_result"] == "over" else "Under 2.5"
                 lines.append(f"{home_d} {m['home_score']}–{m['away_score']} {away_d} · {ou_label}")
 
+                # Compact bet result: one ✅/❌ per player (best result if multiple bets)
+                match_bets = [
+                    b for b in sheet.cache["bets"]
+                    if str(b["match_id"]) == str(m["match_id"])
+                    and b["status"] in ("won", "lost")
+                ]
+                if match_bets:
+                    player_results = {}
+                    for b in match_bets:
+                        uid = b["user_id"]
+                        if uid not in player_results or b["status"] == "won":
+                            player_results[uid] = b["status"]
+                    bet_line = "  ".join(
+                        f"{_get_user_name(uid)} {'✅' if status == 'won' else '❌'}"
+                        for uid, status in sorted(player_results.items(), key=lambda x: _get_user_name(x[0]))
+                    )
+                    lines.append(bet_line)
+
         lines.append("\n🏆 Standings")
 
         for i, user in enumerate(standings_after, 1):
             name = _get_user_name(user["user_id"])
             credits = user["credits"]
             pl = pl_map.get(user["user_id"], 0)
-            pl_str = f"+{pl}c" if pl > 0 else f"{pl}c"
+            daily = tier_map.get(user["user_id"], 0)
+            pl_str = f"+{pl:,}c" if pl > 0 else f"{pl:,}c"
+            credits_str = f"{credits:,}"
+            daily_str = f", +{daily:,}c" if daily else ""
             badge = " 🏆" if i == 1 else ""
-            lines.append(f"{i}. {name}{badge} — {credits}c ({pl_str} today)")
+            lines.append(f"{i}. {name}{badge} — {credits_str}c ({pl_str}{daily_str})")
 
-        # Parlay section — right after standings
-        if parlay_payouts or parlay_losses:
+        # Parlay section — right after standings (all wins + losses)
+        all_parlay_wins = {**parlay_payouts, **parlay_already_paid}
+        if all_parlay_wins or parlay_losses:
             lines.append("")
-            for pid, p in parlay_payouts.items():
+            for pid, p in all_parlay_wins.items():
                 name = _get_user_name(p["user_id"])
                 lines.append(f"🎰 {name} hit a {p['legs']}-leg parlay! {p['stake']}c → {p['payout']}c 🔥")
             for pid, p in parlay_losses.items():
@@ -1052,8 +1076,8 @@ async def job_post_standings(match_ids: list):
         )
         parlay_win_str = ", ".join(
             f"{_get_user_name(p['user_id'])} hit {p['legs']}-leg parlay {p['stake']}c→{p['payout']}c"
-            for p in parlay_payouts.values()
-        ) if parlay_payouts else ""
+            for p in all_parlay_wins.values()
+        ) if all_parlay_wins else ""
         parlay_loss_str = ", ".join(
             f"{_get_user_name(p['user_id'])}'s {p['legs']}-leg parlay busted"
             for p in parlay_losses.values()
@@ -1088,7 +1112,8 @@ async def job_post_standings(match_ids: list):
 
         eod_prompt = (
             f"End of day for WC Kings 2026 ({days_to_final} days to the Final). "
-            f"Write 2-3 sharp, punchy sentences as Katerina the house bookie. Be specific — name names.\n"
+            f"Write 3 punchy sentences as Katerina the house bookie. Vary the focus — don't always lead with the leader. "
+            f"React to the biggest mover, tightest battle, worst collapse, or most dramatic result. Be specific — name names.\n"
             + (f"Today's matches: {match_results_str}\n" if match_results_str else "")
             + f"Standings:\n{standings_str}\n"
             + (f"Biggest winner today: {winner_str}\n" if winner_str else "")
@@ -1102,7 +1127,7 @@ async def job_post_standings(match_ids: list):
         )
 
         if pl_map:
-            commentary = await _katerina_line(eod_prompt, "", max_tokens=200)
+            commentary = await _katerina_line(eod_prompt, "", max_tokens=160)
         else:
             commentary = await _katerina_line(
                 "Nobody placed any bets today. Write one short, slightly mocking line about it. 1 sentence.",
@@ -1116,7 +1141,7 @@ async def job_post_standings(match_ids: list):
 
         tier_values = sorted(set(tier_map.values()))
         if len(tier_values) > 1:
-            lines.append(f"\n+{tier_values[0]}c–{tier_values[-1]}c daily credits added (by rank), good luck tomorrow! 🍀")
+            lines.append(f"\n+{tier_values[0]}c–{tier_values[-1]}c daily credits added by rank, good luck tomorrow! 🍀")
         else:
             lines.append(f"\n+{tier_values[0]}c daily credits added, good luck tomorrow! 🍀")
 
