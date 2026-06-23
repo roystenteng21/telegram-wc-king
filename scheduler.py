@@ -60,41 +60,54 @@ async def send_group(message: str, parse_mode: str = None):
 from helpers import is_silent_hours
 
 
-# ── CT date helper ────────────────────────────────────────────────────────────
-async def get_today_ct_matches() -> list:
-    """Return all matches whose kickoff falls on today's CT date."""
-    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
-    yesterday_utc = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
-    today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
-    tomorrow_utc = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d")
-
-    all_matches = (
-        await sheet.get_matches_for_date(yesterday_utc) +
-        await sheet.get_matches_for_date(today_utc) +
-        await sheet.get_matches_for_date(tomorrow_utc)
-    )
+# ── CT date helpers ───────────────────────────────────────────────────────────
+async def get_ct_date_matches(ct_date: str) -> list:
+    """Return all matches whose kickoff falls on the given CT date (YYYY-MM-DD).
+    Uses the match's own CT date — not datetime.now() — so restarts across midnight
+    never cause a match to be looked up against the wrong day's schedule."""
+    ct_dt = datetime.strptime(ct_date, "%Y-%m-%d")
+    seen = set()
+    all_matches = []
+    for delta in [-1, 0, 1]:
+        utc_date = (ct_dt + timedelta(days=delta)).strftime("%Y-%m-%d")
+        for m in await sheet.get_matches_for_date(utc_date):
+            if m["match_id"] not in seen:
+                seen.add(m["match_id"])
+                all_matches.append(m)
     result = []
     for m in all_matches:
         try:
-            kickoff_utc_dt = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-            if kickoff_utc_dt.astimezone(CT).strftime("%Y-%m-%d") == today_ct:
+            ko = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+            if ko.astimezone(CT).strftime("%Y-%m-%d") == ct_date:
                 result.append(m)
         except Exception:
             continue
     return result
 
 
+async def get_today_ct_matches() -> list:
+    """Return all matches whose kickoff falls on today's CT date."""
+    return await get_ct_date_matches(datetime.now(CT).strftime("%Y-%m-%d"))
+
+
 # ── Last match of day check ───────────────────────────────────────────────────
 async def is_last_match_of_day(match_id: str) -> bool:
-    """Returns True if match_id is the only unfinished match left on today's CT date."""
-    today_matches = await get_today_ct_matches()
-
-    for m in today_matches:
-        if str(m["match_id"]) == str(match_id):
-            continue
-        if m["status"] not in ("FINISHED", "CANCELLED", "POSTPONED"):
-            return False
-    return True
+    """Returns True if match_id has the latest kickoff on its own CT date.
+    Uses the match's kickoff to determine the CT date — not datetime.now() —
+    so this stays correct even when the bot restarts after midnight UTC."""
+    match = await sheet.get_match_by_id(match_id)
+    if not match or not match.get("kickoff_utc"):
+        return True
+    ko = datetime.strptime(match["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+    match_ct_date = ko.astimezone(CT).strftime("%Y-%m-%d")
+    day_matches = await get_ct_date_matches(match_ct_date)
+    if not day_matches:
+        return True
+    active = [m for m in day_matches if m.get("status") not in ("CANCELLED", "POSTPONED")]
+    if not active:
+        return True
+    latest = max(active, key=lambda m: m.get("kickoff_utc", ""))
+    return str(latest["match_id"]) == str(match_id)
 
 
 # ── Format helpers ────────────────────────────────────────────────────────────
@@ -140,6 +153,21 @@ def _is_parlay_leg(s: dict) -> bool:
     """Returns True if this bet is a parlay leg (not a single)."""
     pid = s.get("parlay_id", "")
     return bool(pid) and str(pid) not in ("", "0")
+
+
+def _format_bet_line(b: dict, match: dict) -> str:
+    """Standard bet line for all pre-match listings.
+    Singles: Name — outcome — amount c
+    Parlay legs: Name — outcome — 🎰 N/M (leg number from cache, no amount)"""
+    name = _get_user_name(b["user_id"])
+    outcome = _outcome_label(b["outcome"], match)
+    if _is_parlay_leg(b):
+        pid = b.get("parlay_id")
+        all_legs = sorted(sheet.get_parlay_bets(pid), key=lambda x: x.get("placed_at", ""))
+        total = len(all_legs)
+        leg_num = next((i + 1 for i, l in enumerate(all_legs) if l["bet_id"] == b["bet_id"]), "?")
+        return f"• {name} — {outcome} — 🎰 {leg_num}/{total}"
+    return f"• {name} — {outcome} — {b['amount']}c"
 
 
 def format_result_message(match: dict, settlements: list, parlay_wins: list = None) -> str:
@@ -305,7 +333,7 @@ async def job_night_reminder():
             if open_bets:
                 for b in sorted(open_bets, key=_get_sort_name):
                     name = _get_user_name(b["user_id"])
-                    lines.append(f"  {name} — {_outcome_label(b['outcome'], m)} — {b['amount']}c")
+                    lines.append(f"  {_format_bet_line(b, m)}")
                     bet_context_parts.append(f"{name} on {_outcome_label(b['outcome'], m)} for {format_match_teams(m['home'], m['away'])}")
             else:
                 lines.append("  No bets yet.")
@@ -359,8 +387,7 @@ async def job_prematch_summary(match_id: str):
         if sorted_bets:
             lines.append("Current bets:")
             for b in sorted_bets:
-                name = _get_user_name(b["user_id"])
-                lines.append(f"{name} — {_outcome_label(b['outcome'], match)} — {b['amount']}c")
+                lines.append(f"{_format_bet_line(b, match)}")
         else:
             lines.append("No bets placed yet.")
 
@@ -410,8 +437,7 @@ async def job_kickoff_message(match_id: str):
         ]
 
         for b in sorted_bets:
-            name = _get_user_name(b["user_id"])
-            lines.append(f"{name} — {_outcome_label(b['outcome'], match)} — {b['amount']}c")
+            lines.append(f"{_format_bet_line(b, match)}")
 
         # Suppress during silent hours unless this is the last match
         if is_silent_hours() and not await is_last_match_of_day(match_id):
@@ -566,7 +592,7 @@ async def _auto_settle_stuck_match(match_id: str):
 
         await dm_admin(f"ℹ️ Match {match_id} was auto-settled and result posted to group.")
         logger.info(f"Auto-settled stuck match {match_id}")
-        await check_all_matches_done()
+        await check_all_matches_done(match_id)
 
     except Exception as e:
         logger.error(f"Auto-settle failed for {match_id}: {e}")
@@ -699,7 +725,7 @@ async def job_poll_result(match_id: str, attempt: int = 1):
                 await _send_coming_up_today()
 
         # Check if all matches today are done
-        await check_all_matches_done()
+        await check_all_matches_done(match_id)
 
     except Exception as e:
         logger.error(f"Poll result job failed for {match_id}: {e}")
@@ -777,8 +803,7 @@ async def _send_coming_up_today():
             open_bets = [b for b in sheet.cache["bets"] if b["match_id"] == str(m["match_id"]) and b["status"] == "open"]
             if open_bets:
                 for b in sorted(open_bets, key=_get_sort_name):
-                    name = _get_user_name(b["user_id"])
-                    lines.append(f"{name} — {_outcome_label(b['outcome'], m)} — {b['amount']}c")
+                    lines.append(f"  {_format_bet_line(b, m)}")
 
         await send_group("\n".join(lines))
         logger.info("Coming up today sent")
@@ -808,30 +833,39 @@ def _schedule_poll(match_id: str, delay_seconds: int, attempt: int):
 
 
 # ── Check all matches done → fire standings ───────────────────────────────────
-async def check_all_matches_done():
+async def check_all_matches_done(match_id: str = None):
+    """Fire EOD when the last match of the CT day is finished.
+    Pass match_id to resolve the correct CT date from the match's kickoff —
+    avoids wrong-day lookups when the bot restarts after midnight UTC."""
     try:
-        today_matches = await get_today_ct_matches()
+        if match_id:
+            match = await sheet.get_match_by_id(match_id)
+            if not match or not match.get("kickoff_utc"):
+                return
+            ko = datetime.strptime(match["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+            target_ct_date = ko.astimezone(CT).strftime("%Y-%m-%d")
+        else:
+            target_ct_date = datetime.now(CT).strftime("%Y-%m-%d")
 
+        today_matches = await get_ct_date_matches(target_ct_date)
         if not today_matches:
             return
 
-        all_done = all(
-            m["status"] in ("FINISHED", "CANCELLED", "POSTPONED")
-            for m in today_matches
-        )
-
-        if not all_done:
+        # Guard against double-fire
+        if sheet.cache.get("eod_date") == target_ct_date:
+            logger.info(f"EOD already fired for CT {target_ct_date}, skipping")
             return
 
-        # Guard against double-fire — check if EOD already ran today
-        today_ct = datetime.now(CT).strftime("%Y-%m-%d")
-        eod_date = sheet.cache.get("eod_date")
-        if eod_date == today_ct:
-            logger.info("EOD already fired today, skipping duplicate")
+        # EOD fires when the last match by kickoff time is finished
+        active = [m for m in today_matches if m.get("status") not in ("CANCELLED", "POSTPONED")]
+        if not active:
+            return
+        latest = max(active, key=lambda m: m.get("kickoff_utc", ""))
+        if latest["status"] not in ("FINISHED", "CANCELLED", "POSTPONED"):
             return
 
-        sheet.cache["eod_date"] = today_ct
-        logger.info("All matches done — firing standings")
+        sheet.cache["eod_date"] = target_ct_date
+        logger.info(f"Last match done for CT {target_ct_date} — firing standings")
         match_ids = [str(m["match_id"]) for m in today_matches]
         await job_post_standings(match_ids)
 
