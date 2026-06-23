@@ -194,10 +194,31 @@ async def cmd_admin_eod_push(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text(f"⚠️ Failed: {e}")
         return
 
-    # Step 1: preview and ask for confirmation
+    # Step 1: auto-detect correct CT date and preview
     try:
-        all_matches = await sched.get_today_ct_matches()
+        import pytz as _pytz
+        _CT = _pytz.timezone("America/Chicago")
+        today_ct = datetime.now(_CT).strftime("%Y-%m-%d")
+        yesterday_ct = (datetime.now(_CT) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        # Find most recent CT day with finished matches that hasn't had EOD yet
+        all_matches = []
+        target_ct = None
+        for ct_date in [yesterday_ct, today_ct]:
+            if sheet.cache.get("eod_date") == ct_date:
+                continue
+            candidates = await sched.get_ct_date_matches(ct_date)
+            if any(m.get("status") == "FINISHED" for m in candidates):
+                all_matches = candidates
+                target_ct = ct_date
+                break
+
+        if not all_matches:
+            all_matches = await sched.get_today_ct_matches()
+            target_ct = today_ct
+
         match_ids = [m["match_id"] for m in all_matches]
+        finished_count = sum(1 for m in all_matches if m.get("status") == "FINISHED")
 
         _admin_pending[ADMIN_TELEGRAM_ID] = {
             "action": "eod_push",
@@ -205,7 +226,7 @@ async def cmd_admin_eod_push(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "expires": datetime.now(UTC) + timedelta(seconds=120)
         }
         await update.message.reply_text(
-            f"About to push EOD message for {len(match_ids)} match(es) + add daily credits.\n\n"
+            f"EOD for CT {target_ct} — {finished_count} finished match(es), {len(match_ids)} total.\n\n"
             f"Run /admin_eod_push confirm to proceed."
         )
     except Exception as e:

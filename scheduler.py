@@ -1013,7 +1013,9 @@ async def job_post_standings(match_ids: list):
                     overtakes.append((uid, passed_uid))
 
         # Build EOD message
-        lines = ["📅 End of Day\n"]
+        from datetime import date as _date_cls
+        sgt_date = datetime.now(SGT).strftime("%d %b")
+        lines = [f"📅 End of Day — {sgt_date}\n"]
 
         # Match results
         for m in sorted(today_matches, key=lambda x: x["kickoff_utc"]):
@@ -1061,14 +1063,42 @@ async def job_post_standings(match_ids: list):
             for uid, passed in overtakes
         ) if overtakes else ""
 
+        # Additional context for Katerina
+        from datetime import date as _date_cls
+        days_to_final = (TOURNAMENT_FINAL_DATE - _date_cls.today()).days
+
+        match_results_str = ", ".join(
+            f"{m['home']} {m['home_score']}-{m['away_score']} {m['away']}"
+            for m in sorted(today_matches, key=lambda x: x["kickoff_utc"])
+            if m["status"] == "FINISHED"
+        ) if today_matches else ""
+
+        if pl_map:
+            top_winner_uid = max(pl_map, key=lambda uid: pl_map[uid])
+            top_loser_uid = min(pl_map, key=lambda uid: pl_map[uid])
+            winner_str = f"{_get_user_name(top_winner_uid)} +{pl_map[top_winner_uid]}c" if pl_map[top_winner_uid] > 0 else ""
+            loser_str = f"{_get_user_name(top_loser_uid)} {pl_map[top_loser_uid]}c" if pl_map[top_loser_uid] < 0 else ""
+        else:
+            winner_str = loser_str = ""
+
+        gap_str = ""
+        if len(standings_after) >= 2:
+            gap = standings_after[0]["credits"] - standings_after[1]["credits"]
+            gap_str = f"{_get_user_name(standings_after[0]['user_id'])} leads by {gap}c"
+
         eod_prompt = (
-            f"End of day for WC Kings 2026. Write 2-3 sharp, punchy sentences as Katerina the house bookie. "
-            f"React to today's results and standings. Hype the winner, roast the loser, note any overtakes. "
-            f"Standings:\n{standings_str}\n"
+            f"End of day for WC Kings 2026 ({days_to_final} days to the Final). "
+            f"Write 2-3 sharp, punchy sentences as Katerina the house bookie. Be specific — name names.\n"
+            + (f"Today's matches: {match_results_str}\n" if match_results_str else "")
+            + f"Standings:\n{standings_str}\n"
+            + (f"Biggest winner today: {winner_str}\n" if winner_str else "")
+            + (f"Biggest loser today: {loser_str}\n" if loser_str else "")
+            + (f"Leader gap: {gap_str}\n" if gap_str else "")
             + (f"Parlay wins: {parlay_win_str}\n" if parlay_win_str else "")
             + (f"Parlay losses: {parlay_loss_str}\n" if parlay_loss_str else "")
             + (f"Overtakes: {overtake_str}\n" if overtake_str else "")
-            + "No markdown. No hashtags. Be specific — name names."
+            + "No markdown. No hashtags. Hype the winner, roast the loser. "
+            + "Reference the prize (champion jersey + dining vouchers for 1st, runner-up jersey for 2nd) for extra sting."
         )
 
         if pl_map:
