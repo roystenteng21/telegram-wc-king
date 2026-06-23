@@ -43,16 +43,36 @@ def get_user_lock(user_id: int) -> asyncio.Lock:
         _user_locks[user_id] = asyncio.Lock()
     return _user_locks[user_id]
 
-# ── Sheet client ─────────────────────────────────────────────────────────────
+# ── Sheet client — cached to avoid open_by_key() on every write ──────────────
+_cached_client = None
+_cached_spreadsheet = None
+
+
 def get_client():
-    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-    return gspread.authorize(creds)
+    global _cached_client
+    if _cached_client is None:
+        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+        _cached_client = gspread.authorize(creds)
+    return _cached_client
+
+
+def get_spreadsheet():
+    global _cached_spreadsheet
+    if _cached_spreadsheet is None:
+        _cached_spreadsheet = get_client().open_by_key(SPREADSHEET_ID)
+    return _cached_spreadsheet
+
 
 def get_sheet(tab_name: str):
-    client = get_client()
-    spreadsheet = client.open_by_key(SPREADSHEET_ID)
-    return spreadsheet.worksheet(tab_name)
+    global _cached_client, _cached_spreadsheet
+    try:
+        return get_spreadsheet().worksheet(tab_name)
+    except Exception:
+        # Force full reconnect on error (expired token, network drop, etc.)
+        _cached_client = None
+        _cached_spreadsheet = None
+        return get_spreadsheet().worksheet(tab_name)
 
 # ── Retry wrapper ────────────────────────────────────────────────────────────
 async def with_retry(fn, *args, retries=3, delay=2, **kwargs):
@@ -60,17 +80,20 @@ async def with_retry(fn, *args, retries=3, delay=2, **kwargs):
         try:
             return fn(*args, **kwargs)
         except Exception as e:
+            # Never retry on rate limit — it makes the quota worse
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                raise
             if attempt < retries - 1:
                 await asyncio.sleep(delay * (2 ** attempt))
             else:
-                raise e
+                raise
 
 # ── Cache refresh ────────────────────────────────────────────────────────────
 async def refresh_cache(notify_fn=None):
     """Rebuild in-memory cache from sheet. Also rebuilds row index cache."""
     try:
-        client = get_client()
-        spreadsheet = client.open_by_key(SPREADSHEET_ID)
+        spreadsheet = get_spreadsheet()
 
         # Users
         users_ws = spreadsheet.worksheet(SHEET_USERS)

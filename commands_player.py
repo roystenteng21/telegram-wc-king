@@ -198,7 +198,7 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         all_legs = sheet.get_parlay_bets(pid)
                         total_legs = len(all_legs)
                         from config import PARLAY_MULTIPLIERS
-                        multiplier = PARLAY_MULTIPLIERS.get(total_legs, PARLAY_MULTIPLIERS.get(4, 10.0))
+                        multiplier = PARLAY_MULTIPLIERS.get(total_legs, min(PARLAY_MULTIPLIERS.values()))
                         parlay_summary[pid] = {
                             "name": name,
                             "total_legs": total_legs,
@@ -362,9 +362,14 @@ async def cmd_mybets(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not legs:
             continue
         stake = legs[0]["amount"]
-        multiplier = PARLAY_MULTIPLIERS.get(len(legs), PARLAY_MULTIPLIERS.get(4, 10.0))
-        potential = int(stake * multiplier)
-        lines.append(f"\n🎰 Parlay ({len(legs)}-leg · {stake}c → {potential}c if all win):")
+        num_legs = len(legs)
+        if num_legs < 2:
+            # Incomplete parlay — partial placement failure, show as warning
+            lines.append(f"\n⚠️ Incomplete parlay (1 leg placed — use /cancelparlay to refund {stake}c):")
+        else:
+            multiplier = PARLAY_MULTIPLIERS.get(num_legs, min(PARLAY_MULTIPLIERS.values()))
+            potential = int(stake * multiplier)
+            lines.append(f"\n🎰 Parlay ({num_legs}-leg · {stake}c → {potential}c if all win):")
         for leg in legs:
             match = await sheet.get_match_by_id(leg["match_id"])
             if match:
@@ -397,7 +402,7 @@ async def cmd_mybets(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for pid in alive_parlay_ids:
             legs = sheet.get_parlay_bets(pid)
             if legs:
-                multiplier = PARLAY_MULTIPLIERS.get(len(legs), PARLAY_MULTIPLIERS.get(4, 10.0))
+                multiplier = PARLAY_MULTIPLIERS.get(len(legs), min(PARLAY_MULTIPLIERS.values()))
                 bet_parts.append(f"{len(legs)}-leg parlay ({legs[0]['amount']}c → {int(legs[0]['amount'] * multiplier)}c)")
         if bet_parts:
             prompt = (
@@ -590,6 +595,29 @@ async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Bet placement failed for {user.id}: {e}")
         await update.message.reply_text("Something went wrong placing your bet. Please try again.")
         await dm_admin(f"⚠️ Bet placement failed for user {user.id}: {e}")
+
+
+async def _rollback_parlay(first_bet_id: str, user_id: int, amount: int, parlay_id: str):
+    """Guaranteed rollback: cancel bet + restore credits. Falls back to direct credit fix if sheet fails."""
+    try:
+        await sheet.cancel_bet(first_bet_id, user_id)
+    except Exception:
+        # cancel_bet failed (likely 429) — force-restore credits directly
+        try:
+            current = sheet.cache["users"].get(user_id, {}).get("credits", 0)
+            restored = current + amount
+            await sheet.update_user_credits(user_id, restored, notify_fn=dm_admin)
+            await sheet.append_ledger(user_id, "refund", amount, restored,
+                                      f"Parlay {parlay_id} rollback refund", dm_admin)
+            # Mark stuck leg void in cache so it doesn't show in mybets
+            for b in sheet.cache["bets"]:
+                if b.get("parlay_id") == parlay_id and b["status"] == "open":
+                    b["status"] = "void"
+        except Exception as fallback_err:
+            await dm_admin(
+                f"⚠️ Parlay rollback failed for user {user_id} — "
+                f"manual refund of {amount}c needed. Error: {fallback_err}"
+            )
 
 
 # ── /cancelbet ────────────────────────────────────────────────────────────────
@@ -852,22 +880,14 @@ async def cmd_parlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_por_intervention(update, user.id, amount, por_legs[0]["match"])
 
     except ValueError as e:
-        # Rollback — cancel first leg only (only leg that deducted credits)
         if placed_bet_ids:
-            try:
-                await sheet.cancel_bet(placed_bet_ids[0], user.id)
-            except Exception:
-                pass
+            await _rollback_parlay(placed_bet_ids[0], user.id, amount, parlay_id)
         await update.message.reply_text(str(e))
     except Exception as e:
-        # Rollback — cancel first leg only
         if placed_bet_ids:
-            try:
-                await sheet.cancel_bet(placed_bet_ids[0], user.id)
-            except Exception:
-                pass
+            await _rollback_parlay(placed_bet_ids[0], user.id, amount, parlay_id)
         logger.error(f"Parlay placement failed for {user.id}: {e}")
-        await update.message.reply_text("Something went wrong placing your parlay. All legs rolled back.")
+        await update.message.reply_text("Something went wrong placing your parlay. Credits refunded.")
         await dm_admin(f"⚠️ Parlay placement failed for user {user.id}: {e}")
 
 
