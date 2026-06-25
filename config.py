@@ -260,7 +260,10 @@ STATUS_CANCELLED = "CANCELLED"
 STATUS_POSTPONED = "POSTPONED"
 
 # Parlay multipliers by number of legs
-PARLAY_MULTIPLIERS = {2: 4.5, 3: 8.0, 4: 16.0}
+PARLAY_MULTIPLIERS = {2: 4.5, 3: 8.0, 4: 16.0, 5: 32.0, 6: 64.0}
+
+# Display name overrides (Telegram first_name → short display name)
+NAME_OVERRIDES = {"Shunnnnnn": "Shun", "Roysten": "Roy"}
 
 # Tiered daily credits by rank (rank 1 = best = lowest top-up, rank N = worst = highest)
 # Tied players all receive the most generous tier in their tied group

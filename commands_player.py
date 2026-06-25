@@ -7,7 +7,7 @@ from telegram.ext import ContextTypes
 from config import (
     ADMIN_TELEGRAM_ID, SGT, UTC, TEAM_DISPLAY,
     RESULT_OUTCOMES, ALL_OUTCOMES,
-    SESSION_EXPIRY, BET_LOCK_BUFFER, PARLAY_MULTIPLIERS
+    SESSION_EXPIRY, BET_LOCK_BUFFER, PARLAY_MULTIPLIERS, NAME_OVERRIDES
 )
 import sheet
 import scheduler as sched
@@ -49,6 +49,31 @@ from helpers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _display_name(user_dict: dict) -> str:
+    """Apply name overrides and truncate for display."""
+    name = truncate(user_dict.get("first_name") or user_dict.get("username") or "?")
+    return NAME_OVERRIDES.get(name, name)
+
+
+def _get_in_bet(user_id: int) -> int:
+    """Credits currently tied up in active bets (singles + one stake per alive parlay)."""
+    open_bets = [b for b in sheet.cache.get("bets", []) if b["user_id"] == user_id and b["status"] == "open"]
+
+    def _has_pid(b):
+        pid = b.get("parlay_id", "")
+        return bool(pid) and str(pid) not in ("", "0")
+
+    singles_stake = sum(b["amount"] for b in open_bets if not _has_pid(b))
+    seen_parlays = set()
+    parlay_stake = 0
+    for b in open_bets:
+        pid = b.get("parlay_id", "")
+        if _has_pid(b) and pid not in seen_parlays and sheet.is_parlay_alive(pid):
+            seen_parlays.add(pid)
+            parlay_stake += b["amount"]
+    return singles_stake + parlay_stake
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -179,7 +204,7 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append("Bets:")
             for b in open_or_settled:
                 user = sheet.cache["users"].get(b["user_id"])
-                name = truncate(user.get("first_name") or user.get("username") or "?") if user else "?"
+                name = _display_name(user) if user else "?"
                 outcome_label = format_outcome_label(b["outcome"], m)
                 if b["status"] == "won":
                     icon = " ✅"
@@ -211,7 +236,7 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     total = parlay_summary[pid]["total_legs"]
                     lines.append(f"• {name} — {outcome_label}{icon} — 🎰 {leg_num}/{total}")
                 else:
-                    lines.append(f"• {name} — {outcome_label} — {b['amount']}c{icon}")
+                    lines.append(f"• {name} — {outcome_label} — {b['amount']:,}c{icon}")
 
         lines.append("")  # blank line between matches
 
@@ -220,7 +245,7 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("🎰 Parlays")
         for pid, p in parlay_summary.items():
             potential = int(p["stake"] * p["multiplier"])
-            lines.append(f"• {p['name']} — {p['total_legs']}-leg · {p['stake']}c → {potential}c if all win")
+            lines.append(f"• {p['name']} — {p['total_legs']}-leg · {p['stake']:,}c → {potential:,}c if all win")
         lines.append("")
 
     # Katerina commentary — day overview, light banter
@@ -232,7 +257,7 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 match_bets = [b for b in all_open_bets if b["match_id"] == str(m["match_id"])]
                 for b in match_bets:
                     user = sheet.cache["users"].get(b["user_id"], {})
-                    name = truncate(user.get("first_name") or user.get("username") or "?")
+                    name = _display_name(user) if user else "?"
                     pid = b.get("parlay_id", "")
                     is_parlay = bool(pid) and str(pid) not in ("", "0")
                     label = format_outcome_label(b["outcome"], m)
@@ -257,8 +282,13 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data = await ensure_registered(update)
     credits = user_data["credits"]
-    name = truncate(update.effective_user.first_name or "")
-    await update.message.reply_text(f"💰 {name}, your balance: {credits} credits")
+    user_dict = sheet.cache["users"].get(update.effective_user.id, {})
+    name = _display_name(user_dict) if user_dict else truncate(update.effective_user.first_name or "")
+    in_bet = _get_in_bet(update.effective_user.id)
+    if in_bet > 0:
+        await update.message.reply_text(f"💰 {name}, your balance: {credits:,}c (+{in_bet:,}c in active bets)")
+    else:
+        await update.message.reply_text(f"💰 {name}, your balance: {credits:,}c")
 
 
 # ── /groups ───────────────────────────────────────────────────────────────────
@@ -307,9 +337,13 @@ async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["🏆 Leaderboard\n"]
     for i, user in enumerate(standings, 1):
-        name = truncate(user.get("first_name") or user.get("username") or "Unknown")
+        name = _display_name(user)
         badge = " 🏆" if i == 1 else ""
-        lines.append(f"{i}. {name}{badge} — {user['credits']}c")
+        in_bet = _get_in_bet(user["user_id"])
+        credits_str = f"{user['credits']:,}c"
+        if in_bet > 0:
+            credits_str += f" (+{in_bet:,}c live)"
+        lines.append(f"{i}. {name}{badge} — {credits_str}")
 
     await update.message.reply_text("\n".join(lines))
 
@@ -354,7 +388,7 @@ async def cmd_mybets(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 label = f"{home} vs {away} — {outcome_label}"
             else:
                 label = f"Match {bet['match_id']} — {bet['outcome'].capitalize()}"
-            lines.append(f"{i}. {label} — {bet['amount']}c")
+            lines.append(f"{i}. {label} — {bet['amount']:,}c")
 
     # Parlays
     for pid in alive_parlay_ids:
@@ -365,11 +399,11 @@ async def cmd_mybets(update: Update, context: ContextTypes.DEFAULT_TYPE):
         num_legs = len(legs)
         if num_legs < 2:
             # Incomplete parlay — partial placement failure, show as warning
-            lines.append(f"\n⚠️ Incomplete parlay (1 leg placed — use /cancelparlay to refund {stake}c):")
+            lines.append(f"\n⚠️ Incomplete parlay (1 leg placed — use /cancelparlay to refund {stake:,}c):")
         else:
             multiplier = PARLAY_MULTIPLIERS.get(num_legs, min(PARLAY_MULTIPLIERS.values()))
             potential = int(stake * multiplier)
-            lines.append(f"\n🎰 Parlay ({num_legs}-leg · {stake}c → {potential}c if all win):")
+            lines.append(f"\n🎰 Parlay ({num_legs}-leg · {stake:,}c → {potential:,}c if all win):")
         for leg in legs:
             match = await sheet.get_match_by_id(leg["match_id"])
             if match:
@@ -391,19 +425,19 @@ async def cmd_mybets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Katerina one-liner on the player's bets
     try:
         user_data = sheet.cache["users"].get(user_id, {})
-        name = truncate(user_data.get("first_name") or user_data.get("username") or "?")
+        name = _display_name(user_data) if user_data else "?"
         bet_parts = []
         for bet in singles:
             match = await sheet.get_match_by_id(bet["match_id"])
             if match:
                 label = format_outcome_label(bet["outcome"], match)
                 match_label = f"{format_team(match['home'])} vs {format_team(match['away'])}"
-                bet_parts.append(f"{label} on {match_label} ({bet['amount']}c)")
+                bet_parts.append(f"{label} on {match_label} ({bet['amount']:,}c)")
         for pid in alive_parlay_ids:
             legs = sheet.get_parlay_bets(pid)
             if legs:
                 multiplier = PARLAY_MULTIPLIERS.get(len(legs), min(PARLAY_MULTIPLIERS.values()))
-                bet_parts.append(f"{len(legs)}-leg parlay ({legs[0]['amount']}c → {int(legs[0]['amount'] * multiplier)}c)")
+                bet_parts.append(f"{len(legs)}-leg parlay ({legs[0]['amount']:,}c → {int(legs[0]['amount'] * multiplier):,}c)")
         if bet_parts:
             prompt = (
                 f"{name} has these open bets: {', '.join(bet_parts)}. "
@@ -469,7 +503,7 @@ async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if user_data["credits"] < amount:
-            await update.message.reply_text(f"Insufficient credits. Balance: {user_data['credits']}c")
+            await update.message.reply_text(f"Insufficient credits. Balance: {user_data['credits']:,}c")
             return
 
         option_str = event["options"][option_idx - 1]
@@ -487,8 +521,8 @@ async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             confirm_msg = (
                 f"✅ Bet placed!\n"
                 f"{event['question']}\n"
-                f"{flag_code} — {amount}c\n"
-                f"Balance: {new_balance}c"
+                f"{flag_code} — {amount:,}c\n"
+                f"Balance: {new_balance:,}c"
             )
             await send_confirmation(update, confirm_msg)
         except Exception as e:
@@ -523,7 +557,7 @@ async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check credits
     if user_data["credits"] < amount:
         await update.message.reply_text(
-            f"Insufficient credits. Your balance: {user_data['credits']}c"
+            f"Insufficient credits. Your balance: {user_data['credits']:,}c"
         )
         return
 
@@ -579,8 +613,8 @@ async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         confirm_msg = (
             f"✅ Bet placed!\n"
             f"{home} vs {away}\n"
-            f"{outcome_label} — {amount}c\n"
-            f"Balance: {new_balance}c"
+            f"{outcome_label} — {amount:,}c\n"
+            f"Balance: {new_balance:,}c"
         )
 
         await send_confirmation(update, confirm_msg)
@@ -682,8 +716,8 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 match_line = f"Match {bet['match_id']} — {outcome_label}"
             await update.message.reply_text(
                 f"✅ Bet cancelled.\n"
-                f"{match_line} — {bet['amount']}c refunded.\n"
-                f"Balance: {new_balance}c"
+                f"{match_line} — {bet['amount']:,}c refunded.\n"
+                f"Balance: {new_balance:,}c"
             )
         except Exception as e:
             await update.message.reply_text("Failed to cancel bet. Please try again.")
@@ -706,7 +740,7 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 label = f"{home} vs {away} — {outcome_label}"
         else:
             label = f"Match {bet['match_id']} — {bet['outcome'].capitalize()}"
-        lines.append(f"{i}. {label} — {bet['amount']}c")
+        lines.append(f"{i}. {label} — {bet['amount']:,}c")
 
     lines.append("\nReply /cancel [number] to cancel.")
 
@@ -735,7 +769,7 @@ async def cmd_parlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Usage: /parlay [amount], [team] [win|draw|loss], ...\n"
             "Example: /parlay 50, mexico win, brazil draw\n\n"
-            "Multipliers: 2 legs = 2.5x · 3 legs = 5x · 4 legs = 10x\n"
+            "Multipliers: 2-leg 4.5x · 3-leg 8x · 4-leg 16x · 5-leg 32x · 6-leg 64x\n"
             "Result/draw bets only. All legs must win."
         )
         return
@@ -761,12 +795,12 @@ async def cmd_parlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(leg_parts) < 2:
         await update.message.reply_text("Need at least 2 legs.")
         return
-    if len(leg_parts) > 4:
-        await update.message.reply_text("Maximum 4 legs per parlay.")
+    if len(leg_parts) > 6:
+        await update.message.reply_text("Maximum 6 legs per parlay.")
         return
 
     if user_data["credits"] < amount:
-        await update.message.reply_text(f"Insufficient credits. Balance: {user_data['credits']}c")
+        await update.message.reply_text(f"Insufficient credits. Balance: {user_data['credits']:,}c")
         return
 
     # Validate all legs before placing anything
@@ -868,8 +902,8 @@ async def cmd_parlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 outcome_label = leg["outcome_display"]
             lines.append(f"{i}. {home} vs {away} — {outcome_label}")
-        lines.append(f"\nStake: {amount}c · Win all → {potential_return}c back")
-        lines.append(f"Balance: {new_balance}c")
+        lines.append(f"\nStake: {amount:,}c · Win all → {potential_return:,}c back")
+        lines.append(f"Balance: {new_balance:,}c")
 
         confirm_msg = "\n".join(lines)
         await send_confirmation(update, confirm_msg)
@@ -946,8 +980,8 @@ async def cmd_cancelparlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stake = legs[0]["amount"]
             await update.message.reply_text(
                 f"✅ Parlay cancelled.\n"
-                f"{count} leg(s) voided · {stake}c refunded.\n"
-                f"Balance: {new_balance}c"
+                f"{count} leg(s) voided · {stake:,}c refunded.\n"
+                f"Balance: {new_balance:,}c"
             )
         except Exception as e:
             await update.message.reply_text("Failed to cancel parlay. Please try again.")
@@ -981,8 +1015,8 @@ async def cmd_cancelparlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stake = legs[0]["amount"] if legs else 0
             await update.message.reply_text(
                 f"✅ Parlay cancelled.\n"
-                f"{count} leg(s) voided · {stake}c refunded.\n"
-                f"Balance: {new_balance}c"
+                f"{count} leg(s) voided · {stake:,}c refunded.\n"
+                f"Balance: {new_balance:,}c"
             )
         except Exception as e:
             await update.message.reply_text("Failed to cancel parlay. Please try again.")
@@ -1006,7 +1040,7 @@ async def cmd_cancelparlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 away = format_team(match["away"])
                 outcome_label = format_outcome_label(leg["outcome"], match)
                 leg_lines.append(f"{home} vs {away} — {outcome_label}")
-        lines.append(f"{i}. {stake}c · {multiplier}x")
+        lines.append(f"{i}. {stake:,}c · {multiplier}x")
         for ll in leg_lines:
             lines.append(f"   {ll}")
         parlay_list.append({"parlay_id": pid, "legs": legs})

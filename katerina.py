@@ -13,7 +13,7 @@ from telegram.ext import ContextTypes
 from config import (
     ADMIN_TELEGRAM_ID, SGT, UTC,
     ANTHROPIC_API_KEY, TOURNAMENT_STAGES, TOURNAMENT_FINAL_DATE,
-    PRIZE_INFO, PRIZE_PLAYER_COUNT
+    PRIZE_INFO, PRIZE_PLAYER_COUNT, NAME_OVERRIDES
 )
 import sheet
 from helpers import (
@@ -45,6 +45,25 @@ def _get_current_stage() -> str:
     return "Unknown"
 
 
+def _get_in_bet_for_katerina(user_id: int) -> int:
+    """Credits currently tied up in active bets (singles + one stake per alive parlay)."""
+    open_bets = [b for b in sheet.cache.get("bets", []) if b["user_id"] == user_id and b["status"] == "open"]
+
+    def _has_pid(b):
+        pid = b.get("parlay_id", "")
+        return bool(pid) and str(pid) not in ("", "0")
+
+    singles_stake = sum(b["amount"] for b in open_bets if not _has_pid(b))
+    seen_parlays = set()
+    parlay_stake = 0
+    for b in open_bets:
+        pid = b.get("parlay_id", "")
+        if _has_pid(b) and pid not in seen_parlays and sheet.is_parlay_alive(pid):
+            seen_parlays.add(pid)
+            parlay_stake += b["amount"]
+    return singles_stake + parlay_stake
+
+
 def _build_katerina_context() -> str:
     """Build a snapshot of current bot state for Katerina's system prompt."""
     now_sgt = datetime.now(SGT)
@@ -58,8 +77,12 @@ def _build_katerina_context() -> str:
     standings = sheet.get_standings()
     standings_lines = []
     for i, u in enumerate(standings, 1):
-        name = truncate(u.get("first_name") or u.get("username") or "Unknown")
-        standings_lines.append(f"{i}. {name} — {u['credits']}c")
+        raw_name = truncate(u.get("first_name") or u.get("username") or "Unknown")
+        name = NAME_OVERRIDES.get(raw_name, raw_name)
+        in_bet = _get_in_bet_for_katerina(u["user_id"])
+        effective = u["credits"] + in_bet
+        credit_str = f"{u['credits']:,}c" + (f" (+{in_bet:,}c in bets = {effective:,}c total)" if in_bet > 0 else "")
+        standings_lines.append(f"{i}. {name} — {credit_str}")
 
     today_ct = datetime.now(CT).strftime("%Y-%m-%d")
 
@@ -89,7 +112,8 @@ def _build_katerina_context() -> str:
     # Per-player bet summary
     player_bet_lines = []
     for uid, u in sheet.cache.get("users", {}).items():
-        name = truncate(u.get("first_name") or u.get("username") or "Unknown")
+        raw_name = truncate(u.get("first_name") or u.get("username") or "Unknown")
+        name = NAME_OVERRIDES.get(raw_name, raw_name)
         user_bets = [b for b in sheet.cache["bets"] if b["user_id"] == uid]
 
         def _has_pid(b):
@@ -111,7 +135,7 @@ def _build_katerina_context() -> str:
             m = sheet.cache["matches"].get(str(b["match_id"]), {})
             try:
                 ko = datetime.strptime(m.get("kickoff_utc", ""), "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-                if ko.astimezone(CT_local).strftime("%Y-%m-%d") == today_ct_local:
+                if ko.astimezone(CT).strftime("%Y-%m-%d") == today_ct_local:
                     today_settled.append(b)
             except Exception:
                 continue
@@ -218,8 +242,11 @@ Current bot state:
 async def _get_roast_data(target_uid: int) -> dict:
     """Build roast data for a specific user."""
     user = sheet.cache["users"].get(target_uid, {})
-    name = truncate(user.get("first_name") or user.get("username") or "that sucker")
+    raw_name = truncate(user.get("first_name") or user.get("username") or "that sucker")
+    name = NAME_OVERRIDES.get(raw_name, raw_name)
     credits = user.get("credits", 0)
+    in_bet = _get_in_bet_for_katerina(target_uid)
+    effective_credits = credits + in_bet
     standings = sheet.get_standings()
     rank = next((i+1 for i, u in enumerate(standings) if u["user_id"] == target_uid), None)
     total_players = len(standings)
@@ -255,9 +282,9 @@ async def _get_roast_data(target_uid: int) -> dict:
     outcome_counts = Counter(b["outcome"] for b in all_bets)
     top_outcome = outcome_counts.most_common(1)[0] if outcome_counts else None
 
-    # Avg bet size as % of current credits (bet cowardice indicator)
+    # Avg bet size as % of effective credits (bet cowardice indicator)
     avg_bet = round(sum(b["amount"] for b in all_bets) / total_bets) if total_bets else 0
-    avg_bet_pct = round(avg_bet / credits * 100, 1) if credits > 0 else 0
+    avg_bet_pct = round(avg_bet / effective_credits * 100, 1) if effective_credits > 0 else 0
 
     # OU market participation
     ou_bets = len([b for b in all_bets if b["market"] == "ou"])
@@ -295,6 +322,8 @@ async def _get_roast_data(target_uid: int) -> dict:
     return {
         "name": name,
         "credits": credits,
+        "in_bet": in_bet,
+        "effective_credits": effective_credits,
         "rank": rank,
         "total_players": total_players,
         "total_bets": total_bets,
@@ -348,17 +377,21 @@ Generate a roast of a player based on their stats. Rules:
         else "no notable streak"
     )
 
+    credit_detail = f"{data['credits']:,}c in wallet"
+    if data['in_bet'] > 0:
+        credit_detail += f" + {data['in_bet']:,}c in active bets = {data['effective_credits']:,}c total"
+
     prompt = f"""Roast this player named {data['name']}:
-- Credits: {data['credits']}c (rank {data['rank']} of {data['total_players']})
+- Credits: {credit_detail} (rank {data['rank']} of {data['total_players']})
 - Total bets: {data['total_bets']} ({data['wins']} wins, {data['losses']} losses, {data['win_rate']}% win rate)
-- Average bet: {data['avg_bet']}c ({data['avg_bet_pct']}% of current credits) — low % = playing it safe
+- Average bet: {data['avg_bet']:,}c ({data['avg_bet_pct']}% of effective credits) — low % = playing it safe
 - OU market usage: {data['ou_pct']}% of bets are over/under
 - Parlay record: {data['parlays_attempted']} attempted, {data['parlays_won']} won
 - Current streak: {streak_str}
 - Matches skipped (no bet placed): {data['skipped_matches']}
-- All-time net P&L from betting: {data['all_time_pl']}c
-- Today's P&L: {data['today_pl']}c
-- Biggest loss: {f"{data['biggest_loss']['amount']}c on {data['biggest_loss']['outcome']}" if data['biggest_loss'] else 'none recorded'}
+- All-time net P&L from betting: {data['all_time_pl']:,}c
+- Today's P&L: {data['today_pl']:,}c
+- Biggest loss: {f"{data['biggest_loss']['amount']:,}c on {data['biggest_loss']['outcome']}" if data['biggest_loss'] else 'none recorded'}
 - Most bet outcome: {f"{data['top_outcome'][0]} ({data['top_outcome'][1]} times)" if data['top_outcome'] else 'none'}
 - Is leaderboard leader: {data['is_leader']}
 - Is last place: {data['is_last']}
@@ -678,7 +711,9 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
     sender_uid = sender.id
     sender_cache = sheet.cache["users"].get(sender_uid, {})
     sender_name = sender_cache.get("first_name") or sender_cache.get("username") or sender.first_name or sender.username or "someone"
-    sender_credits = sender_cache.get("credits", "unknown")
+    sender_credits = sender_cache.get("credits", 0)
+    sender_in_bet = _get_in_bet_for_katerina(sender_uid)
+    sender_effective = sender_credits + sender_in_bet
 
     # Build sender stats for Katerina
     all_sender_bets = [b for b in sheet.cache["bets"] if b["user_id"] == sender_uid and b["status"] in ("won", "lost")]
@@ -686,11 +721,14 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
     sender_losses = sum(1 for b in all_sender_bets if b["status"] == "lost")
     standings = sheet.get_standings()
     sender_rank = next((i+1 for i, u in enumerate(standings) if u["user_id"] == sender_uid), None)
+    credit_detail = f"{sender_credits:,}c in wallet"
+    if sender_in_bet > 0:
+        credit_detail += f" + {sender_in_bet:,}c in active bets = {sender_effective:,}c total"
     sender_stats = (
-        f"Credits: {sender_credits}c | "
+        f"Credits: {credit_detail} | "
         f"Record: {sender_wins}W-{sender_losses}L | "
         f"Rank: {sender_rank} of {len(standings)}"
-    ) if sender_rank else f"Credits: {sender_credits}c (not yet ranked)"
+    ) if sender_rank else f"Credits: {credit_detail} (not yet ranked)"
 
     # Check if this is a predictions/odds/analysis question — trigger web search
     search_keywords = ["odds", "prediction", "predict", "outside world", "favourite", "favorite",

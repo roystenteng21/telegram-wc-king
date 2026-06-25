@@ -15,7 +15,7 @@ from config import (
     PREMATCH_SUMMARY_MINUTES, POLL_START_OFFSET, POLL_INTERVAL,
     KNOCKOUT_DURATION, ANTHROPIC_API_KEY,
     ADMIN_TELEGRAM_ID, BOT_VERSION, TEAM_DISPLAY, PARLAY_MULTIPLIERS,
-    DAILY_CREDIT_TIERS, TOURNAMENT_FINAL_DATE
+    DAILY_CREDIT_TIERS, TOURNAMENT_FINAL_DATE, NAME_OVERRIDES
 )
 import sheet
 import api
@@ -138,12 +138,10 @@ def _outcome_label(outcome: str, match: dict) -> str:
     return outcome.capitalize()
 
 
-_NAME_OVERRIDES = {"Shunnnnnn": "Shun", "Roysten": "Roy"}
-
 def _get_user_name(uid: int) -> str:
     user = sheet.cache["users"].get(uid, {})
     name = user.get("first_name") or user.get("username") or "Someone"
-    return _NAME_OVERRIDES.get(name, name)
+    return NAME_OVERRIDES.get(name, name)
 
 
 def _get_sort_name(b: dict) -> str:
@@ -161,16 +159,19 @@ def _is_parlay_leg(s: dict) -> bool:
 def _format_bet_line(b: dict, match: dict) -> str:
     """Standard bet line for all pre-match listings.
     Singles: Name — outcome — amount c
-    Parlay legs: Name — outcome — 🎰 N/M (leg number from cache, no amount)"""
+    Parlay legs: Name — outcome — 🎰 N/M (leg number from cache, no amount)
+    Bust parlay legs: Name — outcome — 🥀"""
     name = _get_user_name(b["user_id"])
     outcome = _outcome_label(b["outcome"], match)
     if _is_parlay_leg(b):
         pid = b.get("parlay_id")
+        if not sheet.is_parlay_alive(pid):
+            return f"• {name} — {outcome} — 🥀"
         all_legs = sorted(sheet.get_parlay_bets(pid), key=lambda x: x.get("placed_at", ""))
         total = len(all_legs)
         leg_num = next((i + 1 for i, l in enumerate(all_legs) if l["bet_id"] == b["bet_id"]), "?")
         return f"• {name} — {outcome} — 🎰 {leg_num}/{total}"
-    return f"• {name} — {outcome} — {b['amount']}c"
+    return f"• {name} — {outcome} — {b['amount']:,}c"
 
 
 def format_result_message(match: dict, settlements: list, parlay_wins: list = None) -> str:
