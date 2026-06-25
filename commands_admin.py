@@ -1,17 +1,22 @@
 import asyncio
 import logging
+import random
+import re
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import ContextTypes
+from rapidfuzz import process as fuzz_process
 
 from config import (
-    ADMIN_TELEGRAM_ID, SGT, UTC, TEAM_DISPLAY, BOT_VERSION
+    ADMIN_TELEGRAM_ID, SGT, UTC, CT, TEAM_DISPLAY, BOT_VERSION,
+    TOURNAMENT_STAGES, TEAM_ALIASES
 )
+import katerina as _katerina
 import sheet
 import scheduler as sched
 import api
 from helpers import (
-    dm_admin, is_silent_hours, format_team, format_match_teams,
+    dm_admin, format_team, format_match_teams,
     truncate, session_expired, clear_admin_pending, ensure_registered,
     _sessions, _admin_pending, get_group_chat_id
 )
@@ -196,10 +201,8 @@ async def cmd_admin_eod_push(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # Step 1: auto-detect correct CT date and preview
     try:
-        import pytz as _pytz
-        _CT = _pytz.timezone("America/Chicago")
-        today_ct = datetime.now(_CT).strftime("%Y-%m-%d")
-        yesterday_ct = (datetime.now(_CT) - timedelta(days=1)).strftime("%Y-%m-%d")
+        today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+        yesterday_ct = (datetime.now(CT) - timedelta(days=1)).strftime("%Y-%m-%d")
 
         # Find most recent CT day with finished matches that hasn't had EOD yet
         all_matches = []
@@ -312,7 +315,6 @@ async def cmd_admin_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raw = " ".join(args[1:])
 
         # Extract question from quotes
-        import re
         q_match = re.match(r'"([^"]+)"(.*)', raw)
         if not q_match:
             await update.message.reply_text('Usage: /admin_event create "Question?" team1 team2 [2x] [free 100]')
@@ -454,8 +456,7 @@ async def cmd_admin_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 break
         if not winner_opt:
             # Try fuzzy
-            from rapidfuzz import process
-            match = process.extractOne(winner_input, event["options"])
+            match = fuzz_process.extractOne(winner_input, event["options"])
             if match and match[1] >= 70:
                 winner_opt = match[0]
         if not winner_opt:
@@ -563,10 +564,12 @@ async def cmd_admin_credits_announcement(update: Update, context: ContextTypes.D
         "On a 1-match day it's just the 100c EOD top-up.\n\n"
         "Bets pay 1:1 — stake 50c on a win, get 100c back.\n\n"
         "🎰 Parlays\n"
-        "Combine 2–4 result bets on the same match day:\n"
-        "• 2 legs = 2.5x\n"
-        "• 3 legs = 5x\n"
-        "• 4 legs = 10x\n"
+        "Combine 2–6 result bets on the same match day:\n"
+        "• 2 legs = 4.5x\n"
+        "• 3 legs = 8x\n"
+        "• 4 legs = 16x\n"
+        "• 5 legs = 32x\n"
+        "• 6 legs = 64x\n"
         "All legs must win. One loss and the whole parlay is done.\n\n"
         "Winner = highest credits after the Final on Jul 19. Good luck! 🍀"
     )
@@ -578,7 +581,6 @@ async def cmd_admin_credits_announcement(update: Update, context: ContextTypes.D
 # ── Admin: /admin_announce ────────────────────────────────────────────────────
 async def cmd_admin_katerina_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send Katerina's 'I'm back' message to the group."""
-    import random
     gid = get_group_chat_id()
     if not gid:
         await update.message.reply_text("Group chat ID not set yet.")
@@ -604,9 +606,6 @@ async def cmd_admin_stage_hype(update: Update, context: ContextTypes.DEFAULT_TYP
     """Manually trigger Katerina stage hype. Usage: /admin_stage_hype [current stage] | [next stage]"""
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
-
-    import katerina as _katerina
-    from config import TOURNAMENT_STAGES
 
     if not context.args:
         stage_names = " / ".join(s["name"] for s in TOURNAMENT_STAGES)
@@ -759,9 +758,8 @@ async def cmd_admin_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Step 1: /admin_result — list pending matches
     if not args:
-        today = datetime.now(UTC).strftime("%Y-%m-%d")
-        matches = await sheet.get_matches_for_date(today)
-        pending = [m for m in matches if m["status"] != "FINISHED"]
+        all_matches = await sched.get_today_ct_matches()
+        pending = [m for m in all_matches if m["status"] != "FINISHED"]
         if not pending:
             await update.message.reply_text("No pending matches today.")
             return
@@ -858,9 +856,8 @@ async def cmd_admin_cancel_match(update: Update, context: ContextTypes.DEFAULT_T
     args = context.args
 
     if not args:
-        today = datetime.now(UTC).strftime("%Y-%m-%d")
-        matches = await sheet.get_matches_for_date(today)
-        active = [m for m in matches if m["status"] in ("SCHEDULED", "TIMED")]
+        all_matches = await sched.get_today_ct_matches()
+        active = [m for m in all_matches if m["status"] in ("SCHEDULED", "TIMED")]
         if not active:
             await update.message.reply_text("No scheduled matches to cancel.")
             return
@@ -1036,7 +1033,7 @@ async def cmd_confirm_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # admin_result is manual recovery — always send immediately, no silent hours hold
             await sched.send_group(result_msg)
             await update.message.reply_text(f"✅ Done. {len(settlements)} bets settled.")
-            await sched.check_all_matches_done()
+            await sched.check_all_matches_done(match["match_id"])
         except Exception as e:
             await update.message.reply_text(f"⚠️ Failed to settle: {e}")
 
@@ -1095,8 +1092,6 @@ async def cmd_confirm_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Auto-roast all players for needing a bailout
         if amount > 0:
-            import asyncio
-            import katerina as _katerina
             asyncio.create_task(_katerina.send_bailout_roast(users, amount, notify_fn=dm_admin))
 
     else:

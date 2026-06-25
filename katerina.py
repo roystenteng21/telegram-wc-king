@@ -4,14 +4,13 @@ import logging
 import random
 import re
 import urllib.request
-import pytz
 from collections import Counter
 from datetime import date, datetime, timedelta
 from telegram import Update
 from telegram.ext import ContextTypes
 
 from config import (
-    ADMIN_TELEGRAM_ID, SGT, UTC,
+    ADMIN_TELEGRAM_ID, SGT, UTC, CT,
     ANTHROPIC_API_KEY, TOURNAMENT_STAGES, TOURNAMENT_FINAL_DATE,
     PRIZE_INFO, PRIZE_PLAYER_COUNT, NAME_OVERRIDES
 )
@@ -22,9 +21,6 @@ from helpers import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Module-level timezone constant — avoid recreating on every call
-CT = pytz.timezone("America/Chicago")
 
 # Ignore mentions sent before this time — prevents backlog replay after restart
 _startup_time = datetime.now(UTC)

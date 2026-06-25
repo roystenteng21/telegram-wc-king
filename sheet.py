@@ -462,7 +462,7 @@ async def settle_parlay(parlay_id: str, notify_fn=None) -> dict | None:
         mark_parlay_paid(parlay_id)  # lost or invalid — mark done so EOD skips
         return None
 
-    multiplier = PARLAY_MULTIPLIERS.get(effective_legs, PARLAY_MULTIPLIERS[4] if effective_legs > 4 else None)
+    multiplier = PARLAY_MULTIPLIERS.get(effective_legs)
     if not multiplier:
         return None
 
@@ -564,7 +564,7 @@ async def settle_bets_for_match(match_id: str, result: str, ou_result: str, noti
 
             # Parlay legs: mark won/lost but DO NOT pay out here.
             # Payout is handled at EOD via multiplier in job_post_standings.
-            is_parlay_leg = bool(bet.get("parlay_id", ""))
+            is_parlay_leg = str(bet.get("parlay_id", "")) not in ("", "0")
 
             row_num = _bet_rows.get(bet["bet_id"])
             if row_num:
@@ -702,33 +702,6 @@ async def add_match_credits(match_amount: int, match_id: str, notify_fn=None):
         raise
 
 
-async def add_daily_credits(daily_amount: int, notify_fn=None):
-    """Add daily credits to all users. Skips if already credited today (in-memory check)."""
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
-    if cache.get("daily_credits_date") == today:
-        logger.info(f"Daily credits already added today ({today}), skipping.")
-        if notify_fn:
-            await notify_fn("⚠️ Daily credits already added today — skipped.")
-        return
-
-    try:
-        ws = get_sheet(SHEET_USERS)
-        for user_id, user in cache["users"].items():
-            row_num = _user_rows.get(user_id)
-            if not row_num:
-                continue
-            new_credits = user["credits"] + daily_amount
-            await with_retry(ws.update_cell, row_num, 4, new_credits)
-            cache["users"][user_id]["credits"] = new_credits
-            await append_ledger(user_id, "daily_credit", daily_amount, new_credits, "Daily top-up", notify_fn)
-        cache["daily_credits_date"] = today
-        logger.info("Daily credits added to all users")
-    except Exception as e:
-        logger.error(f"Failed to add daily credits: {e}")
-        if notify_fn:
-            await notify_fn(f"⚠️ Failed to add daily credits: {e}")
-        raise
-
 async def add_tiered_daily_credits(tier_map: dict, notify_fn=None):
     """Add tiered daily credits. tier_map = {user_id: amount}. Skips if already credited today."""
     today = datetime.now(UTC).strftime("%Y-%m-%d")
@@ -801,7 +774,9 @@ def get_daily_pl(match_ids: list) -> dict:
         all_won = all(b["status"] == "won" for b in settled)
         effective = len(settled)
         if all_won and effective >= 2:
-            multiplier = PARLAY_MULTIPLIERS.get(effective, PARLAY_MULTIPLIERS.get(4, 10.0))
+            multiplier = PARLAY_MULTIPLIERS.get(effective)
+            if not multiplier:
+                continue
             payout = int(stake * multiplier)
             pl[uid] = pl.get(uid, 0) + (payout - stake)
         else:

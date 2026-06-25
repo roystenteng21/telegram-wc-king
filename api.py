@@ -1,7 +1,7 @@
 import time
 import requests
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from config import (
     FOOTBALL_API_KEY, FOOTBALL_API_BASE, WC_COMPETITION,
     STATUS_SCHEDULED, STATUS_FINISHED, STATUS_CANCELLED, STATUS_POSTPONED,

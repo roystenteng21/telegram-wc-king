@@ -1,11 +1,10 @@
 import logging
-import pytz
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import ContextTypes
 
 from config import (
-    ADMIN_TELEGRAM_ID, SGT, UTC, TEAM_DISPLAY,
+    ADMIN_TELEGRAM_ID, SGT, UTC, CT, TEAM_DISPLAY,
     RESULT_OUTCOMES, ALL_OUTCOMES,
     SESSION_EXPIRY, BET_LOCK_BUFFER, PARLAY_MULTIPLIERS, NAME_OVERRIDES
 )
@@ -122,7 +121,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /matches ──────────────────────────────────────────────────────────────────
 async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_registered(update)
-    CT = pytz.timezone("America/Chicago")
     today_ct = datetime.now(CT).strftime("%Y-%m-%d")
 
     # Fetch today and tomorrow in UTC to capture late US kickoffs crossing UTC midnight
@@ -222,7 +220,6 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if pid not in parlay_summary:
                         all_legs = sheet.get_parlay_bets(pid)
                         total_legs = len(all_legs)
-                        from config import PARLAY_MULTIPLIERS
                         multiplier = PARLAY_MULTIPLIERS.get(total_legs, min(PARLAY_MULTIPLIERS.values()))
                         parlay_summary[pid] = {
                             "name": name,
@@ -854,7 +851,6 @@ async def cmd_parlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Check all legs are on the same CT match day
-    CT = pytz.timezone("America/Chicago")
     leg_dates = set()
     for leg in validated_legs:
         try:

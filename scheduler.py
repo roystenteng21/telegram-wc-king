@@ -9,7 +9,7 @@ from apscheduler.triggers.cron import CronTrigger
 import pytz
 
 from config import (
-    SGT, UTC, DAILY_CREDITS, MATCH_CREDITS,
+    SGT, UTC, CT, DAILY_CREDITS, MATCH_CREDITS,
     NIGHT_REMINDER_HOUR, NIGHT_REMINDER_MINUTE,
     MORNING_CATCHUP_HOUR, MORNING_CATCHUP_MINUTE,
     PREMATCH_SUMMARY_MINUTES, POLL_START_OFFSET, POLL_INTERVAL,
@@ -19,12 +19,10 @@ from config import (
 )
 import sheet
 import api
+import katerina as _katerina
 from helpers import format_team, format_match_teams
 
 logger = logging.getLogger(__name__)
-
-# Module-level timezone constant
-CT = pytz.timezone("America/Chicago")
 
 scheduler = AsyncIOScheduler(timezone=UTC)
 
@@ -92,9 +90,9 @@ async def get_today_ct_matches() -> list:
 
 # ── Last match of day check ───────────────────────────────────────────────────
 async def is_last_match_of_day(match_id: str) -> bool:
-    """Returns True if match_id has the latest kickoff on its own CT date.
-    Uses the match's kickoff to determine the CT date — not datetime.now() —
-    so this stays correct even when the bot restarts after midnight UTC."""
+    """Returns True if match_id shares the latest kickoff on its own CT date.
+    Handles co-final matches (same kickoff time) — both return True.
+    Uses the match's kickoff to determine the CT date, not datetime.now()."""
     match = await sheet.get_match_by_id(match_id)
     if not match or not match.get("kickoff_utc"):
         return True
@@ -106,8 +104,8 @@ async def is_last_match_of_day(match_id: str) -> bool:
     active = [m for m in day_matches if m.get("status") not in ("CANCELLED", "POSTPONED")]
     if not active:
         return True
-    latest = max(active, key=lambda m: m.get("kickoff_utc", ""))
-    return str(latest["match_id"]) == str(match_id)
+    latest_ko = max(m.get("kickoff_utc", "") for m in active)
+    return match["kickoff_utc"] == latest_ko
 
 
 # ── Format helpers ────────────────────────────────────────────────────────────
@@ -521,7 +519,7 @@ async def _auto_settle_stuck_match(match_id: str):
             return
         open_bets = [b for b in sheet.cache["bets"] if b["match_id"] == match_id and b["status"] == "open"]
         if not open_bets:
-            await check_all_matches_done()
+            await check_all_matches_done(match_id)
             return
 
         # Settle bets
@@ -755,7 +753,6 @@ async def _send_morning_flush():
             return
 
         match_count = len(held)
-        total_topup = MATCH_CREDITS * match_count
 
         # Build combined message
         lines = ["Good morning lads! 🌅"]
@@ -869,12 +866,13 @@ async def check_all_matches_done(match_id: str = None):
             logger.info(f"EOD already fired for CT {target_ct_date}, skipping")
             return
 
-        # EOD fires when the last match by kickoff time is finished
+        # EOD fires only when ALL matches sharing the latest kickoff are finished
         active = [m for m in today_matches if m.get("status") not in ("CANCELLED", "POSTPONED")]
         if not active:
             return
-        latest = max(active, key=lambda m: m.get("kickoff_utc", ""))
-        if latest["status"] not in ("FINISHED", "CANCELLED", "POSTPONED"):
+        latest_ko = max(m.get("kickoff_utc", "") for m in active)
+        co_latest = [m for m in active if m.get("kickoff_utc") == latest_ko]
+        if not all(m["status"] in ("FINISHED", "CANCELLED", "POSTPONED") for m in co_latest):
             return
 
         sheet.cache["eod_date"] = target_ct_date
@@ -940,7 +938,7 @@ async def job_post_standings(match_ids: list):
             effective_legs = len(settled_legs)
 
             if all_won and effective_legs >= 2:
-                multiplier = PARLAY_MULTIPLIERS.get(effective_legs, PARLAY_MULTIPLIERS[4] if effective_legs > 4 else None)
+                multiplier = PARLAY_MULTIPLIERS.get(effective_legs)
                 if not multiplier:
                     continue
                 payout = int(stake * multiplier)
@@ -1025,7 +1023,6 @@ async def job_post_standings(match_ids: list):
                     overtakes.append((uid, passed_uid))
 
         # Build EOD message
-        from datetime import date as _date_cls
         sgt_date = datetime.now(SGT).strftime("%d %b")
         lines = [f"📅 End of Day — {sgt_date}\n"]
 
@@ -1098,8 +1095,7 @@ async def job_post_standings(match_ids: list):
         ) if overtakes else ""
 
         # Additional context for Katerina
-        from datetime import date as _date_cls
-        days_to_final = (TOURNAMENT_FINAL_DATE - _date_cls.today()).days
+        days_to_final = (TOURNAMENT_FINAL_DATE - datetime.now(UTC).date()).days
 
         match_results_str = ", ".join(
             f"{m['home']} {m['home_score']}-{m['away_score']} {m['away']}"
@@ -1159,7 +1155,6 @@ async def job_post_standings(match_ids: list):
         logger.info("End of day standings and daily credits posted")
 
         # Stage transition check — fire Katerina hype in background if today ends a stage
-        import katerina as _katerina
         asyncio.create_task(_katerina.check_and_send_stage_hype(notify_fn=dm_admin))
 
     except Exception as e:
@@ -1216,7 +1211,7 @@ async def job_health_monitor():
 
         # 3. Any match IN_PLAY or PAUSED with no poll job registered
         for m in sheet.cache.get("matches", {}).values():
-            if m.get("status") in ("IN_PLAY", "PAUSED"):
+            if m.get("status") in ("IN_PLAY", "PAUSED", "HALFTIME"):
                 mid = str(m["match_id"])
                 has_poll = any(mid in job.id and "poll" in job.id for job in scheduler.get_jobs())
                 if not has_poll:
@@ -1257,7 +1252,8 @@ def register_static_jobs():
         job_refresh_cache,
         trigger=CronTrigger(minute="5,15,25,35,45,55"),
         id="cache_refresh",
-        replace_existing=True
+        replace_existing=True,
+        misfire_grace_time=120
     )
 
     # Health monitor — every 10 minutes all day
@@ -1297,7 +1293,7 @@ def register_match_jobs(matches: list):
                     logger.info(f"Match {match_id} FINISHED with open bets — scheduled auto-settle")
             continue
 
-        if status in ("IN_PLAY", "PAUSED"):
+        if status in ("IN_PLAY", "PAUSED", "HALFTIME"):
             # Bot restarted mid-match — schedule immediate poll
             _schedule_poll(match_id, delay_seconds=10, attempt=1)
             logger.info(f"Bot restarted mid-match {match_id} ({status}) — scheduling immediate poll")

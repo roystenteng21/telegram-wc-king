@@ -49,6 +49,7 @@ PRIZE_INFO = (
 # Timezone
 SGT = pytz.timezone("Asia/Singapore")
 UTC = pytz.utc
+CT = pytz.timezone("America/Chicago")
 
 # Game settings
 DAILY_CREDITS = 100
