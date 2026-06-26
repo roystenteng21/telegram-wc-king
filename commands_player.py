@@ -324,6 +324,66 @@ async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Could not fetch standings: {e}")
 
 
+# ── /brackets ─────────────────────────────────────────────────────────────────
+async def cmd_brackets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ensure_registered(update)
+
+    from config import TOURNAMENT_STAGES
+    today = datetime.now(UTC).date()
+    group_stage = next((s for s in TOURNAMENT_STAGES if s["name"] == "Group Stage"), None)
+    if group_stage and today <= group_stage["end"]:
+        await update.message.reply_text(
+            "Group stage is still ongoing.\nUse /groups for current standings."
+        )
+        return
+
+    try:
+        matches = api.fetch_knockout_matches()
+    except RuntimeError as e:
+        await update.message.reply_text(f"⚠️ Could not fetch bracket: {e}")
+        return
+
+    if not matches:
+        await update.message.reply_text("Knockout bracket not yet available.")
+        return
+
+    STAGE_ORDER = [
+        ("ROUND_OF_32",  "🔵 Round of 32"),
+        ("ROUND_OF_16",  "🟡 Round of 16"),
+        ("QUARTER_FINAL","🟠 Quarterfinals"),
+        ("SEMI_FINAL",   "🔴 Semifinals"),
+        ("THIRD_PLACE",  "🥉 Third Place"),
+        ("FINAL",        "🏆 Final"),
+    ]
+
+    by_stage = {}
+    for m in matches:
+        by_stage.setdefault(m["stage"], []).append(m)
+
+    lines = ["🗓 WC 2026 Bracket\n"]
+    for stage_key, stage_label in STAGE_ORDER:
+        if stage_key not in by_stage:
+            continue
+        lines.append(stage_label)
+        for m in sorted(by_stage[stage_key], key=lambda x: x["utcDate"]):
+            home = format_team(m["home"]) if m["home"] != "TBD" else "TBD"
+            away = format_team(m["away"]) if m["away"] != "TBD" else "TBD"
+            if m["status"] == "FINISHED" and m["home_score"] is not None:
+                lines.append(f"{home} {m['home_score']}–{m['away_score']} {away} ✅")
+            elif m["status"] in ("IN_PLAY", "PAUSED", "HALFTIME"):
+                lines.append(f"{home} vs {away} ● Live")
+            else:
+                try:
+                    ko = datetime.strptime(m["utcDate"][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=UTC)
+                    ko_sgt = ko.astimezone(SGT).strftime("%-d %b, %-I:%M%p SGT").lower()
+                    lines.append(f"{home} vs {away} — {ko_sgt}")
+                except Exception:
+                    lines.append(f"{home} vs {away}")
+        lines.append("")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 # ── /leaderboard ──────────────────────────────────────────────────────────────
 async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_registered(update)

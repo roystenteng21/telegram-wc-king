@@ -1022,38 +1022,11 @@ async def job_post_standings(match_ids: list):
                 for passed_uid in passed:
                     overtakes.append((uid, passed_uid))
 
-        # Build EOD message
+        # Build EOD message — Option C: standings + parlays only, no per-match recap
         sgt_date = datetime.now(SGT).strftime("%d %b")
         lines = [f"📅 End of Day — {sgt_date}\n"]
 
-        # Match results with compact bet summary
-        for m in sorted(today_matches, key=lambda x: x["kickoff_utc"]):
-            if m["status"] == "FINISHED":
-                home_d = format_team(m["home"])
-                away_d = format_team(m["away"])
-                ou_label = "Over 2.5" if m["ou_result"] == "over" else "Under 2.5"
-                lines.append(f"{home_d} {m['home_score']}–{m['away_score']} {away_d} · {ou_label}")
-
-                # Compact bet result: one ✅/❌ per player (best result if multiple bets)
-                match_bets = [
-                    b for b in sheet.cache["bets"]
-                    if str(b["match_id"]) == str(m["match_id"])
-                    and b["status"] in ("won", "lost")
-                ]
-                if match_bets:
-                    player_results = {}
-                    for b in match_bets:
-                        uid = b["user_id"]
-                        if uid not in player_results or b["status"] == "won":
-                            player_results[uid] = b["status"]
-                    bet_line = "  ".join(
-                        f"{_get_user_name(uid)} {'✅' if status == 'won' else '❌'}"
-                        for uid, status in sorted(player_results.items(), key=lambda x: _get_user_name(x[0]))
-                    )
-                    lines.append(bet_line)
-
-        lines.append("\n🏆 Standings")
-
+        lines.append("🏆 Standings")
         for i, user in enumerate(standings_after, 1):
             name = _get_user_name(user["user_id"])
             credits = user["credits"]
@@ -1065,80 +1038,106 @@ async def job_post_standings(match_ids: list):
             badge = " 🏆" if i == 1 else ""
             lines.append(f"{i}. {name}{badge} — {credits_str}c ({pl_str}{daily_str})")
 
-        # Parlay section — right after standings (all wins + losses)
+        # Parlay section — individual wins, consolidated busts
         all_parlay_wins = {**parlay_payouts, **parlay_already_paid}
-        if all_parlay_wins or parlay_losses:
-            lines.append("")
-            for pid, p in all_parlay_wins.items():
-                name = _get_user_name(p["user_id"])
-                lines.append(f"🎰 {name} hit a {p['legs']}-leg parlay! {p['stake']}c → {p['payout']}c 🔥")
-            for pid, p in parlay_losses.items():
-                name = _get_user_name(p["user_id"])
-                lines.append(f"🥀 {name}'s {p['legs']}-leg parlay didn't make it. {p['stake']}c gone.")
+        bust_by_user = {}
+        for pid, p in parlay_losses.items():
+            uid = p["user_id"]
+            if uid not in bust_by_user:
+                bust_by_user[uid] = {"count": 0, "total_stake": 0}
+            bust_by_user[uid]["count"] += 1
+            bust_by_user[uid]["total_stake"] += p["stake"]
 
-        # Commentary — Katerina generates 2-3 sentences
+        if all_parlay_wins or bust_by_user:
+            lines.append("")
+            for pid, p in sorted(all_parlay_wins.items(), key=lambda x: -x[1]["payout"]):
+                name = _get_user_name(p["user_id"])
+                lines.append(f"🎰 {name} — {p['legs']}-leg parlay, {p['stake']:,}c → {p['payout']:,}c 🔥")
+            for uid, info in sorted(bust_by_user.items(), key=lambda x: _get_user_name(x[0])):
+                name = _get_user_name(uid)
+                if info["count"] == 1:
+                    lines.append(f"🥀 {name} — parlay bust, {info['total_stake']:,}c gone")
+                else:
+                    lines.append(f"🥀 {name} — {info['count']} busts, {info['total_stake']:,}c gone")
+
+        # Katerina — 1 punchy sentence, best stat angle
+        # Build rich context for interesting stat hunting
+        singles_stats = {}
+        for b in sheet.cache["bets"]:
+            if str(b["match_id"]) not in match_ids:
+                continue
+            if str(b.get("parlay_id", "")) not in ("", "0"):
+                continue
+            uid = b["user_id"]
+            if uid not in singles_stats:
+                singles_stats[uid] = {"won": 0, "lost": 0, "biggest": 0}
+            if b["status"] == "won":
+                singles_stats[uid]["won"] += 1
+                singles_stats[uid]["biggest"] = max(singles_stats[uid]["biggest"], b["amount"])
+            elif b["status"] == "lost":
+                singles_stats[uid]["lost"] += 1
+                singles_stats[uid]["biggest"] = max(singles_stats[uid]["biggest"], b["amount"])
+
+        all_bettors = set(singles_stats) | {p["user_id"] for p in list(parlay_losses.values()) + list(all_parlay_wins.values())}
+        skipped_uids = set(sheet.cache["users"]) - all_bettors
+        skipped_str = ", ".join(_get_user_name(uid) for uid in skipped_uids) if skipped_uids else ""
+
+        singles_lines = []
+        for uid, s in singles_stats.items():
+            total = s["won"] + s["lost"]
+            singles_lines.append(f"{_get_user_name(uid)}: {s['won']}W-{s['lost']}L on singles, biggest bet {s['biggest']:,}c")
+
+        days_to_final = (TOURNAMENT_FINAL_DATE - datetime.now(UTC).date()).days
         standings_str = "\n".join(
-            f"{i}. {_get_user_name(u['user_id'])} — {u['credits']}c ({'+' if pl_map.get(u['user_id'],0)>0 else ''}{pl_map.get(u['user_id'],0)}c today)"
+            f"{i}. {_get_user_name(u['user_id'])} — {u['credits']:,}c ({'+' if pl_map.get(u['user_id'],0)>0 else ''}{pl_map.get(u['user_id'],0):,}c today)"
             for i, u in enumerate(standings_after, 1)
         )
         parlay_win_str = ", ".join(
-            f"{_get_user_name(p['user_id'])} hit {p['legs']}-leg parlay {p['stake']}c→{p['payout']}c"
+            f"{_get_user_name(p['user_id'])} hit {p['legs']}-leg {p['stake']:,}c→{p['payout']:,}c"
             for p in all_parlay_wins.values()
         ) if all_parlay_wins else ""
-        parlay_loss_str = ", ".join(
-            f"{_get_user_name(p['user_id'])}'s {p['legs']}-leg parlay busted"
-            for p in parlay_losses.values()
-        ) if parlay_losses else ""
-        overtake_str = ", ".join(
-            f"{_get_user_name(uid)} overtook {_get_user_name(passed)}"
-            for uid, passed in overtakes
-        ) if overtakes else ""
-
-        # Additional context for Katerina
-        days_to_final = (TOURNAMENT_FINAL_DATE - datetime.now(UTC).date()).days
-
-        match_results_str = ", ".join(
-            f"{m['home']} {m['home_score']}-{m['away_score']} {m['away']}"
-            for m in sorted(today_matches, key=lambda x: x["kickoff_utc"])
-            if m["status"] == "FINISHED"
-        ) if today_matches else ""
-
-        if pl_map:
-            top_winner_uid = max(pl_map, key=lambda uid: pl_map[uid])
-            top_loser_uid = min(pl_map, key=lambda uid: pl_map[uid])
-            winner_str = f"{_get_user_name(top_winner_uid)} +{pl_map[top_winner_uid]}c" if pl_map[top_winner_uid] > 0 else ""
-            loser_str = f"{_get_user_name(top_loser_uid)} {pl_map[top_loser_uid]}c" if pl_map[top_loser_uid] < 0 else ""
-        else:
-            winner_str = loser_str = ""
+        bust_str = ", ".join(
+            f"{_get_user_name(uid)} lost {info['count']} parlay(s) worth {info['total_stake']:,}c"
+            for uid, info in bust_by_user.items()
+        ) if bust_by_user else ""
 
         gap_str = ""
         if len(standings_after) >= 2:
             gap = standings_after[0]["credits"] - standings_after[1]["credits"]
-            gap_str = f"{_get_user_name(standings_after[0]['user_id'])} leads by {gap}c"
+            gap_str = f"{_get_user_name(standings_after[0]['user_id'])} leads {_get_user_name(standings_after[1]['user_id'])} by {gap:,}c"
+
+        top_winner_str, top_loser_str = "", ""
+        if pl_map:
+            top_winner_uid = max(pl_map, key=lambda uid: pl_map[uid])
+            top_loser_uid = min(pl_map, key=lambda uid: pl_map[uid])
+            if pl_map[top_winner_uid] > 0:
+                top_winner_str = f"{_get_user_name(top_winner_uid)} +{pl_map[top_winner_uid]:,}c"
+            if pl_map[top_loser_uid] < 0:
+                top_loser_str = f"{_get_user_name(top_loser_uid)} {pl_map[top_loser_uid]:,}c"
 
         eod_prompt = (
-            f"End of day for WC Kings 2026 ({days_to_final} days to the Final). "
-            f"Write 3 punchy sentences as Katerina the house bookie. Vary the focus — don't always lead with the leader. "
-            f"React to the biggest mover, tightest battle, worst collapse, or most dramatic result. Be specific — name names.\n"
-            + (f"Today's matches: {match_results_str}\n" if match_results_str else "")
-            + f"Standings:\n{standings_str}\n"
-            + (f"Biggest winner today: {winner_str}\n" if winner_str else "")
-            + (f"Biggest loser today: {loser_str}\n" if loser_str else "")
+            f"End of day for WC Kings 2026 ({days_to_final} days to Final). "
+            f"Write EXACTLY 3 punchy sentences as Katerina the house bookie. "
+            f"Vary the focus across the 3 sentences — pick 3 different angles from: biggest swing, tightest race, "
+            f"most reckless bet, worst collapse, who skipped, most dominant singles day, parlay hero or villain. "
+            f"Be specific, name names, no fluff. No markdown, no hashtags.\n"
+            f"Standings:\n{standings_str}\n"
+            + (f"Biggest daily gain: {top_winner_str}\n" if top_winner_str else "")
+            + (f"Biggest daily loss: {top_loser_str}\n" if top_loser_str else "")
             + (f"Leader gap: {gap_str}\n" if gap_str else "")
+            + (f"Singles records today:\n" + "\n".join(singles_lines) + "\n" if singles_lines else "")
             + (f"Parlay wins: {parlay_win_str}\n" if parlay_win_str else "")
-            + (f"Parlay losses: {parlay_loss_str}\n" if parlay_loss_str else "")
-            + (f"Overtakes: {overtake_str}\n" if overtake_str else "")
-            + "No markdown. No hashtags. Hype the winner, roast the loser. "
-            + "Reference the prize (champion jersey + dining vouchers for 1st, runner-up jersey for 2nd) for extra sting."
+            + (f"Parlay busts: {bust_str}\n" if bust_str else "")
+            + (f"Skipped betting entirely: {skipped_str}\n" if skipped_str else "")
         )
 
         if pl_map:
-            commentary = await _katerina_line(eod_prompt, "", max_tokens=160)
+            commentary = await _katerina_line(eod_prompt, "", max_tokens=200)
         else:
             commentary = await _katerina_line(
-                "Nobody placed any bets today. Write one short, slightly mocking line about it. 1 sentence.",
+                "Nobody placed any bets today. Write one short mocking line. 1 sentence max.",
                 "Nobody put money down today. Bold strategy. 🤔",
-                max_tokens=80
+                max_tokens=60
             )
 
         if commentary:

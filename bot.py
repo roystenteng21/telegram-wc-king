@@ -128,6 +128,7 @@ def setup_handlers():
     application.add_handler(CommandHandler("matches", cp.cmd_matches))
     application.add_handler(CommandHandler("balance", cp.cmd_balance))
     application.add_handler(CommandHandler("groups", cp.cmd_groups))
+    application.add_handler(CommandHandler("brackets", cp.cmd_brackets))
     application.add_handler(CommandHandler("leaderboard", cp.cmd_leaderboard))
     application.add_handler(CommandHandler("mybets", cp.cmd_mybets))
     application.add_handler(CommandHandler("bet", cp.cmd_bet))

@@ -205,3 +205,49 @@ def fetch_standings(group_filter: list = None) -> list:
     except Exception as e:
         logger.error(f"Failed to fetch standings: {e}")
         raise RuntimeError(f"Failed to fetch standings: {e}")
+
+
+def fetch_knockout_matches() -> list:
+    """
+    Fetch WC knockout stage matches.
+    Returns list of dicts: {stage, home, away, home_score, away_score, status, utcDate}
+    home/away are "TBD" if not yet determined.
+    Raises RuntimeError on API failure.
+    """
+    KNOCKOUT_STAGES = {
+        "ROUND_OF_32", "ROUND_OF_16",
+        "QUARTER_FINAL", "SEMI_FINAL",
+        "THIRD_PLACE", "FINAL"
+    }
+    try:
+        data = _get(f"/competitions/{WC_COMPETITION}/matches")
+        if not data or "matches" not in data:
+            logger.warning("No match data returned for knockout fetch")
+            return []
+
+        matches = []
+        for m in data.get("matches", []):
+            stage = m.get("stage", "")
+            if stage not in KNOCKOUT_STAGES:
+                continue
+            home = m.get("homeTeam", {}).get("name") or "TBD"
+            away = m.get("awayTeam", {}).get("name") or "TBD"
+            score = m.get("score", {}).get("fullTime", {})
+            matches.append({
+                "stage": stage,
+                "home": home,
+                "away": away,
+                "home_score": score.get("home"),
+                "away_score": score.get("away"),
+                "status": m.get("status", ""),
+                "utcDate": m.get("utcDate", ""),
+            })
+
+        logger.info(f"Fetched {len(matches)} knockout matches")
+        return matches
+
+    except RuntimeError:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to fetch knockout matches: {e}")
+        raise RuntimeError(f"Failed to fetch knockout matches: {e}")
