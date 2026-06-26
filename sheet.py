@@ -7,7 +7,7 @@ from google.oauth2.service_account import Credentials
 from config import (
     SPREADSHEET_ID, GOOGLE_CREDENTIALS_JSON,
     SHEET_USERS, SHEET_MATCHES, SHEET_BETS, SHEET_LEDGER, SHEET_EVENTS,
-    STARTING_CREDITS, UTC
+    STARTING_CREDITS, UTC, PARLAY_MULTIPLIERS, TEAM_DISPLAY
 )
 
 logger = logging.getLogger(__name__)
@@ -176,7 +176,7 @@ async def refresh_cache(notify_fn=None):
                         paid.add(parts[1])
             # Also mark lost/voided parlays from bets cache — all legs settled, none won
             parlay_bets = [b for b in cache["bets"] if b.get("parlay_id")]
-            parlay_ids = set(b["parlay_id"] for b in parlay_bets if b.get("parlay_id"))
+            parlay_ids = set(b["parlay_id"] for b in parlay_bets if b.get("parlay_id") and str(b.get("parlay_id")) not in ("", "0"))
             for pid in parlay_ids:
                 if pid in paid:
                     continue
@@ -185,6 +185,33 @@ async def refresh_cache(notify_fn=None):
                     paid.add(pid)
             cache["paid_parlays"] = paid
             logger.info(f"Cache refreshed successfully — {len(paid)} paid/settled parlays loaded from ledger")
+
+            # Rebuild eod_date and daily_credits_date from ledger — survive restarts
+            try:
+                cutoff = datetime.now(UTC) - timedelta(hours=36)
+                recent_daily_credit_ts = []
+                for row in ledger_data:
+                    if str(row.get("type", "")) == "daily_credit":
+                        ts_str = str(row.get("timestamp", ""))
+                        try:
+                            ts = datetime.strptime(ts_str[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                            if ts >= cutoff:
+                                recent_daily_credit_ts.append(ts)
+                        except Exception:
+                            continue
+                if recent_daily_credit_ts:
+                    from config import CT
+                    most_recent = max(recent_daily_credit_ts)
+                    ct_date = most_recent.astimezone(CT).strftime("%Y-%m-%d")
+                    cache["eod_date"] = ct_date
+                    logger.info(f"Rebuilt eod_date={ct_date} from ledger")
+                    # daily_credits_date uses UTC date
+                    today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
+                    if most_recent.strftime("%Y-%m-%d") == today_utc:
+                        cache["daily_credits_date"] = today_utc
+                        logger.info(f"Rebuilt daily_credits_date={today_utc} from ledger")
+            except Exception as e:
+                logger.warning(f"Could not rebuild eod_date/daily_credits_date from ledger: {e}")
         except Exception as e:
             logger.warning(f"Could not rebuild paid_parlays from ledger: {e}")
             cache["paid_parlays"] = set()
@@ -421,7 +448,7 @@ def get_user_active_parlays(user_id: int) -> list:
     result = []
     for b in cache["bets"]:
         pid = b.get("parlay_id", "")
-        if pid and b["user_id"] == user_id and b["status"] == "open" and pid not in seen:
+        if pid and str(pid) not in ("", "0") and b["user_id"] == user_id and b["status"] == "open" and pid not in seen:
             seen.add(pid)
             result.append(pid)
     return result
@@ -438,7 +465,6 @@ async def settle_parlay(parlay_id: str, notify_fn=None) -> dict | None:
     Returns payout dict {user_id, legs, stake, multiplier, payout, leg_labels}
     or None if not ready or already paid or didn't win.
     """
-    from config import PARLAY_MULTIPLIERS, TEAM_DISPLAY
     if parlay_id in cache["paid_parlays"]:
         return None
 
@@ -741,7 +767,6 @@ def get_standings() -> list:
     )
 
 def get_daily_pl(match_ids: list) -> dict:
-    from config import PARLAY_MULTIPLIERS
     match_ids_str = [str(m) for m in match_ids]
     pl = {}
 
@@ -751,22 +776,23 @@ def get_daily_pl(match_ids: list) -> dict:
             continue
         if bet["status"] not in ("won", "lost"):
             continue
-        if bet.get("parlay_id", ""):
+        if str(bet.get("parlay_id", "")) not in ("", "0"):
             continue  # skip parlay legs here
         uid = bet["user_id"]
         pl[uid] = pl.get(uid, 0) + (bet["amount"] if bet["status"] == "won" else -bet["amount"])
 
-    # Parlays — find all parlay_ids with any leg in today's matches
+    # Parlays — find all valid parlay_ids with any leg in today's matches
     today_parlay_ids = set(
         b["parlay_id"] for b in cache["bets"]
-        if b.get("parlay_id") and b["match_id"] in match_ids_str
+        if b.get("parlay_id") and str(b.get("parlay_id")) not in ("", "0")
+        and b["match_id"] in match_ids_str
     )
     for pid in today_parlay_ids:
         legs = get_parlay_bets(pid)
         if not legs:
             continue
         uid = legs[0]["user_id"]
-        stake = legs[0]["amount"]  # stake deducted once
+        stake = legs[0]["amount"]
         settled = [b for b in legs if b["status"] in ("won", "lost")]
         open_legs = [b for b in legs if b["status"] == "open"]
         if open_legs:

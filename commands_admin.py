@@ -223,13 +223,18 @@ async def cmd_admin_eod_push(update: Update, context: ContextTypes.DEFAULT_TYPE)
         match_ids = [m["match_id"] for m in all_matches]
         finished_count = sum(1 for m in all_matches if m.get("status") == "FINISHED")
 
+        credits_warning = ""
+        if sheet.cache.get("daily_credits_date") == target_ct:
+            credits_warning = "\n⚠️ Daily credits already added for this day — will NOT be added again."
+
         _admin_pending[ADMIN_TELEGRAM_ID] = {
             "action": "eod_push",
             "data": {"match_ids": match_ids},
             "expires": datetime.now(UTC) + timedelta(seconds=120)
         }
         await update.message.reply_text(
-            f"EOD for CT {target_ct} — {finished_count} finished match(es), {len(match_ids)} total.\n\n"
+            f"EOD for CT {target_ct} — {finished_count} finished match(es), {len(match_ids)} total."
+            f"{credits_warning}\n\n"
             f"Run /admin_eod_push confirm to proceed."
         )
     except Exception as e:

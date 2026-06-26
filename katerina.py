@@ -6,6 +6,7 @@ import re
 import urllib.request
 from collections import Counter
 from datetime import date, datetime, timedelta
+from rapidfuzz import fuzz as _rfuzz
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -196,7 +197,12 @@ def _build_katerina_context_light() -> str:
     """Trimmed context for web search calls — standings only, no bet detail (Gap 8)."""
     now_sgt = datetime.now(SGT)
     standings = sheet.get_standings()
-    lines = [f"WC Kings 2026 | {now_sgt.strftime('%I:%M %p SGT')} | 5 players: Peng, Roy, Calvin, OZY, Shun"]
+    player_names = [
+        NAME_OVERRIDES.get(truncate(u.get("first_name") or u.get("username") or "?"),
+                           truncate(u.get("first_name") or u.get("username") or "?"))
+        for u in standings
+    ]
+    lines = [f"WC Kings 2026 | {now_sgt.strftime('%I:%M %p SGT')} | {len(standings)} players: {', '.join(player_names)}"]
     lines.append("Standings:")
     for i, u in enumerate(standings, 1):
         raw = truncate(u.get("first_name") or u.get("username") or "?")
@@ -458,13 +464,13 @@ Generate a roast of a player based on their stats. Rules:
             f"{data['name']}'s at the bottom. That champion jersey is not going to them. 💀",
             f"Last place with {days_to_final} days left. {data['name']} needs a miracle and better bets. 🙏",
             f"The runner-up jersey is looking very out of reach for {data['name']} right now. Very. 😬",
-            f"{data['name']} has {data['credits']}c and is dead last. The champion jersey has other plans. 📉",
+            f"{data['name']} has {data['credits']:,}c and is dead last. The champion jersey has other plans. 📉",
         ]
         fallbacks_general = [
             f"{data['name']} has a {data['win_rate']}% win rate. I've seen better odds on a coin toss. 🪙",
             f"Rank {data['rank']} of {data['total_players']}. {data['name']} is committed to that position. 😏",
             f"{data['name']} — {data['wins']} wins, {data['losses']} losses. The numbers don't lie. 😬",
-            f"{data['credits']}c in the tank. {data['name']} is either strategic or in denial.",
+            f"{data['credits']:,}c in the tank. {data['name']} is either strategic or in denial.",
             f"With {days_to_final} days to the Final, {data['name']}'s got some ground to make up. Understatement of the tournament.",
             f"{data['name']} placed {data['total_bets']} bets and won {data['wins']}. Quantity over quality isn't working. 📊",
         ]
@@ -553,8 +559,7 @@ async def cmd_roast(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for candidate in [uname_clean, fname_clean]:
                     if not candidate:
                         continue
-                    from rapidfuzz import fuzz as _fuzz
-                    score = _fuzz.ratio(target_clean, candidate)
+                    score = _rfuzz.ratio(target_clean, candidate)
                     if score > best_score:
                         best_score = score
                         best_uid = uid
@@ -591,10 +596,11 @@ async def send_stage_hype(current_stage: str, next_stage: str, notify_fn=None, s
     try:
         standings = sheet.get_standings()
         leader = standings[0] if standings else None
-        leader_name = truncate(leader.get("first_name") or leader.get("username") or "Someone") if leader else "Someone"
+        leader_raw = truncate(leader.get("first_name") or leader.get("username") or "Someone") if leader else "Someone"
+        leader_name = NAME_OVERRIDES.get(leader_raw, leader_raw)
 
         standings_str = "\n".join(
-            f"{i}. {truncate(u.get('first_name') or u.get('username') or 'Unknown')} — {u['credits']}c"
+            f"{i}. {NAME_OVERRIDES.get(truncate(u.get('first_name') or u.get('username') or 'Unknown'), truncate(u.get('first_name') or u.get('username') or 'Unknown'))} — {u['credits']:,}c"
             for i, u in enumerate(standings, 1)
         ) if standings else "No standings yet"
 
@@ -660,16 +666,17 @@ async def send_bailout_roast(users: list, amount: int, notify_fn=None):
     try:
         standings = sheet.get_standings()
         zero_players = [
-            truncate(s.get("first_name") or s.get("username") or "Someone")
+            NAME_OVERRIDES.get(truncate(s.get("first_name") or s.get("username") or "Someone"),
+                               truncate(s.get("first_name") or s.get("username") or "Someone"))
             for s in standings if s.get("credits", 0) == 0
         ]
         bottom_players = [
-            f"{truncate(s.get('first_name') or s.get('username') or '?')} ({s['credits']}c)"
+            f"{NAME_OVERRIDES.get(truncate(s.get('first_name') or s.get('username') or '?'), truncate(s.get('first_name') or s.get('username') or '?'))} ({s['credits']:,}c)"
             for s in standings[-2:]
         ] if standings else []
 
         leaderboard_str = "\n".join(
-            f"{i+1}. {truncate(s.get('first_name') or s.get('username') or '?')} — {s['credits']}c"
+            f"{i+1}. {NAME_OVERRIDES.get(truncate(s.get('first_name') or s.get('username') or '?'), truncate(s.get('first_name') or s.get('username') or '?'))} — {s['credits']:,}c"
             for i, s in enumerate(standings)
         ) if standings else "No standings available."
 
@@ -788,6 +795,24 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
         "stats", "record against", "when did", "what are", "tonight",
     ]
     wants_search = any(kw in clean.lower() for kw in search_keywords)
+
+    # During silent hours — DM sender and return before any search runs
+    if is_silent_hours():
+        quiet_lines = [
+            "Quiet hours. Bets are still open but I'm not taking questions right now. Back at 7:30AM. 😌",
+            "I'm off the clock. Place your bets via /bet if you need to — I'll be back at 7:30AM. 🌙",
+            "Sleeping hours. The house is still open for bets, just not for chat. See you at 7:30AM. 😴",
+            "Quiet hours. Use /bet if you need to place one. Questions can wait till 7:30AM. 😌",
+            "Taking a break. Bets still work — just use /bet. I'm back at 7:30AM SGT. 🌙",
+        ]
+        try:
+            await application.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=random.choice(quiet_lines)
+            )
+        except Exception as e:
+            logger.warning(f"Could not DM {update.effective_user.id} during silent hours: {e}")
+        return
 
     web_results = ""
     if wants_search:
@@ -918,24 +943,6 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
     if _chat_history:
         history_str = "\n".join(list(_chat_history)[-50:])
         bot_context += f"\n\nRECENT GROUP CHAT (last {min(len(_chat_history), 50)} messages):\n{history_str}"
-
-    # During silent hours — DM sender instead of replying in group
-    if is_silent_hours():
-        quiet_lines = [
-            "Quiet hours. Bets are still open but I'm not taking questions right now. Back at 7:30AM. 😌",
-            "I'm off the clock. Place your bets via /bet if you need to — I'll be back at 7:30AM. 🌙",
-            "Sleeping hours. The house is still open for bets, just not for chat. See you at 7:30AM. 😴",
-            "Quiet hours. Use /bet if you need to place one. Questions can wait till 7:30AM. 😌",
-            "Taking a break. Bets still work — just use /bet. I'm back at 7:30AM SGT. 🌙",
-        ]
-        try:
-            await application.bot.send_message(
-                chat_id=update.effective_user.id,
-                text=random.choice(quiet_lines)
-            )
-        except Exception as e:
-            logger.warning(f"Could not DM {update.effective_user.id} during silent hours: {e}")
-        return
 
     reply = await _call_katerina(clean, bot_context, sender_name=sender_name, sender_stats=sender_stats)
     if reply:

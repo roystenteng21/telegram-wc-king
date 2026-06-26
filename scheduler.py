@@ -269,8 +269,8 @@ async def _katerina_line(prompt: str, fallback: str, max_tokens: int = 120) -> s
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read())
-            text_blocks = [b for b in data.get("content", []) if b.get("type") == "text"]
-            result = text_blocks[0]["text"].strip() if text_blocks else ""
+            texts = [b["text"].strip() for b in data.get("content", []) if b.get("type") == "text" and b.get("text", "").strip()]
+            result = " ".join(texts) if texts else ""
             return result if result else fallback
     except Exception as e:
         logger.error(f"Katerina API call failed in scheduler: {e}")
@@ -463,11 +463,11 @@ async def job_kickoff_message(match_id: str):
                 for b in sorted_bets
             )
             standings_str = ", ".join(
-                f"{sheet.cache['users'].get(u['user_id'], {}).get('first_name') or 'Unknown'} {u['credits']}c"
+                f"{_get_user_name(u['user_id'])} {u['credits']:,}c"
                 for u in standings[:3]
             ) if standings else ""
             no_bet_names = [
-                sheet.cache["users"].get(u["user_id"], {}).get("first_name") or "Unknown"
+                _get_user_name(u["user_id"])
                 for u in standings if u["user_id"] not in {b["user_id"] for b in open_bets}
             ]
             prompt = (
@@ -500,6 +500,7 @@ async def check_parlay_completions(match_id: str) -> list:
         and b["market"] == "result"
     )
     affected_parlay_ids.discard("")
+    affected_parlay_ids.discard("0")
 
     for pid in affected_parlay_ids:
         result = await sheet.settle_parlay(pid, notify_fn=dm_admin)
@@ -511,27 +512,34 @@ async def check_parlay_completions(match_id: str) -> list:
 async def _auto_settle_stuck_match(match_id: str):
     """
     Settle bets for a match that's FINISHED in cache but still has open bets.
-    Sends the result message to the group automatically — no manual push needed.
+    If some bets were already settled (result was already posted), settle remaining
+    bets silently and DM admin — do NOT repost result to group.
     """
     try:
         match = await sheet.get_match_by_id(match_id)
         if not match or not match.get("result"):
             return
-        open_bets = [b for b in sheet.cache["bets"] if b["match_id"] == match_id and b["status"] == "open"]
+
+        all_match_bets = [b for b in sheet.cache["bets"] if b["match_id"] == str(match_id)]
+        open_bets = [b for b in all_match_bets if b["status"] == "open"]
+        already_settled = any(b["status"] in ("won", "lost") for b in all_match_bets)
+
         if not open_bets:
             await check_all_matches_done(match_id)
             return
 
-        # Settle bets
+        # Settle remaining open bets
         settlements = await sheet.settle_bets_for_match(match_id, match["result"], match.get("ou_result", ""), notify_fn=dm_admin)
-
-        # Check parlay completions
         parlay_wins = await check_parlay_completions(match_id)
 
-        # Is this the last match of the day?
-        is_last = await is_last_match_of_day(match_id)
+        if already_settled:
+            # Result was already posted to group — settle silently, DM admin only
+            await dm_admin(f"ℹ️ Match {match_id} had {len(open_bets)} lingering open bet(s) — settled silently. Result was already posted to group.")
+            await check_all_matches_done(match_id)
+            return
 
-        # Post-match top-up
+        # Result was never posted — full auto-settle with group message
+        is_last = await is_last_match_of_day(match_id)
         topup_line = ""
         if not is_last:
             try:
@@ -540,7 +548,6 @@ async def _auto_settle_stuck_match(match_id: str):
             except Exception as e:
                 logger.error(f"Auto-settle top-up failed for {match_id}: {e}")
 
-        # Build result message
         base_result_msg = format_result_message(match, settlements, parlay_wins=parlay_wins)
         result_msg = base_result_msg
 
@@ -548,13 +555,12 @@ async def _auto_settle_stuck_match(match_id: str):
             home_score = match.get("home_score", "?")
             away_score = match.get("away_score", "?")
             settled_summary = ", ".join(
-                f"{_get_user_name(s['user_id'])} {'won' if s['status'] == 'won' else 'lost'} {s['amount']}c on {_outcome_label(s['outcome'], match)}"
+                f"{_get_user_name(s['user_id'])} {'won' if s['status'] == 'won' else 'lost'} {s['amount']:,}c on {_outcome_label(s['outcome'], match)}"
                 for s in settlements if not _is_parlay_leg(s)
             )
             context = f"Result: {format_match_teams(match['home'], match['away'])} {home_score}-{away_score}."
             if settled_summary:
                 context += f" Singles: {settled_summary}."
-
             singles_on_match = [s for s in settlements if not _is_parlay_leg(s)]
             parlay_legs_on_match = [s for s in settlements if _is_parlay_leg(s)]
             everyone_lost = (
@@ -564,20 +570,13 @@ async def _auto_settle_stuck_match(match_id: str):
             )
             if everyone_lost:
                 names = ", ".join(dict.fromkeys(_get_user_name(s["user_id"]) for s in settlements))
-                prompt = (
-                    f"{context} Every single person lost — {names}. "
-                    f"Go full savage. 1-2 sentences, no mercy. No markdown."
-                )
+                prompt = (f"{context} Every single person lost — {names}. Go full savage. 1-2 sentences, no mercy. No markdown.")
             else:
-                prompt = (
-                    f"{context} Write 1-2 sharp sentences reacting to the result and bets with light banter. "
-                    f"Reference specific names and outcomes. No markdown."
-                )
+                prompt = (f"{context} Write 1-2 sharp sentences reacting to the result and bets with light banter. Reference specific names and outcomes. No markdown.")
             commentary = await _katerina_line(prompt, "", max_tokens=150)
             if commentary:
                 result_msg = result_msg + f"\n\n{commentary}"
 
-        # Send or hold for morning flush
         if is_silent_hours() and not is_last:
             if "held_results" not in sheet.cache:
                 sheet.cache["held_results"] = []
@@ -588,12 +587,7 @@ async def _auto_settle_stuck_match(match_id: str):
                 if send_time_sgt <= now_sgt:
                     send_time_sgt = send_time_sgt + timedelta(days=1)
                 send_time_utc = send_time_sgt.astimezone(UTC)
-                scheduler.add_job(
-                    _send_morning_flush,
-                    trigger=DateTrigger(run_date=send_time_utc),
-                    id="morning_flush",
-                    replace_existing=True
-                )
+                scheduler.add_job(_send_morning_flush, trigger=DateTrigger(run_date=send_time_utc), id="morning_flush", replace_existing=True)
         else:
             if topup_line:
                 result_msg = result_msg + topup_line
@@ -822,9 +816,36 @@ async def _send_coming_up_today():
         await dm_admin(f"⚠️ Coming up today message failed: {e}")
 
 
+async def _send_coming_up_next_day():
+    """Send tomorrow's matches after EOD. Shows kickoff times and any bets already placed."""
+    try:
+        tomorrow_ct = (datetime.now(CT) + timedelta(days=1)).strftime("%Y-%m-%d")
+        tomorrow_matches = await get_ct_date_matches(tomorrow_ct)
+        upcoming = [m for m in tomorrow_matches if m.get("status") not in ("FINISHED", "CANCELLED", "POSTPONED")]
+        if not upcoming:
+            return
+
+        lines = ["📅 Coming up tomorrow:"]
+        for m in sorted(upcoming, key=lambda x: x["kickoff_utc"]):
+            home_d = format_team(m["home"])
+            away_d = format_team(m["away"])
+            kickoff_utc = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+            time_str = kickoff_utc.astimezone(SGT).strftime("%-I:%M %p SGT")
+            lines.append(f"\n{home_d} vs {away_d} — {time_str}")
+            open_bets = [b for b in sheet.cache["bets"] if b["match_id"] == str(m["match_id"]) and b["status"] == "open"]
+            for b in sorted(open_bets, key=_get_sort_name):
+                lines.append(f"  {_format_bet_line(b, m)}")
+
+        await send_group("\n".join(lines))
+        logger.info("Coming up tomorrow sent after EOD")
+    except Exception as e:
+        logger.error(f"_send_coming_up_next_day failed: {e}")
+        await dm_admin(f"⚠️ Coming up tomorrow message failed: {e}")
+
+
 def trigger_poll(match_id: str):
     """Manually trigger an immediate poll for a match (admin use)."""
-    _schedule_poll(match_id, delay_seconds=0, attempt=99)
+    _schedule_poll(match_id, delay_seconds=0, attempt=1)
     logger.info(f"Admin triggered poll for match {match_id}")
 
 
@@ -866,17 +887,16 @@ async def check_all_matches_done(match_id: str = None):
             logger.info(f"EOD already fired for CT {target_ct_date}, skipping")
             return
 
-        # EOD fires only when ALL matches sharing the latest kickoff are finished
+        # EOD fires only when ALL active CT-day matches are finished
         active = [m for m in today_matches if m.get("status") not in ("CANCELLED", "POSTPONED")]
         if not active:
             return
-        latest_ko = max(m.get("kickoff_utc", "") for m in active)
-        co_latest = [m for m in active if m.get("kickoff_utc") == latest_ko]
-        if not all(m["status"] in ("FINISHED", "CANCELLED", "POSTPONED") for m in co_latest):
+        if not all(m["status"] in ("FINISHED", "CANCELLED", "POSTPONED") for m in active):
             return
 
         sheet.cache["eod_date"] = target_ct_date
-        logger.info(f"Last match done for CT {target_ct_date} — firing standings")
+        logger.info(f"All matches done for CT {target_ct_date} — waiting 10s before firing standings")
+        await asyncio.sleep(10)  # Allow in-flight bet writes to complete before cache refresh
         match_ids = [str(m["match_id"]) for m in today_matches]
         await job_post_standings(match_ids)
 
@@ -1153,6 +1173,9 @@ async def job_post_standings(match_ids: list):
         await send_group("\n".join(lines))
         logger.info("End of day standings and daily credits posted")
 
+        # Coming up tomorrow
+        await _send_coming_up_next_day()
+
         # Stage transition check — fire Katerina hype in background if today ends a stage
         asyncio.create_task(_katerina.check_and_send_stage_hype(notify_fn=dm_admin))
 
@@ -1356,6 +1379,8 @@ async def on_startup(notify_fn=None):
     4. DM admin
     """
     try:
+        # Brief pause before sheet access — prevents 429 on rapid restarts
+        await asyncio.sleep(8)
         await sheet.refresh_cache(notify_fn=dm_admin)
         await asyncio.sleep(5)  # Brief pause after cache read to avoid Sheets rate limit
 
@@ -1371,7 +1396,7 @@ async def on_startup(notify_fn=None):
                     await sheet.upsert_match(m, notify_fn=dm_admin)
                 except Exception as e:
                     logger.warning(f"Startup: upsert skipped for match {m.get('match_id', '?')}: {e}")
-                await asyncio.sleep(0.5)  # Rate limit: space out sheet writes
+                await asyncio.sleep(1.5)  # Rate limit: space out sheet writes
         except RuntimeError as e:
             await dm_admin(f"⚠️ Startup: failed to fetch today's fixtures: {e}\nUse /admin_refresh to retry.")
 
