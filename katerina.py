@@ -24,6 +24,23 @@ logger = logging.getLogger(__name__)
 
 # Ignore mentions sent before this time — prevents backlog replay after restart
 _startup_time = datetime.now(UTC)
+_last_response: dict = {}  # user_id -> last Katerina reply text (for source followups)
+
+
+def _is_source_followup(text: str) -> bool:
+    """Detect if the player is asking for the source of Katerina's last reply."""
+    keywords = ["source", "where did you get", "how do you know", "which site", "link", "cite", "reference", "prove it", "proof"]
+    return any(kw in text.lower() for kw in keywords)
+
+
+def _extract_text_blocks(content: list) -> str:
+    """Extract and join all text blocks from API response content array.
+    Takes ALL text blocks in order — handles multi-block search responses (Gap 6)."""
+    texts = [
+        b["text"].strip() for b in content
+        if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip()
+    ]
+    return " ".join(texts)
 
 def _get_current_stage() -> str:
     """Return current tournament stage name based on today's date."""
@@ -175,6 +192,19 @@ PLAYER BET STATUS:
 
 
 
+def _build_katerina_context_light() -> str:
+    """Trimmed context for web search calls — standings only, no bet detail (Gap 8)."""
+    now_sgt = datetime.now(SGT)
+    standings = sheet.get_standings()
+    lines = [f"WC Kings 2026 | {now_sgt.strftime('%I:%M %p SGT')} | 5 players: Peng, Roy, Calvin, OZY, Shun"]
+    lines.append("Standings:")
+    for i, u in enumerate(standings, 1):
+        raw = truncate(u.get("first_name") or u.get("username") or "?")
+        name = NAME_OVERRIDES.get(raw, raw)
+        lines.append(f"{i}. {name} — {u['credits']:,}c")
+    return "\n".join(lines)
+
+
 async def _call_katerina(user_message: str, bot_context: str, sender_name: str = None, sender_stats: str = None) -> str:
     """Call Claude API to get Katerina's reply."""
 
@@ -198,14 +228,19 @@ Your personality:
 - "Sucker" is reserved ONLY for people who lost bets or have a bad record — do NOT use it as a generic filler or casual address.
 - Short replies — 1 to 3 sentences max unless the question genuinely needs more.
 - When referencing data, always say "as of [time]" from the data snapshot.
-- If the data doesn't confirm something, say you don't have that right now.
 - You NEVER place bets, change credits, or run commands. Direct to /bet only — NEVER mention /predict.
 - You are NOT a customer service bot. You have a personality. Use it.
 - When someone says "me" or "my", they are referring to the person identified in THE PERSON TALKING TO YOU RIGHT NOW. Address them by name.
 - NEVER use markdown formatting. No **bold**, no _italic_, no backticks. Plain text only.
 - NEVER mention match kickoff times in your replies.
 - When referencing a failed or dead parlay, always use the 🥀 emoji.
-- When asked about predictions and search results are unavailable, say you couldn't find current expert opinions and leave it there. Do NOT speculate, invent analysis, or make up facts.
+
+FACTUAL RULES — CRITICAL, NON-NEGOTIABLE:
+- If web search results are provided in your context, use ONLY those results to answer factual questions. Do not add anything not in the results.
+- If no search results are available and the question requires live data (team form, injuries, match previews, odds), say exactly: "I couldn't find reliable information on that right now." Then stop. Do NOT speculate, invent analysis, or fill gaps with what you think you know.
+- Never use phrases like "I believe", "I think", "likely", "probably", "typically" when making factual sports claims.
+- WC 2026 is live — do not use pre-tournament training knowledge as a substitute for live search data.
+- CITATIONS: Do not cite sources in your reply unless the player explicitly asks where you got the information.
 
 Current bot state:
 """ + bot_context + sender_block
@@ -228,8 +263,7 @@ Current bot state:
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read())
-            text_blocks = [b for b in data.get("content", []) if b.get("type") == "text"]
-            return text_blocks[0]["text"].strip() if text_blocks else None
+            return _extract_text_blocks(data.get("content", [])) or None
     except Exception as e:
         logger.error(f"Katerina API call failed: {e}")
         return None
@@ -706,7 +740,8 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
     sender = update.effective_user
     sender_uid = sender.id
     sender_cache = sheet.cache["users"].get(sender_uid, {})
-    sender_name = sender_cache.get("first_name") or sender_cache.get("username") or sender.first_name or sender.username or "someone"
+    raw_sender_name = sender_cache.get("first_name") or sender_cache.get("username") or sender.first_name or sender.username or "someone"
+    sender_name = NAME_OVERRIDES.get(raw_sender_name, raw_sender_name)
     sender_credits = sender_cache.get("credits", 0)
     sender_in_bet = _get_in_bet_for_katerina(sender_uid)
     sender_effective = sender_credits + sender_in_bet
@@ -726,16 +761,48 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
         f"Rank: {sender_rank} of {len(standings)}"
     ) if sender_rank else f"Credits: {credit_detail} (not yet ranked)"
 
-    # Check if this is a predictions/odds/analysis question — trigger web search
-    search_keywords = ["odds", "prediction", "predict", "outside world", "favourite", "favorite",
-                       "who will win", "analysis", "expert", "betting line", "what do you think",
-                       "chance", "likely", "bookie", "market"]
-    wants_analysis = any(kw in clean.lower() for kw in search_keywords)
+    # Source followup — player asking where last reply came from
+    if _is_source_followup(clean) and sender_uid in _last_response:
+        source_prompt = (
+            f"{sender_name} is asking for the source of your last reply. "
+            f"Your last reply was: \"{_last_response[sender_uid]}\"\n"
+            f"If it came from a web search, describe the type of source (news outlet, sports analytics, official site etc). "
+            f"If it came from the bot's own data, say so. If you genuinely don't know, say so. Never invent a source."
+        )
+        bot_context = _build_katerina_context()
+        reply = await _call_katerina(source_prompt, bot_context, sender_name=sender_name, sender_stats=sender_stats)
+        if reply:
+            _last_response[sender_uid] = reply
+            await update.message.reply_text(reply)
+        return
+
+    # Check if this is a factual sports question requiring web search
+    search_keywords = [
+        "form", "injur", "head to head", "h2h", "odds", "favourite", "favorite",
+        "predict", "prediction", "who will win", "who do you", "what do you think",
+        "read today", "your read", "analysis", "expert", "chance", "likely",
+        "score", "result", "latest", "news", "update", "squad", "lineup",
+        "coach", "manager", "how have", "recent", "last game", "last match",
+        "qualification", "knockout", "bracket", "group standing", "table",
+        "betting line", "market", "outside world", "bookie", "pundit",
+        "stats", "record against", "when did", "what are", "tonight",
+    ]
+    wants_search = any(kw in clean.lower() for kw in search_keywords)
 
     web_results = ""
-    if wants_analysis:
+    if wants_search:
+        # Send immediate ack before search blocks the event loop
+        sender_handle = f"@{sender.username}" if sender.username else sender_name
+        topic = clean[:60].strip()
+        if len(clean) > 60:
+            topic += "..."
+        ack_text = f"On it, {sender_name}. Checking: {topic}"
+        try:
+            await update.message.reply_text(ack_text)
+        except Exception:
+            pass
 
-        # Resolve to the team's next upcoming match first
+        # Resolve match context for the query
         now_utc = datetime.now(UTC)
         match_query = None
         for m in sorted(sheet.cache.get("matches", {}).values(), key=lambda x: x.get("kickoff_utc", "")):
@@ -745,22 +812,20 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
                 try:
                     ko = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
                     if ko > now_utc and m.get("status") in ("SCHEDULED", "TIMED"):
-                        match_query = f"{home} vs {away} prediction analyst preview 2026 World Cup"
+                        match_query = f"{home} vs {away} preview analyst prediction 2026 World Cup"
                         break
                 except Exception:
                     continue
         if not match_query:
-            match_query = f"{clean} 2026 World Cup analyst prediction preview"
+            match_query = f"{clean} 2026 World Cup"
 
         search_prompt = (
-            f"Search for analyst predictions and expert previews for: {match_query}. "
-            f"Focus on: win probability, expected scoreline or predicted result, team form and recent performance. "
-            f"Do NOT include individual player highlights, live betting odds, or bookmaker prices. "
-            f"Return a factual 3-sentence summary of what analysts and pundits are saying. No fluff."
+            f"Search for factual, analyst-backed information about: {match_query}. "
+            f"Focus on: recent team form, injuries, head-to-head record, and any analyst predictions. "
+            f"Return only facts from search results. If no reliable results found, say so explicitly."
         )
 
         try:
-            # Step 1 — send search request, get tool_use block back
             step1_payload = json.dumps({
                 "model": "claude-sonnet-4-6",
                 "max_tokens": 1024,
@@ -776,30 +841,19 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
                     "x-api-key": ANTHROPIC_API_KEY
                 }
             )
-            with urllib.request.urlopen(req1, timeout=20) as resp1:
+            with urllib.request.urlopen(req1, timeout=25) as resp1:
                 step1 = json.loads(resp1.read())
 
-            # Extract tool_use blocks from step 1 response
             tool_use_blocks = [b for b in step1.get("content", []) if b.get("type") == "tool_use"]
 
             if not tool_use_blocks:
-                # Model returned text directly without searching
-                for block in step1.get("content", []):
-                    if block.get("type") == "text" and block.get("text", "").strip():
-                        web_results = block["text"].strip()
-                        break
+                web_results = _extract_text_blocks(step1.get("content", []))
             else:
-                # Step 2 — send tool results back to get final answer
-                # web_search_20250305 is server-side; tool_result content="" is correct
                 messages = [
                     {"role": "user", "content": search_prompt},
                     {"role": "assistant", "content": step1.get("content", [])},
                     {"role": "user", "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": b["id"],
-                            "content": ""
-                        }
+                        {"type": "tool_result", "tool_use_id": b["id"], "content": ""}
                         for b in tool_use_blocks
                     ]}
                 ]
@@ -818,13 +872,11 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
                         "x-api-key": ANTHROPIC_API_KEY
                     }
                 )
-                with urllib.request.urlopen(req2, timeout=20) as resp2:
+                with urllib.request.urlopen(req2, timeout=25) as resp2:
                     step2 = json.loads(resp2.read())
 
-                # Extract text — may need another round if model searched again
                 step2_tool_use = [b for b in step2.get("content", []) if b.get("type") == "tool_use"]
                 if step2_tool_use:
-                    # Model searched again — do one more round
                     messages2 = messages + [
                         {"role": "assistant", "content": step2.get("content", [])},
                         {"role": "user", "content": [
@@ -847,23 +899,21 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
                             "x-api-key": ANTHROPIC_API_KEY
                         }
                     )
-                    with urllib.request.urlopen(req3, timeout=20) as resp3:
+                    with urllib.request.urlopen(req3, timeout=25) as resp3:
                         step2 = json.loads(resp3.read())
 
-                for block in step2.get("content", []):
-                    if block.get("type") == "text" and block.get("text", "").strip():
-                        web_results = block["text"].strip()
-                        break
+                web_results = _extract_text_blocks(step2.get("content", []))
 
         except Exception as e:
             logger.error(f"Katerina web search failed: {e}")
             web_results = ""
 
-    bot_context = _build_katerina_context()
+    # Build context — lighter when search is active (Gap 8)
+    bot_context = _build_katerina_context_light() if wants_search else _build_katerina_context()
     if web_results:
-        bot_context += f"\nWEB SEARCH RESULTS (use this to answer their question about match predictions):\n{web_results}"
-    elif wants_analysis:
-        bot_context += "\nWEB SEARCH: Could not retrieve current expert predictions. Tell the user you couldn't find current opinions on this. Do NOT speculate, invent analysis, or fabricate any facts."
+        bot_context += f"\n\nWEB SEARCH RESULTS (use ONLY these facts to answer — do not add anything not in these results):\n{web_results}"
+    elif wants_search:
+        bot_context += "\n\nWEB SEARCH: No reliable results found. Tell the player you couldn't find current information on that. Do NOT speculate or invent any facts."
 
     if _chat_history:
         history_str = "\n".join(list(_chat_history)[-50:])
@@ -889,7 +939,13 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
 
     reply = await _call_katerina(clean, bot_context, sender_name=sender_name, sender_stats=sender_stats)
     if reply:
-        await update.message.reply_text(reply)
+        _last_response[sender_uid] = reply
+        # Tag the player in search replies so they know it's their answer
+        if wants_search:
+            sender_handle = f"@{sender.username}" if sender.username else sender_name
+            await update.effective_chat.send_message(f"{sender_handle} {reply}")
+        else:
+            await update.message.reply_text(reply)
     else:
         fallbacks = [
             "I'm thinking. Don't rush me. 😒",
