@@ -2,7 +2,7 @@ import gspread
 import json
 import logging
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from google.oauth2.service_account import Credentials
 from config import (
     SPREADSHEET_ID, GOOGLE_CREDENTIALS_JSON,
@@ -234,6 +234,31 @@ async def refresh_cache(notify_fn=None):
                                 cache[f"match_credits_{mid}"] = True
             except Exception as e:
                 logger.warning(f"Could not rebuild match_credits from ledger: {e}")
+
+            # Rebuild held_results from ledger — morning flush survives restarts
+            try:
+                held_cutoff = datetime.now(UTC) - timedelta(hours=12)
+                held = []
+                flushed = False
+                for row in reversed(ledger_data):
+                    ts_str = str(row.get("timestamp", ""))
+                    try:
+                        ts = datetime.strptime(ts_str[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                    except Exception:
+                        continue
+                    if ts < held_cutoff:
+                        break
+                    row_type = str(row.get("type", ""))
+                    if row_type == "held_result_flushed":
+                        flushed = True
+                        break
+                    if row_type == "held_result":
+                        held.insert(0, str(row.get("notes", "")))
+                if held and not flushed:
+                    cache["held_results"] = held
+                    logger.info(f"Rebuilt {len(held)} held result(s) from ledger")
+            except Exception as e:
+                logger.warning(f"Could not rebuild held_results from ledger: {e}")
         except Exception as e:
             logger.warning(f"Could not rebuild paid_parlays from ledger: {e}")
             cache["paid_parlays"] = set()
@@ -687,16 +712,16 @@ async def void_parlay_bets(parlay_id: str, user_id: int, notify_fn=None) -> int:
         return 0
 
     try:
-        ws = get_sheet(SHEET_BETS)
-        for bet in parlay_bets:
-            row_num = _bet_rows.get(bet["bet_id"])
-            if row_num:
-                ws.update_cell(row_num, 7, "void")
-            bet["status"] = "void"
-
-        # Refund total stake once — amount is the same on all legs, deducted only once
-        stake = parlay_bets[0]["amount"]
         async with get_user_lock(user_id):
+            ws = get_sheet(SHEET_BETS)
+            for bet in parlay_bets:
+                row_num = _bet_rows.get(bet["bet_id"])
+                if row_num:
+                    ws.update_cell(row_num, 7, "void")
+                bet["status"] = "void"
+
+            # Refund total stake once — amount is the same on all legs, deducted only once
+            stake = parlay_bets[0]["amount"]
             user = cache["users"].get(user_id)
             if user:
                 new_credits = user["credits"] + stake

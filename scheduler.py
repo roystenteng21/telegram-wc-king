@@ -582,6 +582,7 @@ async def _auto_settle_stuck_match(match_id: str):
             if "held_results" not in sheet.cache:
                 sheet.cache["held_results"] = []
             sheet.cache["held_results"].append(base_result_msg)
+            await sheet.append_ledger(0, "held_result", 0, 0, base_result_msg, dm_admin)
             if not scheduler.get_job("morning_flush"):
                 now_sgt = datetime.now(SGT)
                 send_time_sgt = now_sgt.replace(hour=MORNING_CATCHUP_HOUR, minute=MORNING_CATCHUP_MINUTE, second=0, microsecond=0)
@@ -707,6 +708,7 @@ async def job_poll_result(match_id: str, attempt: int = 1):
             if "held_results" not in sheet.cache:
                 sheet.cache["held_results"] = []
             sheet.cache["held_results"].append(base_result_msg)
+            await sheet.append_ledger(0, "held_result", 0, 0, base_result_msg, dm_admin)
 
             # Schedule morning flush if not already scheduled
             if not scheduler.get_job("morning_flush"):
@@ -777,6 +779,7 @@ async def _send_morning_flush():
 
         await send_group("\n".join(lines))
         logger.info(f"Morning flush sent: {match_count} result(s)")
+        await sheet.append_ledger(0, "held_result_flushed", 0, 0, "Morning flush sent", dm_admin)
 
         # Fire coming up today once
         await _send_coming_up_today()
@@ -1469,6 +1472,15 @@ async def on_startup(notify_fn=None):
         if now_sgt.hour == NIGHT_REMINDER_HOUR:
             logger.info("Startup during 11PM hour — firing night reminder immediately")
             scheduler.add_job(job_night_reminder, trigger=DateTrigger(run_date=datetime.now(UTC) + timedelta(seconds=5)), id="night_reminder_recovery", replace_existing=True)
+
+        # Startup recovery — re-schedule morning flush if held results exist from before restart
+        if sheet.cache.get("held_results"):
+            flush_sgt = now_sgt.replace(hour=MORNING_CATCHUP_HOUR, minute=MORNING_CATCHUP_MINUTE, second=0, microsecond=0)
+            if flush_sgt <= now_sgt:
+                flush_sgt = flush_sgt + timedelta(days=1)
+            flush_utc = flush_sgt.astimezone(UTC)
+            scheduler.add_job(_send_morning_flush, trigger=DateTrigger(run_date=flush_utc), id="morning_flush", replace_existing=True)
+            logger.info(f"Startup: re-scheduled morning flush at {flush_utc} — {len(sheet.cache['held_results'])} held result(s)")
 
         if _bot is not None:
             await dm_admin(

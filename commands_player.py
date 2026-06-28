@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -291,6 +291,17 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /groups ───────────────────────────────────────────────────────────────────
 async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_registered(update)
+
+    # During knockout stage, group standings are no longer relevant
+    from config import TOURNAMENT_STAGES
+    today = datetime.now(UTC).date()
+    group_stage = next((s for s in TOURNAMENT_STAGES if s["name"] == "Group Stage"), None)
+    if group_stage and today > group_stage["end"]:
+        await update.message.reply_text(
+            "Group stage is over.\nUse /brackets for the knockout bracket."
+        )
+        return
+
     try:
         today_matches = await sched.get_today_ct_matches()
         today_teams = {team for m in today_matches for team in (m["home"], m["away"])}
