@@ -15,7 +15,8 @@ from config import (
     PREMATCH_SUMMARY_MINUTES, POLL_START_OFFSET, POLL_INTERVAL,
     KNOCKOUT_DURATION, ANTHROPIC_API_KEY,
     ADMIN_TELEGRAM_ID, BOT_VERSION, TEAM_DISPLAY, PARLAY_MULTIPLIERS,
-    DAILY_CREDIT_TIERS, TOURNAMENT_FINAL_DATE, NAME_OVERRIDES
+    DAILY_CREDIT_TIERS, TOURNAMENT_FINAL_DATE, NAME_OVERRIDES,
+    STATUS_ACTIVE_PLAY
 )
 import sheet
 import api
@@ -797,7 +798,7 @@ async def _send_coming_up_today():
         for m in sorted(remaining, key=lambda x: x["kickoff_utc"]):
             home_d = format_team(m["home"])
             away_d = format_team(m["away"])
-            if m["status"] in ("IN_PLAY", "PAUSED", "HALFTIME"):
+            if m["status"] in STATUS_ACTIVE_PLAY:
                 lines.append(f"\n{home_d} vs {away_d} — ● In Play")
             else:
                 kickoff_utc = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
@@ -1184,6 +1185,39 @@ async def job_post_standings(match_ids: list):
         await dm_admin(f"⚠️ Post standings job failed: {e}")
 
 
+# ── Finished-match settlement guard ──────────────────────────────────────────
+async def _check_finished_matches_need_settlement() -> list:
+    """
+    Check all cached matches. For any that are FINISHED with a result and still
+    have open bets, schedule _auto_settle_stuck_match if not already scheduled.
+    Returns list of match_ids that had auto_settle scheduled (for health monitor DM).
+    """
+    scheduled = []
+    job_ids = {job.id for job in scheduler.get_jobs()}
+    for m in sheet.cache.get("matches", {}).values():
+        if m.get("status") != "FINISHED":
+            continue
+        if not m.get("result"):
+            continue
+        match_id = str(m["match_id"])
+        open_bets = [b for b in sheet.cache["bets"] if b["match_id"] == match_id and b["status"] == "open"]
+        if not open_bets:
+            continue
+        job_id = f"auto_settle_{match_id}"
+        if job_id in job_ids:
+            continue
+        scheduler.add_job(
+            _auto_settle_stuck_match,
+            trigger=DateTrigger(run_date=datetime.now(UTC) + timedelta(seconds=5)),
+            args=[match_id],
+            id=job_id,
+            replace_existing=True
+        )
+        scheduled.append(match_id)
+        logger.info(f"Match {match_id} FINISHED with open bets — scheduled auto-settle")
+    return scheduled
+
+
 # ── Cache refresh job ─────────────────────────────────────────────────────────
 async def job_refresh_cache():
     await sheet.refresh_cache(notify_fn=dm_admin)
@@ -1204,6 +1238,9 @@ async def job_refresh_cache():
                 pass  # API fetch failure — skip date, don't break full refresh
     except Exception as e:
         logger.warning(f"Cache refresh API upsert failed: {e}")
+
+    # After upserts: catch any FINISHED matches with open bets that have no settlement job
+    await _check_finished_matches_need_settlement()
 
 
 # ── Health monitor job ────────────────────────────────────────────────────────
@@ -1231,16 +1268,21 @@ async def job_health_monitor():
         if "cache_refresh" not in job_ids:
             issues.append("cache_refresh job missing from scheduler")
 
-        # 3. Any match IN_PLAY or PAUSED with no poll job registered
+        # 3. Any match in active play with no poll job registered
         for m in sheet.cache.get("matches", {}).values():
-            if m.get("status") in ("IN_PLAY", "PAUSED", "HALFTIME"):
+            if m.get("status") in STATUS_ACTIVE_PLAY:
                 mid = str(m["match_id"])
                 has_poll = any(mid in job.id and "poll" in job.id for job in scheduler.get_jobs())
                 if not has_poll:
                     _schedule_poll(mid, delay_seconds=10, attempt=1)
                     issues.append(f"Match {mid} is {m['status']} — no poll job found, scheduled emergency poll")
 
-        # 4. Bot can reach group chat — lightweight check via _group_chat_id
+        # 4. Any FINISHED match with open bets and no settlement job
+        settled = await _check_finished_matches_need_settlement()
+        for mid in settled:
+            issues.append(f"Match {mid} FINISHED with open bets — no settlement job found, scheduled auto-settle")
+
+        # 5. Bot can reach group chat — lightweight check via _group_chat_id
         if _group_chat_id is None:
             issues.append("Group chat ID not set — bot may not be connected to group")
 
@@ -1315,7 +1357,7 @@ def register_match_jobs(matches: list):
                     logger.info(f"Match {match_id} FINISHED with open bets — scheduled auto-settle")
             continue
 
-        if status in ("IN_PLAY", "PAUSED", "HALFTIME"):
+        if status in STATUS_ACTIVE_PLAY:
             # Bot restarted mid-match — schedule immediate poll
             _schedule_poll(match_id, delay_seconds=10, attempt=1)
             logger.info(f"Bot restarted mid-match {match_id} ({status}) — scheduling immediate poll")
