@@ -6,7 +6,8 @@ from telegram.ext import ContextTypes
 from config import (
     ADMIN_TELEGRAM_ID, SGT, UTC, CT, TEAM_DISPLAY,
     RESULT_OUTCOMES, ALL_OUTCOMES,
-    SESSION_EXPIRY, BET_LOCK_BUFFER, PARLAY_MULTIPLIERS, NAME_OVERRIDES
+    SESSION_EXPIRY, BET_LOCK_BUFFER, PARLAY_MULTIPLIERS, NAME_OVERRIDES,
+    STATUS_ACTIVE_PLAY
 )
 import sheet
 import scheduler as sched
@@ -289,61 +290,138 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"💰 {name}, your balance: {credits:,}c")
 
 
+# ── Bracket helpers ───────────────────────────────────────────────────────────
+def _find_bracket_match(r32_entry: dict) -> dict | None:
+    """Find match in cache by match_id first, then by team names as fallback."""
+    if r32_entry.get("match_id"):
+        m = sheet.cache["matches"].get(str(r32_entry["match_id"]))
+        if m:
+            return m
+    home = r32_entry["home"].lower()
+    away = r32_entry["away"].lower()
+    for m in sheet.cache["matches"].values():
+        if m.get("home", "").lower() == home and m.get("away", "").lower() == away:
+            return m
+    return None
+
+
+def _bracket_team(name: str) -> str:
+    """Format team as flag + code for bracket display."""
+    if name in TEAM_DISPLAY:
+        code, flag = TEAM_DISPLAY[name]
+        return f"{flag} {code}"
+    return name[:3].upper()
+
+
+def _format_r32_line(r32_entry: dict, active_ct: str) -> str:
+    """Format a single R32 match line. active_ct is the CT date being displayed."""
+    home = _bracket_team(r32_entry["home"])
+    away = _bracket_team(r32_entry["away"])
+    match = _find_bracket_match(r32_entry)
+
+    if not match:
+        return f"{home} vs {away}"
+
+    status = match.get("status", "")
+
+    if status == "FINISHED":
+        hs = match.get("home_score", "?")
+        as_ = match.get("away_score", "?")
+        return f"{home} {hs}–{as_} {away} ✅"
+
+    if status in STATUS_ACTIVE_PLAY:
+        return f"{home} vs {away} ⚽ Live"
+
+    try:
+        ko = datetime.strptime(match["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+        match_ct = ko.astimezone(CT).strftime("%Y-%m-%d")
+        if match_ct == active_ct:
+            time_str = ko.astimezone(SGT).strftime("%-I:%M %p SGT").lstrip("0")
+            return f"{home} vs {away} · {time_str}"
+        ko_label = ko.astimezone(SGT).strftime("%-d %b")
+        return f"{home} vs {away} · {ko_label}"
+    except Exception:
+        return f"{home} vs {away}"
+
+
+def _group_has_match_on(group: dict, ct_date: str) -> bool:
+    """Return True if any R32 match in this group falls on the given CT date."""
+    for pair in group["pairs"]:
+        for r32 in pair["r32"]:
+            match = _find_bracket_match(r32)
+            if not match or not match.get("kickoff_utc"):
+                continue
+            try:
+                ko = datetime.strptime(match["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                if ko.astimezone(CT).strftime("%Y-%m-%d") == ct_date:
+                    return True
+            except Exception:
+                pass
+    return False
+
+
 # ── /brackets ─────────────────────────────────────────────────────────────────
 async def cmd_brackets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_registered(update)
+
     from config import TOURNAMENT_STAGES
-    today = datetime.now(UTC).date()
+    from brackets import BRACKET
+
+    today_date = datetime.now(UTC).date()
     group_stage = next((s for s in TOURNAMENT_STAGES if s["name"] == "Group Stage"), None)
-    if group_stage and today <= group_stage["end"]:
+    if group_stage and today_date <= group_stage["end"]:
         await update.message.reply_text(
             "Group stage is still ongoing. Bracket available once knockout starts."
         )
         return
 
-    try:
-        matches = api.fetch_knockout_matches()
-    except RuntimeError as e:
-        await update.message.reply_text(f"⚠️ Could not fetch bracket: {e}")
+    today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+
+    # Show groups with matches today
+    active_groups = [g for g in BRACKET if _group_has_match_on(g, today_ct)]
+    active_ct = today_ct
+
+    if not active_groups:
+        # No matches today — find next upcoming CT date across all groups
+        upcoming = []
+        for group in BRACKET:
+            for pair in group["pairs"]:
+                for r32 in pair["r32"]:
+                    match = _find_bracket_match(r32)
+                    if not match or not match.get("kickoff_utc"):
+                        continue
+                    if match.get("status") in ("FINISHED", "CANCELLED", "POSTPONED"):
+                        continue
+                    try:
+                        ko = datetime.strptime(match["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                        ct_date = ko.astimezone(CT).strftime("%Y-%m-%d")
+                        if ct_date > today_ct:
+                            upcoming.append(ct_date)
+                    except Exception:
+                        pass
+
+        if not upcoming:
+            await update.message.reply_text("No upcoming bracket matches found.")
+            return
+
+        active_ct = min(upcoming)
+        active_groups = [g for g in BRACKET if _group_has_match_on(g, active_ct)]
+
+    if not active_groups:
+        await update.message.reply_text("No upcoming bracket matches found.")
         return
 
-    if not matches:
-        await update.message.reply_text("Knockout bracket not yet available.")
-        return
-
-    STAGE_ORDER = [
-        ("ROUND_OF_32",  "🔵 Round of 32"),
-        ("ROUND_OF_16",  "🟡 Round of 16"),
-        ("QUARTER_FINAL","🟠 Quarterfinals"),
-        ("SEMI_FINAL",   "🔴 Semifinals"),
-        ("THIRD_PLACE",  "🥉 Third Place"),
-        ("FINAL",        "🏆 Final"),
-    ]
-
-    by_stage = {}
-    for m in matches:
-        by_stage.setdefault(m["stage"], []).append(m)
-
-    lines = ["🗓 WC 2026 Bracket\n"]
-    for stage_key, stage_label in STAGE_ORDER:
-        if stage_key not in by_stage:
-            continue
-        lines.append(stage_label)
-        for m in sorted(by_stage[stage_key], key=lambda x: x["utcDate"]):
-            home = format_team(m["home"]) if m["home"] != "TBD" else "TBD"
-            away = format_team(m["away"]) if m["away"] != "TBD" else "TBD"
-            if m["status"] == "FINISHED" and m["home_score"] is not None:
-                lines.append(f"{home} {m['home_score']}–{m['away_score']} {away} ✅")
-            elif m["status"] in ("IN_PLAY", "PAUSED", "HALFTIME"):
-                lines.append(f"{home} vs {away} ● Live")
-            else:
-                try:
-                    ko = datetime.strptime(m["utcDate"][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=UTC)
-                    ko_sgt = ko.astimezone(SGT).strftime("%-d %b, %-I:%M%p SGT").lower()
-                    lines.append(f"{home} vs {away} — {ko_sgt}")
-                except Exception:
-                    lines.append(f"{home} vs {away}")
+    lines = ["⚽ WC 2026 Bracket"]
+    for group in active_groups:
         lines.append("")
+        lines.append(f"🟠 {group['qf_label']} · {group['qf_date']}")
+        lines.append("")
+        lines.append("🔵 Round of 32")
+        for pair in group["pairs"]:
+            lines.append("")
+            for r32 in pair["r32"]:
+                lines.append(_format_r32_line(r32, active_ct))
+            lines.append(f"→ {pair['r16_label']} · {pair['r16_date']}")
 
     await update.message.reply_text("\n".join(lines))
 
