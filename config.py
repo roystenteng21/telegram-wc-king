@@ -63,8 +63,7 @@ BET_LOCK_BUFFER = 30
 POLL_START_OFFSET = 120 * 60   # 120 minutes (90min match + 15min HT + 15min buffer)
 POLL_INTERVAL = 5 * 60        # 5 minutes in seconds
 
-# Group stage match duration (seconds)
-GROUP_STAGE_DURATION = 90 * 60
+# Knockout match duration (seconds) — used for poll offset
 KNOCKOUT_DURATION = 120 * 60
 
 # Scheduler times (SGT)

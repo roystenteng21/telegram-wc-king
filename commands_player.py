@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -111,6 +111,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/cancel — Cancel an open bet\n"
         "/cancelparlay — Cancel an active parlay\n"
         "/balance — Your current credits\n"
+        "/brackets — WC 2026 knockout bracket\n"
         "/leaderboard — Full standings\n"
         "/help — This message\n\n"
         "Bets lock at kickoff. All times in SGT."
@@ -288,63 +289,15 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"💰 {name}, your balance: {credits:,}c")
 
 
-# ── /groups ───────────────────────────────────────────────────────────────────
-async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ensure_registered(update)
-
-    # During knockout stage, group standings are no longer relevant
-    from config import TOURNAMENT_STAGES
-    today = datetime.now(UTC).date()
-    group_stage = next((s for s in TOURNAMENT_STAGES if s["name"] == "Group Stage"), None)
-    if group_stage and today > group_stage["end"]:
-        await update.message.reply_text(
-            "Group stage is over.\nUse /brackets for the knockout bracket."
-        )
-        return
-
-    try:
-        today_matches = await sched.get_today_ct_matches()
-        today_teams = {team for m in today_matches for team in (m["home"], m["away"])}
-
-        all_standings = api.fetch_standings()
-        if not all_standings:
-            await update.message.reply_text("No standings available yet.")
-            return
-
-        lines = ["📊 Group Standings\n"]
-        for group in all_standings:
-            group_teams = {row["team"] for row in group["table"]}
-            if today_teams and not today_teams.intersection(group_teams):
-                continue
-            group_name = group["group"].replace("GROUP_", "Group ")
-            lines.append(f"── {group_name} ──")
-            for row in group["table"]:
-                team = row["team"]
-                if team in TEAM_DISPLAY:
-                    code, flag = TEAM_DISPLAY[team]
-                    flag_code = f"{flag} {code}"
-                else:
-                    flag_code = team[:3].upper()
-                w, d, l = row["won"], row["draw"], row["lost"]
-                pts = row["points"]
-                lines.append(f"{row['position']}. {flag_code} — {pts}pts ({w}W {d}D {l}L)")
-            lines.append("")
-
-        await update.message.reply_text("\n".join(lines))
-    except RuntimeError as e:
-        await update.message.reply_text(f"⚠️ Could not fetch standings: {e}")
-
-
 # ── /brackets ─────────────────────────────────────────────────────────────────
 async def cmd_brackets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_registered(update)
-
     from config import TOURNAMENT_STAGES
     today = datetime.now(UTC).date()
     group_stage = next((s for s in TOURNAMENT_STAGES if s["name"] == "Group Stage"), None)
     if group_stage and today <= group_stage["end"]:
         await update.message.reply_text(
-            "Group stage is still ongoing.\nUse /groups for current standings."
+            "Group stage is still ongoing. Bracket available once knockout starts."
         )
         return
 

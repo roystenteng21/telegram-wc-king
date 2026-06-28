@@ -163,50 +163,6 @@ def fetch_today_matches() -> list:
     return fetch_matches_for_date(today)
 
 
-def fetch_standings(group_filter: list = None) -> list:
-    """
-    Fetch WC group stage standings.
-    Returns list of group dicts: {group, table: [{position, team, points, won, draw, lost}]}
-    Optionally filter to specific group names e.g. ["GROUP_A", "GROUP_B"].
-    Raises RuntimeError on API failure.
-    """
-    try:
-        data = _get(f"/competitions/{WC_COMPETITION}/standings")
-        if not data or "standings" not in data:
-            logger.warning("No standings data returned")
-            return []
-
-        groups = []
-        for standing in data["standings"]:
-            group = standing.get("group", "")
-            if not group:
-                continue
-            if group_filter and group not in group_filter:
-                continue
-            table = []
-            for row in standing.get("table", []):
-                team_name = row.get("team", {}).get("name", "")
-                table.append({
-                    "position": row.get("position"),
-                    "team": team_name,
-                    "points": row.get("points", 0),
-                    "won": row.get("won", 0),
-                    "draw": row.get("draw", 0),
-                    "lost": row.get("lost", 0),
-                    "played": row.get("playedGames", 0),
-                })
-            groups.append({"group": group, "table": table})
-
-        logger.info(f"Fetched standings for {len(groups)} groups")
-        return groups
-
-    except RuntimeError:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to fetch standings: {e}")
-        raise RuntimeError(f"Failed to fetch standings: {e}")
-
-
 def fetch_knockout_matches() -> list:
     """
     Fetch WC knockout stage matches.

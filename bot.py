@@ -127,7 +127,6 @@ def setup_handlers():
     application.add_handler(CommandHandler("help", cp.cmd_help))
     application.add_handler(CommandHandler("matches", cp.cmd_matches))
     application.add_handler(CommandHandler("balance", cp.cmd_balance))
-    application.add_handler(CommandHandler("groups", cp.cmd_groups))
     application.add_handler(CommandHandler("brackets", cp.cmd_brackets))
     application.add_handler(CommandHandler("leaderboard", cp.cmd_leaderboard))
     application.add_handler(CommandHandler("mybets", cp.cmd_mybets))
@@ -178,7 +177,7 @@ async def post_init(app):
         BotCommand("cancelparlay", "Cancel an active parlay"),
         BotCommand("balance", "Your current credits"),
         BotCommand("predict", "Free event prediction"),
-        BotCommand("groups", "Group stage standings"),
+        BotCommand("brackets", "WC 2026 knockout bracket"),
         BotCommand("leaderboard", "Credits standings"),
         BotCommand("roast", "Ask Katerina to roast someone"),
         BotCommand("help", "Help"),
