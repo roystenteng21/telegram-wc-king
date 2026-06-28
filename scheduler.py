@@ -921,6 +921,18 @@ async def job_post_standings(match_ids: list):
             if m:
                 today_matches.append(m)
 
+        # Derive CT date from match kickoffs — more reliable than datetime.now(CT)
+        ct_date = None
+        for m in today_matches:
+            try:
+                ko = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                ct_date = ko.astimezone(CT).strftime("%Y-%m-%d")
+                break
+            except Exception:
+                continue
+        if not ct_date:
+            ct_date = datetime.now(CT).strftime("%Y-%m-%d")
+
         # Get standings BEFORE adding credits (for P&L calculation)
         pl_map = sheet.get_daily_pl(match_ids)
         standings_before = sheet.get_standings()
@@ -1027,7 +1039,7 @@ async def job_post_standings(match_ids: list):
                 tier_map[standings_before[k]["user_id"]] = amount
             rank_pos += (j - i)
             i = j
-        await sheet.add_tiered_daily_credits(tier_map, notify_fn=dm_admin)
+        await sheet.add_tiered_daily_credits(tier_map, notify_fn=dm_admin, ct_date=ct_date)
 
         # Get standings AFTER credits added
         standings_after = sheet.get_standings()

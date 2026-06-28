@@ -189,29 +189,51 @@ async def refresh_cache(notify_fn=None):
             # Rebuild eod_date and daily_credits_date from ledger — survive restarts
             try:
                 cutoff = datetime.now(UTC) - timedelta(hours=36)
-                recent_daily_credit_ts = []
+                recent_ct_dates = []
                 for row in ledger_data:
                     if str(row.get("type", "")) == "daily_credit":
+                        notes = str(row.get("notes", ""))
+                        # Primary: read CT date directly from notes "CT:YYYY-MM-DD"
+                        ct_from_notes = None
+                        if "CT:" in notes:
+                            try:
+                                ct_from_notes = notes.split("CT:")[1][:10]
+                                datetime.strptime(ct_from_notes, "%Y-%m-%d")  # validate
+                            except Exception:
+                                ct_from_notes = None
+                        if ct_from_notes:
+                            recent_ct_dates.append(ct_from_notes)
+                            continue
+                        # Fallback: convert ledger timestamp to CT date
                         ts_str = str(row.get("timestamp", ""))
                         try:
                             ts = datetime.strptime(ts_str[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
                             if ts >= cutoff:
-                                recent_daily_credit_ts.append(ts)
+                                from config import CT as _CT
+                                recent_ct_dates.append(ts.astimezone(_CT).strftime("%Y-%m-%d"))
                         except Exception:
                             continue
-                if recent_daily_credit_ts:
-                    from config import CT
-                    most_recent = max(recent_daily_credit_ts)
-                    ct_date = most_recent.astimezone(CT).strftime("%Y-%m-%d")
-                    cache["eod_date"] = ct_date
-                    logger.info(f"Rebuilt eod_date={ct_date} from ledger")
-                    # daily_credits_date uses UTC date
-                    today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
-                    if most_recent.strftime("%Y-%m-%d") == today_utc:
-                        cache["daily_credits_date"] = today_utc
-                        logger.info(f"Rebuilt daily_credits_date={today_utc} from ledger")
+                if recent_ct_dates:
+                    # Most recent CT date = last EOD that fired
+                    latest_ct_date = sorted(recent_ct_dates)[-1]
+                    cache["eod_date"] = latest_ct_date
+                    cache["daily_credits_date"] = latest_ct_date
+                    logger.info(f"Rebuilt eod_date={latest_ct_date} daily_credits_date={latest_ct_date} from ledger")
             except Exception as e:
                 logger.warning(f"Could not rebuild eod_date/daily_credits_date from ledger: {e}")
+
+            # Rebuild match_credits dedup keys from ledger — prevents double top-up on restart
+            try:
+                for row in ledger_data:
+                    if str(row.get("type", "")) == "match_credit":
+                        notes = str(row.get("notes", ""))
+                        # Notes format: "Post-match top-up (match_id)"
+                        if notes.startswith("Post-match top-up (") and notes.endswith(")"):
+                            mid = notes[len("Post-match top-up ("):-1]
+                            if mid:
+                                cache[f"match_credits_{mid}"] = True
+            except Exception as e:
+                logger.warning(f"Could not rebuild match_credits from ledger: {e}")
         except Exception as e:
             logger.warning(f"Could not rebuild paid_parlays from ledger: {e}")
             cache["paid_parlays"] = set()
@@ -728,11 +750,13 @@ async def add_match_credits(match_amount: int, match_id: str, notify_fn=None):
         raise
 
 
-async def add_tiered_daily_credits(tier_map: dict, notify_fn=None):
-    """Add tiered daily credits. tier_map = {user_id: amount}. Skips if already credited today."""
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
-    if cache.get("daily_credits_date") == today:
-        logger.info(f"Daily credits already added today ({today}), skipping.")
+async def add_tiered_daily_credits(tier_map: dict, notify_fn=None, ct_date: str = None):
+    """Add tiered daily credits. tier_map = {user_id: amount}. Skips if already credited for ct_date."""
+    from config import CT
+    if not ct_date:
+        ct_date = datetime.now(CT).strftime("%Y-%m-%d")
+    if cache.get("daily_credits_date") == ct_date:
+        logger.info(f"Daily credits already added for CT {ct_date}, skipping.")
         if notify_fn:
             await notify_fn("⚠️ Daily credits already added today — skipped.")
         return
@@ -748,9 +772,9 @@ async def add_tiered_daily_credits(tier_map: dict, notify_fn=None):
             new_credits = user["credits"] + amount
             await with_retry(ws.update_cell, row_num, 4, new_credits)
             cache["users"][user_id]["credits"] = new_credits
-            await append_ledger(user_id, "daily_credit", amount, new_credits, "Daily top-up (tiered)", notify_fn)
-        cache["daily_credits_date"] = today
-        logger.info("Tiered daily credits added to all users")
+            await append_ledger(user_id, "daily_credit", amount, new_credits, f"Daily top-up (tiered) CT:{ct_date}", notify_fn)
+        cache["daily_credits_date"] = ct_date
+        logger.info(f"Tiered daily credits added to all users for CT {ct_date}")
     except Exception as e:
         logger.error(f"Failed to add tiered daily credits: {e}")
         if notify_fn:
