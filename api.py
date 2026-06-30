@@ -55,9 +55,18 @@ def fetch_matches_for_date(date_str: str) -> list:
 
             status = m.get("status", STATUS_SCHEDULED)
             score = m.get("score", {})
+            # Knockout bets settle on 90-minute result only — extra time and
+            # penalties do not count. score.fullTime is a running/cumulative
+            # field that includes ET + penalty goals once a match goes there;
+            # score.regularTime is the actual 90-minute score. Prefer
+            # regularTime, fall back to fullTime only if regularTime is absent.
+            regular_time = score.get("regularTime", {})
             full_time = score.get("fullTime", {})
-            home_score = full_time.get("home")
-            away_score = full_time.get("away")
+            home_score = regular_time.get("home")
+            away_score = regular_time.get("away")
+            if home_score is None or away_score is None:
+                home_score = full_time.get("home")
+                away_score = full_time.get("away")
 
             # Derive result and ou_result if finished
             result = ""
@@ -115,9 +124,14 @@ def fetch_match_result(match_id: str) -> dict | None:
                 return None
 
             score = data.get("score", {})
+            # Same rule as fetch_matches_for_date — 90-minute score only.
+            regular_time = score.get("regularTime", {})
             full_time = score.get("fullTime", {})
-            home_score = full_time.get("home")
-            away_score = full_time.get("away")
+            home_score = regular_time.get("home")
+            away_score = regular_time.get("away")
+            if home_score is None or away_score is None:
+                home_score = full_time.get("home")
+                away_score = full_time.get("away")
 
             if home_score is None or away_score is None:
                 logger.warning(f"Match {match_id} finished but scores missing")
@@ -188,7 +202,10 @@ def fetch_knockout_matches() -> list:
                 continue
             home = m.get("homeTeam", {}).get("name") or "TBD"
             away = m.get("awayTeam", {}).get("name") or "TBD"
-            score = m.get("score", {}).get("fullTime", {})
+            score_node = m.get("score", {})
+            regular_time = score_node.get("regularTime", {})
+            full_time = score_node.get("fullTime", {})
+            score = regular_time if (regular_time.get("home") is not None and regular_time.get("away") is not None) else full_time
             matches.append({
                 "stage": stage,
                 "home": home,
