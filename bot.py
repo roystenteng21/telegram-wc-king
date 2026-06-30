@@ -147,6 +147,7 @@ def setup_handlers():
     application.add_handler(CommandHandler("admin_refresh", ca.cmd_admin_refresh))
     application.add_handler(CommandHandler("admin_result", ca.cmd_admin_result))
     application.add_handler(CommandHandler("admin_cancel_match", ca.cmd_admin_cancel_match))
+    application.add_handler(CommandHandler("admin_cancel_parlay", ca.cmd_admin_cancel_parlay))
     application.add_handler(CommandHandler("admin_credits", ca.cmd_admin_credits))
     application.add_handler(CommandHandler("admin_endtournament", ca.cmd_admin_endtournament))
     application.add_handler(CommandHandler("admin_poll", ca.cmd_admin_poll))
@@ -194,6 +195,7 @@ async def post_init(app):
         BotCommand("admin_poll", "Trigger result polling"),
         BotCommand("admin_credits", "Adjust player credits"),
         BotCommand("admin_cancel_match", "Void all bets for a match"),
+        BotCommand("admin_cancel_parlay", "Cancel a player's active parlay"),
         BotCommand("admin_announce", "Announce to group"),
         BotCommand("admin_event", "Manage ad hoc events"),
         BotCommand("admin_katerina_back", "Send Katerina back message"),

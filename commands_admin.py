@@ -9,14 +9,14 @@ from rapidfuzz import process as fuzz_process
 
 from config import (
     ADMIN_TELEGRAM_ID, SGT, UTC, CT, TEAM_DISPLAY, BOT_VERSION,
-    TOURNAMENT_STAGES, TEAM_ALIASES
+    TOURNAMENT_STAGES, TEAM_ALIASES, BET_LOCK_BUFFER, PARLAY_MULTIPLIERS
 )
 import katerina as _katerina
 import sheet
 import scheduler as sched
 import api
 from helpers import (
-    dm_admin, format_team, format_match_teams,
+    dm_admin, format_team, format_match_teams, format_outcome_label,
     truncate, session_expired, clear_admin_pending, ensure_registered,
     _sessions, _admin_pending, get_group_chat_id
 )
@@ -910,6 +910,148 @@ async def cmd_admin_cancel_match(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("Run /admin_cancel_match to start.")
 
 
+# ── Admin: /admin_cancel_parlay ───────────────────────────────────────────────
+async def _present_parlay_confirm(update: Update, user: dict, parlay: dict) -> bool:
+    """Pre-kickoff guard + confirm prompt for a selected parlay. Returns False if blocked."""
+    parlay_id = parlay["parlay_id"]
+    legs = parlay["legs"]
+
+    for leg in legs:
+        match = await sheet.get_match_by_id(leg["match_id"])
+        if match:
+            try:
+                kickoff = datetime.strptime(match["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                lock_time = kickoff + timedelta(seconds=BET_LOCK_BUFFER)
+                if datetime.now(UTC) >= lock_time:
+                    home = format_team(match["home"])
+                    away = format_team(match["away"])
+                    await update.message.reply_text(
+                        f"Cannot cancel — {home} vs {away} has already kicked off."
+                    )
+                    clear_admin_pending()
+                    return False
+            except Exception:
+                pass
+
+    name = truncate(user.get("first_name") or user.get("username") or "Unknown")
+    stake = legs[0]["amount"]
+    multiplier = PARLAY_MULTIPLIERS.get(len(legs), "?")
+
+    _admin_pending[ADMIN_TELEGRAM_ID] = {
+        "action": "parlay_cancel_confirm",
+        "data": {"user_id": user["user_id"], "name": name, "parlay_id": parlay_id, "stake": stake},
+        "expires": datetime.now(UTC) + timedelta(seconds=120)
+    }
+    await update.message.reply_text(
+        f"Confirm: cancel {name}'s {len(legs)}-leg parlay ({stake:,}c · {multiplier}x)?\n"
+        f"Refunds {stake:,}c.\n\n"
+        f"/confirm_admin or /cancel_admin"
+    )
+    return True
+
+
+async def cmd_admin_cancel_parlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+
+    args = context.args
+
+    # Step 2/3: a number was supplied
+    if args:
+        pending = _admin_pending.get(ADMIN_TELEGRAM_ID)
+        if not pending or session_expired(pending):
+            await update.message.reply_text("Run /admin_cancel_parlay to start.")
+            return
+
+        try:
+            index = int(args[0]) - 1
+        except ValueError:
+            await update.message.reply_text("Usage: /admin_cancel_parlay [number]")
+            return
+
+        # Stage: player selected — show their parlay(s) or go straight to confirm
+        if pending["action"] == "parlay_player_select":
+            players = pending["data"]["players"]
+            if index < 0 or index >= len(players):
+                await update.message.reply_text("Invalid number.")
+                return
+            user = players[index]
+            user_id = user["user_id"]
+            active_parlays = sheet.get_user_active_parlays(user_id)
+            if not active_parlays:
+                await update.message.reply_text("That player has no active parlays.")
+                clear_admin_pending()
+                return
+
+            parlay_list = []
+            for pid in active_parlays:
+                legs = sheet.get_parlay_bets(pid)
+                if legs:
+                    parlay_list.append({"parlay_id": pid, "legs": legs})
+
+            if len(parlay_list) == 1:
+                await _present_parlay_confirm(update, user, parlay_list[0])
+                return
+
+            name = truncate(user.get("first_name") or user.get("username") or "Unknown")
+            lines = [f"{name}'s active parlays:\n"]
+            for i, p in enumerate(parlay_list, 1):
+                legs = p["legs"]
+                stake = legs[0]["amount"]
+                multiplier = PARLAY_MULTIPLIERS.get(len(legs), "?")
+                lines.append(f"{i}. {stake:,}c · {multiplier}x")
+                for leg in legs:
+                    match = await sheet.get_match_by_id(leg["match_id"])
+                    if match:
+                        home = format_team(match["home"])
+                        away = format_team(match["away"])
+                        outcome_label = format_outcome_label(leg["outcome"], match)
+                        lines.append(f"   {home} vs {away} — {outcome_label}")
+            lines.append("\nReply /admin_cancel_parlay [number] to select.")
+
+            _admin_pending[ADMIN_TELEGRAM_ID] = {
+                "action": "parlay_select",
+                "data": {"user": user, "parlays": parlay_list},
+                "expires": datetime.now(UTC) + timedelta(seconds=120)
+            }
+            await update.message.reply_text("\n".join(lines))
+            return
+
+        # Stage: parlay selected — confirm
+        if pending["action"] == "parlay_select":
+            parlays = pending["data"]["parlays"]
+            if index < 0 or index >= len(parlays):
+                await update.message.reply_text("Invalid number.")
+                return
+            user = pending["data"]["user"]
+            await _present_parlay_confirm(update, user, parlays[index])
+            return
+
+        await update.message.reply_text("Run /admin_cancel_parlay to start.")
+        return
+
+    # Step 1: no args — list players with active parlays
+    standings = sheet.get_standings()
+    players_with_parlays = [u for u in standings if sheet.get_user_active_parlays(u["user_id"])]
+    if not players_with_parlays:
+        await update.message.reply_text("No players have active parlays.")
+        return
+
+    lines = ["Which player's parlay to cancel?\n"]
+    for i, user in enumerate(players_with_parlays, 1):
+        name = truncate(user.get("first_name") or user.get("username") or "Unknown")
+        count = len(sheet.get_user_active_parlays(user["user_id"]))
+        lines.append(f"{i}. {name} — {count} active parlay(s)")
+    lines.append("\nReply /admin_cancel_parlay [number]")
+
+    _admin_pending[ADMIN_TELEGRAM_ID] = {
+        "action": "parlay_player_select",
+        "data": {"players": players_with_parlays},
+        "expires": datetime.now(UTC) + timedelta(seconds=120)
+    }
+    await update.message.reply_text("\n".join(lines))
+
+
 # ── Admin: /admin_credits ─────────────────────────────────────────────────────
 async def cmd_admin_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
@@ -1098,6 +1240,22 @@ async def cmd_confirm_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Auto-roast all players for needing a bailout
         if amount > 0:
             asyncio.create_task(_katerina.send_bailout_roast(users, amount, notify_fn=dm_admin))
+
+    # Cancel parlay
+    elif action == "parlay_cancel_confirm":
+        user_id = data["user_id"]
+        name = data["name"]
+        parlay_id = data["parlay_id"]
+        stake = data["stake"]
+        try:
+            count = await sheet.void_parlay_bets(parlay_id, user_id, notify_fn=dm_admin)
+            new_balance = sheet.cache["users"][user_id]["credits"]
+            await update.message.reply_text(
+                f"✅ Done. {name}'s parlay cancelled — {count} leg(s) voided, {stake:,}c refunded.\n"
+                f"Balance: {new_balance:,}c"
+            )
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Failed to cancel parlay: {e}")
 
     else:
         await update.message.reply_text("Unknown pending action.")
