@@ -6,12 +6,9 @@ from datetime import datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.cron import CronTrigger
-import pytz
 
 from config import (
     SGT, UTC, CT, MATCH_CREDITS,
-    NIGHT_REMINDER_HOUR, NIGHT_REMINDER_MINUTE,
-    MORNING_CATCHUP_HOUR, MORNING_CATCHUP_MINUTE,
     PREMATCH_SUMMARY_MINUTES, POLL_START_OFFSET, POLL_INTERVAL,
     KNOCKOUT_DURATION, ANTHROPIC_API_KEY,
     ADMIN_TELEGRAM_ID, BOT_VERSION, TEAM_DISPLAY, PARLAY_MULTIPLIERS,
@@ -53,10 +50,6 @@ async def send_group(message: str, parse_mode: str = None):
     except Exception as e:
         logger.error(f"Failed to send group message: {e}")
         await dm_admin(f"⚠️ Failed to send group message: {e}")
-
-
-# ── Silent hours — imported from helpers ─────────────────────────────────────
-from helpers import is_silent_hours
 
 
 # ── CT date helpers ───────────────────────────────────────────────────────────
@@ -110,14 +103,6 @@ async def is_last_match_of_day(match_id: str) -> bool:
 
 
 # ── Format helpers ────────────────────────────────────────────────────────────
-def format_match_line(match: dict) -> str:
-    kickoff_utc = datetime.strptime(match["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-    kickoff_sgt = kickoff_utc.astimezone(SGT)
-    time_str = kickoff_sgt.strftime("%I:%M %p SGT").lstrip("0")
-    return f"{format_match_teams(match['home'], match['away'])} — {time_str}"
-
-
-
 def _outcome_label(outcome: str, match: dict) -> str:
     """Convert internal outcome to display label."""
     if outcome == "draw":
@@ -278,112 +263,9 @@ async def _katerina_line(prompt: str, fallback: str, max_tokens: int = 120) -> s
         return fallback
 
 
-# ── Night reminder (11PM SGT) ────────────────────────────────────────────────
-async def job_night_reminder():
-    try:
-        today_ct = datetime.now(CT).strftime("%Y-%m-%d")
-        now_utc = datetime.now(UTC)
-        yesterday_utc = (now_utc - timedelta(days=1)).strftime("%Y-%m-%d")
-        today_utc = now_utc.strftime("%Y-%m-%d")
-        tomorrow_utc = (now_utc + timedelta(days=1)).strftime("%Y-%m-%d")
-
-        # Read from cache first — cache already holds yesterday + today + tomorrow from startup
-        cached_all = list(sheet.cache.get("matches", {}).values())
-        raw_from_cache = [
-            m for m in cached_all
-            if m.get("kickoff_utc", "") >= yesterday_utc
-        ]
-
-        raw = None
-        if raw_from_cache:
-            raw = raw_from_cache
-            logger.info("Night reminder: using cached fixtures")
-        else:
-            # Cache empty — fall back to API with 5-attempt retry
-            last_error = None
-            for attempt in range(1, 6):
-                try:
-                    raw = (
-                        api.fetch_matches_for_date(yesterday_utc) +
-                        api.fetch_matches_for_date(today_utc) +
-                        api.fetch_matches_for_date(tomorrow_utc)
-                    )
-                    logger.info(f"Night reminder: API fetch succeeded on attempt {attempt}")
-                    break
-                except RuntimeError as e:
-                    last_error = e
-                    logger.warning(f"Night reminder: API fetch attempt {attempt} failed: {e}")
-                    if attempt < 5:
-                        await asyncio.sleep(5)
-            if raw is None:
-                await dm_admin(f"⚠️ Night reminder: failed to fetch fixtures after 5 attempts: {last_error}")
-                return
-
-        matches = []
-        for m in raw:
-            try:
-                ko = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-                if (
-                    ko.astimezone(CT).strftime("%Y-%m-%d") == today_ct
-                    and ko > now_utc
-                    and m.get("status") not in ("FINISHED", "CANCELLED", "POSTPONED")
-                ):
-                    matches.append(m)
-            except Exception:
-                continue
-
-        if not matches:
-            logger.info("Night reminder: no upcoming matches today CT, skipping")
-            return
-
-        lines = ["🌙 Good evening gents! Matches tonight:\n"]
-
-        bet_context_parts = []
-        for m in sorted(matches, key=lambda x: x["kickoff_utc"]):
-            lines.append(f"  {format_match_line(m)}")
-            open_bets = [b for b in sheet.cache["bets"] if b["match_id"] == str(m["match_id"]) and b["status"] == "open"]
-            if open_bets:
-                for b in sorted(open_bets, key=_get_sort_name):
-                    name = _get_user_name(b["user_id"])
-                    lines.append(f"  {_format_bet_line(b, m)}")
-                    bet_context_parts.append(f"{name} on {_outcome_label(b['outcome'], m)} for {format_match_teams(m['home'], m['away'])}")
-            else:
-                lines.append("  No bets yet.")
-            lines.append("")
-
-        # Katerina closing line
-        if bet_context_parts:
-            bet_summary = ", ".join(bet_context_parts)
-            prompt = (
-                f"It's 11PM. Tonight's WC matches are set. Current bets placed: {bet_summary}. "
-                f"Write one short punchy good night line — acknowledge who's bet, maybe a light dig. "
-                f"1 sentence max. No hashtags."
-            )
-            closing = await _katerina_line(prompt, "Get your bets in before kickoff. Good night! 🌛")
-        else:
-            prompt = (
-                f"It's 11PM. Tonight's WC matches are set but nobody has bet yet. "
-                f"Write one short punchy good night line encouraging bets. 1 sentence max."
-            )
-            closing = await _katerina_line(prompt, "No bets placed yet. Get on it before kickoff. Good night! 🌛")
-
-        lines.append(closing)
-        await send_group("\n".join(lines))
-        logger.info("Night reminder sent")
-    except Exception as e:
-        logger.error(f"Night reminder job failed: {e}")
-        await dm_admin(f"⚠️ Night reminder job failed: {e}")
-
-
-
 # ── Pre-match summary ─────────────────────────────────────────────────────────
 async def job_prematch_summary(match_id: str):
     try:
-        # Suppress during silent hours — 3AM match already covered by night reminder
-        if is_silent_hours():
-            logger.info(f"Pre-match summary suppressed for {match_id} — silent hours")
-            return
-
         match = await sheet.get_match_by_id(match_id)
         if not match:
             await dm_admin(f"⚠️ Pre-match summary: match {match_id} not found")
@@ -450,11 +332,6 @@ async def job_kickoff_message(match_id: str):
 
         for b in sorted_bets:
             lines.append(f"{_format_bet_line(b, match)}")
-
-        # Suppress during silent hours unless this is the last match
-        if is_silent_hours() and not await is_last_match_of_day(match_id):
-            logger.info(f"Kickoff message suppressed for {match_id} — silent hours, not last match")
-            return
 
         # Katerina good luck / roast line
         if open_bets:
@@ -578,24 +455,11 @@ async def _auto_settle_stuck_match(match_id: str):
             if commentary:
                 result_msg = result_msg + f"\n\n{commentary}"
 
-        if is_silent_hours() and not is_last:
-            if "held_results" not in sheet.cache:
-                sheet.cache["held_results"] = []
-            sheet.cache["held_results"].append(base_result_msg)
-            await sheet.append_ledger(0, "held_result", 0, 0, base_result_msg, dm_admin)
-            if not scheduler.get_job("morning_flush"):
-                now_sgt = datetime.now(SGT)
-                send_time_sgt = now_sgt.replace(hour=MORNING_CATCHUP_HOUR, minute=MORNING_CATCHUP_MINUTE, second=0, microsecond=0)
-                if send_time_sgt <= now_sgt:
-                    send_time_sgt = send_time_sgt + timedelta(days=1)
-                send_time_utc = send_time_sgt.astimezone(UTC)
-                scheduler.add_job(_send_morning_flush, trigger=DateTrigger(run_date=send_time_utc), id="morning_flush", replace_existing=True)
-        else:
-            if topup_line:
-                result_msg = result_msg + topup_line
-            await send_group(result_msg)
-            if not is_last:
-                await _send_coming_up_today()
+        if topup_line:
+            result_msg = result_msg + topup_line
+        await send_group(result_msg)
+        if not is_last:
+            await _send_coming_up_today()
 
         await dm_admin(f"ℹ️ Match {match_id} was auto-settled and result posted to group.")
         logger.info(f"Auto-settled stuck match {match_id}")
@@ -640,6 +504,17 @@ async def job_poll_result(match_id: str, attempt: int = 1):
         home_score = result_data["home_score"]
         away_score = result_data["away_score"]
         result, ou_result = await sheet.update_match_result(match_id, home_score, away_score, notify_fn=dm_admin)
+
+        # Idempotency guard: if this match's bets were already settled by another
+        # path (auto-settle via cache refresh), do not settle or post again.
+        all_match_bets = [b for b in sheet.cache["bets"] if b["match_id"] == str(match_id)]
+        already_settled = any(b["status"] in ("won", "lost") for b in all_match_bets)
+        has_open = any(b["status"] == "open" for b in all_match_bets)
+        if already_settled and not has_open:
+            logger.info(f"Match {match_id} already settled by another path — poll skipping duplicate post")
+            await check_all_matches_done(match_id)
+            return
+
         settlements = await sheet.settle_bets_for_match(match_id, result, ou_result, notify_fn=dm_admin)
 
         # Check parlay completions after settlement
@@ -702,35 +577,12 @@ async def job_poll_result(match_id: str, attempt: int = 1):
             if commentary:
                 result_msg = result_msg + f"\n\n{commentary}"
 
-        if is_silent_hours() and not is_last:
-            logger.info(f"Match {match_id} result held — silent hours, appending to morning flush")
-            # Hold only base result (score + bets) — morning flush adds one combined Katerina + top-up
-            if "held_results" not in sheet.cache:
-                sheet.cache["held_results"] = []
-            sheet.cache["held_results"].append(base_result_msg)
-            await sheet.append_ledger(0, "held_result", 0, 0, base_result_msg, dm_admin)
-
-            # Schedule morning flush if not already scheduled
-            if not scheduler.get_job("morning_flush"):
-                now_sgt = datetime.now(SGT)
-                send_time_sgt = now_sgt.replace(hour=MORNING_CATCHUP_HOUR, minute=MORNING_CATCHUP_MINUTE, second=0, microsecond=0)
-                if send_time_sgt <= now_sgt:
-                    send_time_sgt = send_time_sgt + timedelta(days=1)
-                send_time_utc = send_time_sgt.astimezone(UTC)
-                scheduler.add_job(
-                    _send_morning_flush,
-                    trigger=DateTrigger(run_date=send_time_utc),
-                    id="morning_flush",
-                    replace_existing=True
-                )
-                logger.info(f"Morning flush scheduled at {send_time_utc}")
-        else:
-            if topup_line:
-                result_msg = result_msg + topup_line
-            await send_group(result_msg)
-            # Fire "Coming up today" follow-up if more matches remain
-            if not is_last:
-                await _send_coming_up_today()
+        if topup_line:
+            result_msg = result_msg + topup_line
+        await send_group(result_msg)
+        # Fire "Coming up today" follow-up if more matches remain
+        if not is_last:
+            await _send_coming_up_today()
 
         # Check if all matches today are done
         await check_all_matches_done(match_id)
@@ -738,55 +590,6 @@ async def job_poll_result(match_id: str, attempt: int = 1):
     except Exception as e:
         logger.error(f"Poll result job failed for {match_id}: {e}")
         await dm_admin(f"⚠️ Poll result job failed for match {match_id}: {e}")
-
-
-async def _send_morning_flush():
-    """Send all held overnight results as one combined message at 7:30AM, then fire coming up today."""
-    try:
-        held = sheet.cache.pop("held_results", [])
-        if not held:
-            logger.info("Morning flush: no held results to send")
-            await _send_coming_up_today()
-            return
-
-        match_count = len(held)
-
-        # Build combined message
-        lines = ["Good morning lads! 🌅"]
-        for i, result_block in enumerate(held):
-            lines.append("")
-            lines.append(result_block)
-
-        # Single Katerina commentary covering all overnight results
-        all_results_summary = f"{match_count} overnight results: " + " | ".join(
-            r.split("\n")[0] for r in held  # first line of each result block = scoreline
-        )
-        prompt = (
-            f"{all_results_summary}. Write one sharp line reacting to the overnight results overall — "
-            f"light banter. Reference names if notable outcomes. 1-2 sentences. No markdown."
-        )
-        commentary = await _katerina_line(prompt, "", max_tokens=120)
-        if commentary:
-            lines.append("")
-            lines.append(commentary)
-
-        # Combined top-up line
-        lines.append("")
-        if match_count == 1:
-            lines.append(f"+{MATCH_CREDITS}c added to everyone's account. 🪙")
-        else:
-            lines.append(f"+{MATCH_CREDITS}c × {match_count} added to everyone's account. 🪙")
-
-        await send_group("\n".join(lines))
-        logger.info(f"Morning flush sent: {match_count} result(s)")
-        await sheet.append_ledger(0, "held_result_flushed", 0, 0, "Morning flush sent", dm_admin)
-
-        # Fire coming up today once
-        await _send_coming_up_today()
-
-    except Exception as e:
-        logger.error(f"Morning flush failed: {e}")
-        await dm_admin(f"⚠️ Morning flush failed: {e}")
 
 
 async def _send_coming_up_today():
@@ -1278,8 +1081,6 @@ async def job_health_monitor():
 
         # 2. Scheduler jobs still registered
         job_ids = {job.id for job in scheduler.get_jobs()}
-        if "night_reminder" not in job_ids:
-            issues.append("night_reminder job missing from scheduler")
         if "cache_refresh" not in job_ids:
             issues.append("cache_refresh job missing from scheduler")
 
@@ -1316,15 +1117,6 @@ async def job_health_monitor():
 # ── Register daily jobs ───────────────────────────────────────────────────────
 def register_static_jobs():
     """Register fixed-time daily jobs. Called on startup."""
-
-    # Night reminder — 11PM SGT daily
-    scheduler.add_job(
-        job_night_reminder,
-        trigger=CronTrigger(hour=NIGHT_REMINDER_HOUR, minute=NIGHT_REMINDER_MINUTE, timezone=SGT),
-        id="night_reminder",
-        replace_existing=True,
-        misfire_grace_time=600
-    )
 
     # Cache refresh — staggered to avoid colliding with cron jobs at :00 and :30
     scheduler.add_job(
@@ -1386,10 +1178,9 @@ def register_match_jobs(matches: list):
 
         kickoff_sgt = kickoff_utc.astimezone(SGT)
 
-        # Pre-match summary — 15 min before kickoff, only if after 7:30AM SGT
+        # Pre-match summary — 15 min before kickoff
         summary_time = kickoff_utc - timedelta(minutes=PREMATCH_SUMMARY_MINUTES)
-        cutoff_sgt = kickoff_sgt.replace(hour=MORNING_CATCHUP_HOUR, minute=MORNING_CATCHUP_MINUTE, second=0)
-        if summary_time > now_utc and kickoff_sgt > cutoff_sgt:
+        if summary_time > now_utc:
             scheduler.add_job(
                 job_prematch_summary,
                 trigger=DateTrigger(run_date=summary_time),
@@ -1466,21 +1257,6 @@ async def on_startup(notify_fn=None):
         register_match_jobs(all_today_matches)
 
         scheduler.start()
-
-        # Startup recovery — fire night reminder if bot restarted during 11PM hour
-        now_sgt = datetime.now(SGT)
-        if now_sgt.hour == NIGHT_REMINDER_HOUR:
-            logger.info("Startup during 11PM hour — firing night reminder immediately")
-            scheduler.add_job(job_night_reminder, trigger=DateTrigger(run_date=datetime.now(UTC) + timedelta(seconds=5)), id="night_reminder_recovery", replace_existing=True)
-
-        # Startup recovery — re-schedule morning flush if held results exist from before restart
-        if sheet.cache.get("held_results"):
-            flush_sgt = now_sgt.replace(hour=MORNING_CATCHUP_HOUR, minute=MORNING_CATCHUP_MINUTE, second=0, microsecond=0)
-            if flush_sgt <= now_sgt:
-                flush_sgt = flush_sgt + timedelta(days=1)
-            flush_utc = flush_sgt.astimezone(UTC)
-            scheduler.add_job(_send_morning_flush, trigger=DateTrigger(run_date=flush_utc), id="morning_flush", replace_existing=True)
-            logger.info(f"Startup: re-scheduled morning flush at {flush_utc} — {len(sheet.cache['held_results'])} held result(s)")
 
         if _bot is not None:
             await dm_admin(

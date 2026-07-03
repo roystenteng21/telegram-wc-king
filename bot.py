@@ -142,7 +142,6 @@ def setup_handlers():
     application.add_handler(CommandHandler("admin_katerina_back", ca.cmd_admin_katerina_back))
     application.add_handler(CommandHandler("admin_credits_announcement", ca.cmd_admin_credits_announcement))
     application.add_handler(CommandHandler("admin_stage_hype", ca.cmd_admin_stage_hype))
-    application.add_handler(CommandHandler("admin_silent_hours", ca.cmd_admin_silent_hours))
     application.add_handler(CommandHandler("admin_status", ca.cmd_admin_status))
     application.add_handler(CommandHandler("admin_refresh", ca.cmd_admin_refresh))
     application.add_handler(CommandHandler("admin_result", ca.cmd_admin_result))
@@ -201,7 +200,6 @@ async def post_init(app):
         BotCommand("admin_katerina_back", "Send Katerina back message"),
         BotCommand("admin_credits_announcement", "Announce credits system to group"),
         BotCommand("admin_stage_hype", "Trigger Katerina stage transition hype"),
-        BotCommand("admin_silent_hours", "Toggle silent hours on|off"),
         BotCommand("confirm_admin", "Confirm pending action"),
         BotCommand("cancel_admin", "Cancel pending action"),
     ]

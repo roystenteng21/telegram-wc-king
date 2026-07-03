@@ -55,18 +55,18 @@ def fetch_matches_for_date(date_str: str) -> list:
 
             status = m.get("status", STATUS_SCHEDULED)
             score = m.get("score", {})
-            # Knockout bets settle on 90-minute result only — extra time and
-            # penalties do not count. score.fullTime is a running/cumulative
-            # field that includes ET + penalty goals once a match goes there;
-            # score.regularTime is the actual 90-minute score. Prefer
-            # regularTime, fall back to fullTime only if regularTime is absent.
-            regular_time = score.get("regularTime", {})
-            full_time = score.get("fullTime", {})
-            home_score = regular_time.get("home")
-            away_score = regular_time.get("away")
-            if home_score is None or away_score is None:
-                home_score = full_time.get("home")
-                away_score = full_time.get("away")
+            # Bets settle on the 90-minute result only.
+            # score.duration: REGULAR → fullTime IS the 90-min score.
+            # EXTRA_TIME / PENALTY_SHOOTOUT → fullTime is cumulative (incl. ET/pens);
+            # the 90-min score is in regularTime. If regularTime isn't populated
+            # yet, leave scores blank — no result derived, no settlement triggered.
+            duration = score.get("duration") or "REGULAR"
+            if duration == "REGULAR":
+                score_node = score.get("fullTime") or {}
+            else:
+                score_node = score.get("regularTime") or {}
+            home_score = score_node.get("home")
+            away_score = score_node.get("away")
 
             # Derive result and ou_result if finished
             result = ""
@@ -124,17 +124,20 @@ def fetch_match_result(match_id: str) -> dict | None:
                 return None
 
             score = data.get("score", {})
-            # Same rule as fetch_matches_for_date — 90-minute score only.
-            regular_time = score.get("regularTime", {})
-            full_time = score.get("fullTime", {})
-            home_score = regular_time.get("home")
-            away_score = regular_time.get("away")
+            # Bets settle on the 90-minute result only.
+            # duration REGULAR → fullTime is the 90-min score.
+            # duration EXTRA_TIME / PENALTY_SHOOTOUT → 90-min score is regularTime;
+            # if not yet populated, return None so the poll retries. Never fall
+            # back to fullTime here — it includes ET/penalty goals.
+            duration = score.get("duration") or "REGULAR"
+            if duration == "REGULAR":
+                score_node = score.get("fullTime") or {}
+            else:
+                score_node = score.get("regularTime") or {}
+            home_score = score_node.get("home")
+            away_score = score_node.get("away")
             if home_score is None or away_score is None:
-                home_score = full_time.get("home")
-                away_score = full_time.get("away")
-
-            if home_score is None or away_score is None:
-                logger.warning(f"Match {match_id} finished but scores missing")
+                logger.info(f"Match {match_id} FINISHED ({duration}) but 90-min score not yet available — retrying")
                 return None
 
             if home_score > away_score:
@@ -202,10 +205,12 @@ def fetch_knockout_matches() -> list:
                 continue
             home = m.get("homeTeam", {}).get("name") or "TBD"
             away = m.get("awayTeam", {}).get("name") or "TBD"
-            score_node = m.get("score", {})
-            regular_time = score_node.get("regularTime", {})
-            full_time = score_node.get("fullTime", {})
-            score = regular_time if (regular_time.get("home") is not None and regular_time.get("away") is not None) else full_time
+            score_data = m.get("score", {})
+            duration = score_data.get("duration") or "REGULAR"
+            if duration == "REGULAR":
+                score = score_data.get("fullTime") or {}
+            else:
+                score = score_data.get("regularTime") or {}
             matches.append({
                 "stage": stage,
                 "home": home,

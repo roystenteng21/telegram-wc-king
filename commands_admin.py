@@ -638,25 +638,6 @@ async def cmd_admin_stage_hype(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("⚠️ Stage hype failed — check admin DM for details.")
 
 
-async def cmd_admin_silent_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Toggle silent hours on/off. Resets to on on bot restart."""
-    if update.effective_user.id != ADMIN_TELEGRAM_ID:
-        return
-    if not context.args:
-        current = "OFF" if sheet.cache.get("silent_hours_disabled", False) else "ON"
-        await update.message.reply_text(f"Silent hours currently: {current}\nUsage: /admin_silent_hours on|off")
-        return
-    arg = context.args[0].lower()
-    if arg == "off":
-        sheet.cache["silent_hours_disabled"] = True
-        await update.message.reply_text("✅ Silent hours disabled. Katerina will reply in group during 12AM–7:30AM.")
-    elif arg == "on":
-        sheet.cache["silent_hours_disabled"] = False
-        await update.message.reply_text("✅ Silent hours enabled.")
-    else:
-        await update.message.reply_text("Usage: /admin_silent_hours on|off")
-
-
 async def cmd_admin_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
@@ -681,7 +662,6 @@ async def cmd_admin_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_refresh = sheet.cache.get("last_refresh")
     refresh_str = last_refresh.strftime("%H:%M:%S UTC") if last_refresh else "Never"
 
-    silent_state = "OFF (disabled)" if sheet.cache.get("silent_hours_disabled", False) else "ON"
     text = (
         f"✅ Degen v{BOT_VERSION} is running\n"
         f"Sheet: Connected\n"
@@ -690,7 +670,6 @@ async def cmd_admin_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{len(sheet.cache['bets'])} bets\n"
         f"Scheduler: {len(jobs)} active jobs\n"
         f"Last cache refresh: {refresh_str}\n"
-        f"Silent hours: {silent_state}\n"
         f"Group chat ID: {get_group_chat_id()}"
     )
     await update.message.reply_text(text)
@@ -1177,7 +1156,7 @@ async def cmd_confirm_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parlay_wins = await sched.check_parlay_completions(match["match_id"])
             result_msg = sched.format_result_message(updated_match, settlements, parlay_wins=parlay_wins)
 
-            # admin_result is manual recovery — always send immediately, no silent hours hold
+            # admin_result is manual recovery — always send immediately
             await sched.send_group(result_msg)
             await update.message.reply_text(f"✅ Done. {len(settlements)} bets settled.")
             await sched.check_all_matches_done(match["match_id"])

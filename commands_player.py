@@ -11,7 +11,7 @@ from config import (
 )
 import sheet
 import scheduler as sched
-import api
+
 
 
 # ── Portugal intervention helper ──────────────────────────────────────────────
@@ -40,7 +40,7 @@ async def _send_por_intervention(update, user_id: int, amount: int, match: dict)
     except Exception as e:
         logger.error(f"POR intervention failed: {e}")
 from helpers import (
-    dm_admin, is_silent_hours, is_group_message,
+    dm_admin, is_group_message,
     send_confirmation, format_team, format_match_teams, format_outcome_label,
     truncate, session_expired, clear_session,
     ensure_registered, resolve_team, find_match_for_team,

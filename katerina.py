@@ -17,7 +17,7 @@ from config import (
 )
 import sheet
 from helpers import (
-    application, dm_admin, is_silent_hours, is_group_message,
+    application, dm_admin, is_group_message,
     format_team, truncate, _chat_history, get_group_chat_id
 )
 
@@ -121,8 +121,6 @@ def _build_katerina_context() -> str:
     except Exception:
         pass
 
-    silent = is_silent_hours()
-
     # Per-player bet summary
     player_bet_lines = []
     for uid, u in sheet.cache.get("users", {}).items():
@@ -171,7 +169,6 @@ def _build_katerina_context() -> str:
     return f"""Data as of {refresh_str}.
 
 CURRENT TIME: {now_sgt.strftime("%I:%M %p SGT")}
-SILENT HOURS: {"YES (12AM–7:30AM SGT)" if silent else "NO"}
 
 TOURNAMENT STAGE: {current_stage}
 DAYS TO FINAL (July 19): {days_to_final}
@@ -795,24 +792,6 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
         "stats", "record against", "when did", "what are", "tonight",
     ]
     wants_search = any(kw in clean.lower() for kw in search_keywords)
-
-    # During silent hours — DM sender and return before any search runs
-    if is_silent_hours():
-        quiet_lines = [
-            "Quiet hours. Bets are still open but I'm not taking questions right now. Back at 7:30AM. 😌",
-            "I'm off the clock. Place your bets via /bet if you need to — I'll be back at 7:30AM. 🌙",
-            "Sleeping hours. The house is still open for bets, just not for chat. See you at 7:30AM. 😴",
-            "Quiet hours. Use /bet if you need to place one. Questions can wait till 7:30AM. 😌",
-            "Taking a break. Bets still work — just use /bet. I'm back at 7:30AM SGT. 🌙",
-        ]
-        try:
-            await application.bot.send_message(
-                chat_id=update.effective_user.id,
-                text=random.choice(quiet_lines)
-            )
-        except Exception as e:
-            logger.warning(f"Could not DM {update.effective_user.id} during silent hours: {e}")
-        return
 
     web_results = ""
     if wants_search:

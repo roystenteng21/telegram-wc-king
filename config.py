@@ -66,11 +66,7 @@ POLL_INTERVAL = 5 * 60        # 5 minutes in seconds
 # Knockout match duration (seconds) — used for poll offset
 KNOCKOUT_DURATION = 120 * 60
 
-# Scheduler times (SGT)
-NIGHT_REMINDER_HOUR = 23
-NIGHT_REMINDER_MINUTE = 0
-MORNING_CATCHUP_HOUR = 7
-MORNING_CATCHUP_MINUTE = 30
+# Scheduler times (SGT) — removed silent hours / morning flush
 PREMATCH_SUMMARY_MINUTES = 15
 
 
@@ -265,7 +261,7 @@ STATUS_ACTIVE_PLAY = ("IN_PLAY", "PAUSED", "HALFTIME", "EXTRA_TIME", "PENALTY_SH
 PARLAY_MULTIPLIERS = {2: 4.5, 3: 8.0, 4: 16.0, 5: 32.0, 6: 64.0}
 
 # Display name overrides (Telegram first_name → short display name)
-NAME_OVERRIDES = {"Shunnnnnn": "Shun", "Roysten": "Roy"}
+NAME_OVERRIDES = {"Shunnnnnn": "Shun", "Shunnnnnn ☄️": "Shun", "Roysten": "Roy"}
 
 # Tiered daily credits by rank (rank 1 = best = lowest top-up, rank N = worst = highest)
 # Tied players all receive the most generous tier in their tied group

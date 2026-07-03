@@ -2,7 +2,7 @@ import gspread
 import json
 import logging
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from google.oauth2.service_account import Credentials
 from config import (
     SPREADSHEET_ID, GOOGLE_CREDENTIALS_JSON,
@@ -214,11 +214,16 @@ async def refresh_cache(notify_fn=None):
                         except Exception:
                             continue
                 if recent_ct_dates:
-                    # Most recent CT date = last EOD that fired
+                    # Most recent CT date = last EOD that fired.
+                    # Never move backwards: if the in-memory value is already newer
+                    # (EOD marked fired but daily credits not yet in ledger — e.g.
+                    # refresh_cache running inside job_post_standings), keep it.
                     latest_ct_date = sorted(recent_ct_dates)[-1]
-                    cache["eod_date"] = latest_ct_date
-                    cache["daily_credits_date"] = latest_ct_date
-                    logger.info(f"Rebuilt eod_date={latest_ct_date} daily_credits_date={latest_ct_date} from ledger")
+                    if not cache.get("eod_date") or cache["eod_date"] < latest_ct_date:
+                        cache["eod_date"] = latest_ct_date
+                    if not cache.get("daily_credits_date") or cache["daily_credits_date"] < latest_ct_date:
+                        cache["daily_credits_date"] = latest_ct_date
+                    logger.info(f"Rebuilt eod_date={cache['eod_date']} daily_credits_date={cache['daily_credits_date']} from ledger")
             except Exception as e:
                 logger.warning(f"Could not rebuild eod_date/daily_credits_date from ledger: {e}")
 
@@ -235,30 +240,6 @@ async def refresh_cache(notify_fn=None):
             except Exception as e:
                 logger.warning(f"Could not rebuild match_credits from ledger: {e}")
 
-            # Rebuild held_results from ledger — morning flush survives restarts
-            try:
-                held_cutoff = datetime.now(UTC) - timedelta(hours=12)
-                held = []
-                flushed = False
-                for row in reversed(ledger_data):
-                    ts_str = str(row.get("timestamp", ""))
-                    try:
-                        ts = datetime.strptime(ts_str[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-                    except Exception:
-                        continue
-                    if ts < held_cutoff:
-                        break
-                    row_type = str(row.get("type", ""))
-                    if row_type == "held_result_flushed":
-                        flushed = True
-                        break
-                    if row_type == "held_result":
-                        held.insert(0, str(row.get("notes", "")))
-                if held and not flushed:
-                    cache["held_results"] = held
-                    logger.info(f"Rebuilt {len(held)} held result(s) from ledger")
-            except Exception as e:
-                logger.warning(f"Could not rebuild held_results from ledger: {e}")
         except Exception as e:
             logger.warning(f"Could not rebuild paid_parlays from ledger: {e}")
             cache["paid_parlays"] = set()
