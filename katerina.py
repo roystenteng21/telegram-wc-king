@@ -238,6 +238,13 @@ Your personality:
 - NEVER mention match kickoff times in your replies.
 - When referencing a failed or dead parlay, always use the 🥀 emoji.
 
+GAME RULES — use these exact numbers when explaining the game:
+- Single bets: win/draw/loss or over/under 2.5, payout 1:1 (stake + equal profit back).
+- Parlays: 2–4 legs, win/draw outcomes only, all legs on the same match day. All legs must win.
+- Parlay multipliers: 2 legs = 4.5x, 3 legs = 8x, 4 legs = 16x. Payout = stake × multiplier (e.g. 1,000c 3-leg parlay returns 8,000c). One leg loses = whole parlay dead, stake gone.
+- Bets settle on the 90-minute result only — extra time and penalties do not count.
+- Bets lock at kickoff. Daily credits added at end of day by rank (50–175c). +50c to everyone after each match.
+
 FACTUAL RULES — CRITICAL, NON-NEGOTIABLE:
 - If web search results are provided in your context, use ONLY those results to answer factual questions. Do not add anything not in the results.
 - If no search results are available and the question requires live data (team form, injuries, match previews, odds), say exactly: "I couldn't find reliable information on that right now." Then stop. Do NOT speculate, invent analysis, or fill gaps with what you think you know.
@@ -631,33 +638,6 @@ async def send_stage_hype(current_stage: str, next_stage: str, notify_fn=None, s
         return False
 
 
-async def check_and_send_stage_hype(notify_fn=None):
-    """
-    Called after EOD. Checks if today is the last day of a stage and tomorrow
-    starts a new one. If so, fires Katerina hype. No-op if no transition detected.
-    """
-    today_ct = datetime.now(CT).date()
-    tomorrow_ct = today_ct + timedelta(days=1)
-
-    current_stage = None
-    next_stage = None
-
-    for i, stage in enumerate(TOURNAMENT_STAGES):
-        if stage["start"] <= today_ct <= stage["end"]:
-            current_stage = stage["name"]
-            # Check if today is the last day of this stage
-            if today_ct == stage["end"] and i + 1 < len(TOURNAMENT_STAGES):
-                next_stage = TOURNAMENT_STAGES[i + 1]["name"]
-            break
-
-    if not current_stage or not next_stage:
-        logger.info("Stage hype check: no transition today, skipping")
-        return
-
-    logger.info(f"Stage transition detected: {current_stage} → {next_stage}, firing hype")
-    await send_stage_hype(current_stage, next_stage, notify_fn=notify_fn)
-
-
 async def send_bailout_roast(users: list, amount: int, notify_fn=None):
     """Roast all players for needing a bailout credit top-up."""
     try:
@@ -830,83 +810,26 @@ async def handle_katerina_mention(update: Update, context: ContextTypes.DEFAULT_
         )
 
         try:
-            step1_payload = json.dumps({
+            # web_search_20250305 is a server-side tool: the API executes
+            # searches itself within one request. No tool_result round-trips.
+            search_payload = json.dumps({
                 "model": "claude-sonnet-4-6",
                 "max_tokens": 1024,
                 "tools": [{"type": "web_search_20250305", "name": "web_search"}],
                 "messages": [{"role": "user", "content": search_prompt}]
             }).encode()
-            req1 = urllib.request.Request(
+            search_req = urllib.request.Request(
                 "https://api.anthropic.com/v1/messages",
-                data=step1_payload,
+                data=search_payload,
                 headers={
                     "content-type": "application/json",
                     "anthropic-version": "2023-06-01",
                     "x-api-key": ANTHROPIC_API_KEY
                 }
             )
-            with urllib.request.urlopen(req1, timeout=25) as resp1:
-                step1 = json.loads(resp1.read())
-
-            tool_use_blocks = [b for b in step1.get("content", []) if b.get("type") == "tool_use"]
-
-            if not tool_use_blocks:
-                web_results = _extract_text_blocks(step1.get("content", []))
-            else:
-                messages = [
-                    {"role": "user", "content": search_prompt},
-                    {"role": "assistant", "content": step1.get("content", [])},
-                    {"role": "user", "content": [
-                        {"type": "tool_result", "tool_use_id": b["id"], "content": ""}
-                        for b in tool_use_blocks
-                    ]}
-                ]
-                step2_payload = json.dumps({
-                    "model": "claude-sonnet-4-6",
-                    "max_tokens": 800,
-                    "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-                    "messages": messages
-                }).encode()
-                req2 = urllib.request.Request(
-                    "https://api.anthropic.com/v1/messages",
-                    data=step2_payload,
-                    headers={
-                        "content-type": "application/json",
-                        "anthropic-version": "2023-06-01",
-                        "x-api-key": ANTHROPIC_API_KEY
-                    }
-                )
-                with urllib.request.urlopen(req2, timeout=25) as resp2:
-                    step2 = json.loads(resp2.read())
-
-                step2_tool_use = [b for b in step2.get("content", []) if b.get("type") == "tool_use"]
-                if step2_tool_use:
-                    messages2 = messages + [
-                        {"role": "assistant", "content": step2.get("content", [])},
-                        {"role": "user", "content": [
-                            {"type": "tool_result", "tool_use_id": b["id"], "content": ""}
-                            for b in step2_tool_use
-                        ]}
-                    ]
-                    step3_payload = json.dumps({
-                        "model": "claude-sonnet-4-6",
-                        "max_tokens": 800,
-                        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-                        "messages": messages2
-                    }).encode()
-                    req3 = urllib.request.Request(
-                        "https://api.anthropic.com/v1/messages",
-                        data=step3_payload,
-                        headers={
-                            "content-type": "application/json",
-                            "anthropic-version": "2023-06-01",
-                            "x-api-key": ANTHROPIC_API_KEY
-                        }
-                    )
-                    with urllib.request.urlopen(req3, timeout=25) as resp3:
-                        step2 = json.loads(resp3.read())
-
-                web_results = _extract_text_blocks(step2.get("content", []))
+            with urllib.request.urlopen(search_req, timeout=45) as search_resp:
+                search_data = json.loads(search_resp.read())
+            web_results = _extract_text_blocks(search_data.get("content", []))
 
         except Exception as e:
             logger.error(f"Katerina web search failed: {e}")
