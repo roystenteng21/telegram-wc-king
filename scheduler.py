@@ -369,6 +369,24 @@ async def job_night_reminder():
 
 
 # ── Pre-match summary ─────────────────────────────────────────────────────────
+def _parlay_context_for_bets(bets: list) -> str:
+    """For open bets that are legs of a dead parlay, return a note for Katerina prompts."""
+    dead = []
+    for b in bets:
+        pid = b.get("parlay_id", "")
+        if pid and str(pid) not in ("", "0") and not sheet.is_parlay_alive(pid):
+            name = _get_user_name(b["user_id"])
+            if name not in dead:
+                dead.append(name)
+    if not dead:
+        return ""
+    return (
+        f"IMPORTANT: these bets are parlay legs whose parlay is ALREADY DEAD (an earlier leg lost): "
+        f"{', '.join(dead)}. Their pick tonight changes nothing — they win nothing even if it hits. "
+        f"Do not hype their pick; be slightly pitying about them riding a dead parlay. "
+    )
+
+
 async def job_prematch_summary(match_id: str):
     try:
         match = await sheet.get_match_by_id(match_id)
@@ -398,7 +416,8 @@ async def job_prematch_summary(match_id: str):
             )
             prompt = (
                 f"{match_label} kicks off in 15 minutes. Bets so far: {bet_summary}. "
-                f"Write one short last-call line — light banter, encourage anyone sitting out to get in. 1 sentence."
+                + _parlay_context_for_bets(sorted_bets)
+                + "Write one short last-call line — light banter, encourage anyone sitting out to get in. 1 sentence."
             )
             closing = await _katerina_line(prompt, "Last chance — get your bets in before kickoff! ⚽")
         else:
@@ -457,6 +476,7 @@ async def job_kickoff_message(match_id: str):
                 f"{match_label} has just kicked off. Bets placed: {bet_summary}. "
                 + (f"Sitting out: {', '.join(no_bet_names)}. " if no_bet_names else "")
                 + (f"Current standings: {standings_str}. " if standings_str else "")
+                + _parlay_context_for_bets(sorted_bets)
                 + "Write one fun good luck line — light banter, reference specific names and their picks. "
                 "1-2 sentences. Sharp and punchy."
             )
