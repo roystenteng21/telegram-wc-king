@@ -569,12 +569,10 @@ async def cmd_admin_credits_announcement(update: Update, context: ContextTypes.D
         "On a 1-match day it's just the 100c EOD top-up.\n\n"
         "Bets pay 1:1 — stake 50c on a win, get 100c back.\n\n"
         "🎰 Parlays\n"
-        "Combine 2–6 result bets on the same match day:\n"
+        "Combine 2–4 win/draw bets on the same match day:\n"
         "• 2 legs = 4.5x\n"
         "• 3 legs = 8x\n"
         "• 4 legs = 16x\n"
-        "• 5 legs = 32x\n"
-        "• 6 legs = 64x\n"
         "All legs must win. One loss and the whole parlay is done.\n\n"
         "Winner = highest credits after the Final on Jul 19. Good luck! 🍀"
     )

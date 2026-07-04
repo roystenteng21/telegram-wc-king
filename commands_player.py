@@ -5,7 +5,7 @@ from telegram.ext import ContextTypes
 
 from config import (
     ADMIN_TELEGRAM_ID, SGT, UTC, CT, TEAM_DISPLAY,
-    RESULT_OUTCOMES, ALL_OUTCOMES,
+    ALL_OUTCOMES,
     SESSION_EXPIRY, BET_LOCK_BUFFER, PARLAY_MULTIPLIERS, NAME_OVERRIDES,
     STATUS_ACTIVE_PLAY
 )
@@ -107,7 +107,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 Degen — WC Kings 2026\n\n"
         "/matches — Today's matches + kickoff times\n"
         "/bet [team] [win|loss|draw|over|under] [amount] — Place a bet\n"
-        "/parlay [amount], [team] [win|draw|loss], ... — Place a parlay\n"
+        "/parlay [amount], [team] [win|draw], ... — Place a parlay\n"
         "/mybets — Your open bets\n"
         "/cancel — Cancel an open bet\n"
         "/cancelparlay — Cancel an active parlay\n"
@@ -866,10 +866,10 @@ async def cmd_parlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = " ".join(context.args)
     if not raw:
         await update.message.reply_text(
-            "Usage: /parlay [amount], [team] [win|draw|loss], ...\n"
+            "Usage: /parlay [amount], [team] [win|draw], ...\n"
             "Example: /parlay 50, mexico win, brazil draw\n\n"
-            "Multipliers: 2-leg 4.5x · 3-leg 8x · 4-leg 16x · 5-leg 32x · 6-leg 64x\n"
-            "Result/draw bets only. All legs must win."
+            "Multipliers: 2-leg 4.5x · 3-leg 8x · 4-leg 16x\n"
+            "Win/draw bets only. All legs must win."
         )
         return
 
@@ -894,8 +894,8 @@ async def cmd_parlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(leg_parts) < 2:
         await update.message.reply_text("Need at least 2 legs.")
         return
-    if len(leg_parts) > 6:
-        await update.message.reply_text("Maximum 6 legs per parlay.")
+    if len(leg_parts) > 4:
+        await update.message.reply_text("Maximum 4 legs per parlay.")
         return
 
     if user_data["credits"] < amount:
@@ -907,15 +907,15 @@ async def cmd_parlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for leg_str in leg_parts:
         tokens = leg_str.strip().split()
         if len(tokens) < 2:
-            await update.message.reply_text(f"Invalid leg: '{leg_str}'. Format: [team] [win|draw|loss]")
+            await update.message.reply_text(f"Invalid leg: '{leg_str}'. Format: [team] [win|draw]")
             return
 
         team_input = tokens[0]
         outcome_input = tokens[1].lower()
 
-        if outcome_input not in RESULT_OUTCOMES:
+        if outcome_input not in ("win", "draw"):
             await update.message.reply_text(
-                f"'{outcome_input}' is not valid for parlays. Use: win, draw, loss (no over/under)."
+                f"'{outcome_input}' is not valid for parlays. Use: win or draw only."
             )
             return
 

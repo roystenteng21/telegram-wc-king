@@ -66,7 +66,9 @@ POLL_INTERVAL = 5 * 60        # 5 minutes in seconds
 # Knockout match duration (seconds) — used for poll offset
 KNOCKOUT_DURATION = 120 * 60
 
-# Scheduler times (SGT) — removed silent hours / morning flush
+# Scheduler times (SGT)
+NIGHT_REMINDER_HOUR = 23
+NIGHT_REMINDER_MINUTE = 0
 PREMATCH_SUMMARY_MINUTES = 15
 
 
@@ -233,6 +235,7 @@ TEAM_ALIASES = {
     "bol": "Bolivia",
     "bolivia": "Bolivia",
     "cap": "Cape Verde Islands",
+    "cpv": "Cape Verde Islands",
     "cape verde": "Cape Verde Islands",
     "cape verde islands": "Cape Verde Islands",
     "cur": "Curaçao",
@@ -243,6 +246,16 @@ TEAM_ALIASES = {
     "uzbekistan": "Uzbekistan",
     "gha": "Ghana",
     "ghana": "Ghana",
+    "bih": "Bosnia-Herzegovina",
+    "cuw": "Curaçao",
+    "gnb": "Guinea-Bissau",
+    "nga": "Nigeria",
+    "chi": "Chile",
+    "chile": "Chile",
+    "crc": "Costa Rica",
+    "costa rica": "Costa Rica",
+    "ukr": "Ukraine",
+    "ukraine": "Ukraine",
 }
 
 # Valid bet outcomes
@@ -258,7 +271,7 @@ STATUS_POSTPONED = "POSTPONED"
 STATUS_ACTIVE_PLAY = ("IN_PLAY", "PAUSED", "HALFTIME", "EXTRA_TIME", "PENALTY_SHOOTOUT")
 
 # Parlay multipliers by number of legs
-PARLAY_MULTIPLIERS = {2: 4.5, 3: 8.0, 4: 16.0, 5: 32.0, 6: 64.0}
+PARLAY_MULTIPLIERS = {2: 4.5, 3: 8.0, 4: 16.0}
 
 # Display name overrides (Telegram first_name → short display name)
 NAME_OVERRIDES = {"Shunnnnnn": "Shun", "Shunnnnnn ☄️": "Shun", "Roysten": "Roy"}

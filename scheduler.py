@@ -9,6 +9,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from config import (
     SGT, UTC, CT, MATCH_CREDITS,
+    NIGHT_REMINDER_HOUR, NIGHT_REMINDER_MINUTE,
     PREMATCH_SUMMARY_MINUTES, POLL_START_OFFSET, POLL_INTERVAL,
     KNOCKOUT_DURATION, ANTHROPIC_API_KEY,
     ADMIN_TELEGRAM_ID, BOT_VERSION, TEAM_DISPLAY, PARLAY_MULTIPLIERS,
@@ -50,6 +51,13 @@ async def send_group(message: str, parse_mode: str = None):
     except Exception as e:
         logger.error(f"Failed to send group message: {e}")
         await dm_admin(f"⚠️ Failed to send group message: {e}")
+
+
+def format_match_line(match: dict) -> str:
+    kickoff_utc = datetime.strptime(match["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+    kickoff_sgt = kickoff_utc.astimezone(SGT)
+    time_str = kickoff_sgt.strftime("%I:%M %p SGT").lstrip("0")
+    return f"{format_match_teams(match['home'], match['away'])} — {time_str}"
 
 
 # ── CT date helpers ───────────────────────────────────────────────────────────
@@ -261,6 +269,103 @@ async def _katerina_line(prompt: str, fallback: str, max_tokens: int = 120) -> s
     except Exception as e:
         logger.error(f"Katerina API call failed in scheduler: {e}")
         return fallback
+
+
+# ── Night reminder (11PM SGT) ────────────────────────────────────────────────
+async def job_night_reminder():
+    try:
+        today_ct = datetime.now(CT).strftime("%Y-%m-%d")
+        now_utc = datetime.now(UTC)
+        yesterday_utc = (now_utc - timedelta(days=1)).strftime("%Y-%m-%d")
+        today_utc = now_utc.strftime("%Y-%m-%d")
+        tomorrow_utc = (now_utc + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        # Read from cache first — cache already holds yesterday + today + tomorrow from startup
+        cached_all = list(sheet.cache.get("matches", {}).values())
+        raw_from_cache = [
+            m for m in cached_all
+            if m.get("kickoff_utc", "") >= yesterday_utc
+        ]
+
+        raw = None
+        if raw_from_cache:
+            raw = raw_from_cache
+            logger.info("Night reminder: using cached fixtures")
+        else:
+            # Cache empty — fall back to API with 5-attempt retry
+            last_error = None
+            for attempt in range(1, 6):
+                try:
+                    raw = (
+                        api.fetch_matches_for_date(yesterday_utc) +
+                        api.fetch_matches_for_date(today_utc) +
+                        api.fetch_matches_for_date(tomorrow_utc)
+                    )
+                    logger.info(f"Night reminder: API fetch succeeded on attempt {attempt}")
+                    break
+                except RuntimeError as e:
+                    last_error = e
+                    logger.warning(f"Night reminder: API fetch attempt {attempt} failed: {e}")
+                    if attempt < 5:
+                        await asyncio.sleep(5)
+            if raw is None:
+                await dm_admin(f"⚠️ Night reminder: failed to fetch fixtures after 5 attempts: {last_error}")
+                return
+
+        matches = []
+        for m in raw:
+            try:
+                ko = datetime.strptime(m["kickoff_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+                if (
+                    ko.astimezone(CT).strftime("%Y-%m-%d") == today_ct
+                    and ko > now_utc
+                    and m.get("status") not in ("FINISHED", "CANCELLED", "POSTPONED")
+                ):
+                    matches.append(m)
+            except Exception:
+                continue
+
+        if not matches:
+            logger.info("Night reminder: no upcoming matches today CT, skipping")
+            return
+
+        lines = ["🌙 Good evening gents! Matches tonight:\n"]
+
+        bet_context_parts = []
+        for m in sorted(matches, key=lambda x: x["kickoff_utc"]):
+            lines.append(f"  {format_match_line(m)}")
+            open_bets = [b for b in sheet.cache["bets"] if b["match_id"] == str(m["match_id"]) and b["status"] == "open"]
+            if open_bets:
+                for b in sorted(open_bets, key=_get_sort_name):
+                    name = _get_user_name(b["user_id"])
+                    lines.append(f"  {_format_bet_line(b, m)}")
+                    bet_context_parts.append(f"{name} on {_outcome_label(b['outcome'], m)} for {format_match_teams(m['home'], m['away'])}")
+            else:
+                lines.append("  No bets yet.")
+            lines.append("")
+
+        # Katerina closing line
+        if bet_context_parts:
+            bet_summary = ", ".join(bet_context_parts)
+            prompt = (
+                f"It's 11PM. Tonight's WC matches are set. Current bets placed: {bet_summary}. "
+                f"Write one short punchy good night line — acknowledge who's bet, maybe a light dig. "
+                f"1 sentence max. No hashtags."
+            )
+            closing = await _katerina_line(prompt, "Get your bets in before kickoff. Good night! 🌛")
+        else:
+            prompt = (
+                f"It's 11PM. Tonight's WC matches are set but nobody has bet yet. "
+                f"Write one short punchy good night line encouraging bets. 1 sentence max."
+            )
+            closing = await _katerina_line(prompt, "No bets placed yet. Get on it before kickoff. Good night! 🌛")
+
+        lines.append(closing)
+        await send_group("\n".join(lines))
+        logger.info("Night reminder sent")
+    except Exception as e:
+        logger.error(f"Night reminder job failed: {e}")
+        await dm_admin(f"⚠️ Night reminder job failed: {e}")
 
 
 # ── Pre-match summary ─────────────────────────────────────────────────────────
@@ -623,10 +728,15 @@ async def _send_coming_up_today():
         await dm_admin(f"⚠️ Coming up today message failed: {e}")
 
 
-async def _send_coming_up_next_day():
-    """Send tomorrow's matches after EOD. Shows kickoff times and any bets already placed."""
+async def _send_coming_up_next_day(ct_date: str = None):
+    """Send the next CT match day's fixtures after EOD.
+    Based on the just-ended CT match day (+1), never the wall clock —
+    an EOD can fire while the CT calendar is already on the next day."""
     try:
-        tomorrow_ct = (datetime.now(CT) + timedelta(days=1)).strftime("%Y-%m-%d")
+        if ct_date:
+            tomorrow_ct = (datetime.strptime(ct_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+        else:
+            tomorrow_ct = (datetime.now(CT) + timedelta(days=1)).strftime("%Y-%m-%d")
         tomorrow_matches = await get_ct_date_matches(tomorrow_ct)
         upcoming = [m for m in tomorrow_matches if m.get("status") not in ("FINISHED", "CANCELLED", "POSTPONED")]
         if not upcoming:
@@ -713,6 +823,25 @@ async def check_all_matches_done(match_id: str = None):
 
 
 # ── Post standings + daily credits ───────────────────────────────────────────
+_STAGE_DISPLAY = {
+    "GROUP_STAGE": "Group Stage",
+    "LAST_32": "Round of 32", "ROUND_OF_32": "Round of 32",
+    "LAST_16": "Round of 16", "ROUND_OF_16": "Round of 16",
+    "QUARTER_FINALS": "Quarterfinals", "QUARTER_FINAL": "Quarterfinals",
+    "SEMI_FINALS": "Semifinals", "SEMI_FINAL": "Semifinals",
+    "THIRD_PLACE": "Third Place",
+    "FINAL": "Final",
+}
+
+
+def _stage_of(matches: list) -> str:
+    """Most common stage string among the given matches, '' if none."""
+    stages = [m.get("round", "") for m in matches if m.get("round")]
+    if not stages:
+        return ""
+    return max(set(stages), key=stages.count)
+
+
 async def job_post_standings(match_ids: list):
     try:
         # Force fresh data before P&L and credit calculations
@@ -992,11 +1121,26 @@ async def job_post_standings(match_ids: list):
         await send_group("\n".join(lines))
         logger.info("End of day standings and daily credits posted")
 
-        # Coming up tomorrow
-        await _send_coming_up_next_day()
+        # Coming up next match day — based on the EOD'd CT date, not the clock
+        await _send_coming_up_next_day(ct_date)
 
-        # Stage transition check — fire Katerina hype in background if today ends a stage
-        asyncio.create_task(_katerina.check_and_send_stage_hype(notify_fn=dm_admin))
+        # Stage transition check — fixture-based: hype only when the next CT day's
+        # matches belong to a different stage than the day that just ended
+        try:
+            next_ct = (datetime.strptime(ct_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+            next_matches = await get_ct_date_matches(next_ct)
+            cur_stage = _stage_of(today_matches)
+            nxt_stage = _stage_of(next_matches)
+            if cur_stage and nxt_stage and cur_stage != nxt_stage:
+                asyncio.create_task(_katerina.send_stage_hype(
+                    _STAGE_DISPLAY.get(cur_stage, cur_stage),
+                    _STAGE_DISPLAY.get(nxt_stage, nxt_stage),
+                    notify_fn=dm_admin
+                ))
+            else:
+                logger.info(f"Stage hype check: {cur_stage} → {nxt_stage}, no transition")
+        except Exception as e:
+            logger.warning(f"Stage transition check failed: {e}")
 
     except Exception as e:
         logger.error(f"Post standings job failed: {e}")
@@ -1081,6 +1225,8 @@ async def job_health_monitor():
 
         # 2. Scheduler jobs still registered
         job_ids = {job.id for job in scheduler.get_jobs()}
+        if "night_reminder" not in job_ids:
+            issues.append("night_reminder job missing from scheduler")
         if "cache_refresh" not in job_ids:
             issues.append("cache_refresh job missing from scheduler")
 
@@ -1117,6 +1263,15 @@ async def job_health_monitor():
 # ── Register daily jobs ───────────────────────────────────────────────────────
 def register_static_jobs():
     """Register fixed-time daily jobs. Called on startup."""
+
+    # Night reminder — 11PM SGT daily
+    scheduler.add_job(
+        job_night_reminder,
+        trigger=CronTrigger(hour=NIGHT_REMINDER_HOUR, minute=NIGHT_REMINDER_MINUTE, timezone=SGT),
+        id="night_reminder",
+        replace_existing=True,
+        misfire_grace_time=600
+    )
 
     # Cache refresh — staggered to avoid colliding with cron jobs at :00 and :30
     scheduler.add_job(
@@ -1257,6 +1412,12 @@ async def on_startup(notify_fn=None):
         register_match_jobs(all_today_matches)
 
         scheduler.start()
+
+        # Startup recovery — fire night reminder if bot restarted during 11PM hour
+        now_sgt = datetime.now(SGT)
+        if now_sgt.hour == NIGHT_REMINDER_HOUR:
+            logger.info("Startup during 11PM hour — firing night reminder immediately")
+            scheduler.add_job(job_night_reminder, trigger=DateTrigger(run_date=datetime.now(UTC) + timedelta(seconds=5)), id="night_reminder_recovery", replace_existing=True)
 
         if _bot is not None:
             await dm_admin(
