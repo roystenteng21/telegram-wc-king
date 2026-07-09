@@ -109,7 +109,8 @@ async def cmd_admin_result_push(update: Update, context: ContextTypes.DEFAULT_TY
         open_bets = [b for b in await sheet.get_bets_for_match(match_id) if b["status"] == "open"]
         if open_bets and match.get("result"):
             await sheet.settle_bets_for_match(
-                match_id, match["result"], match.get("ou_result", ""), notify_fn=dm_admin
+                match_id, match["result"], match.get("ou_result", ""),
+                match.get("home_score"), match.get("away_score"), notify_fn=dm_admin
             )
 
         bets = await sheet.get_bets_for_match(match_id)
@@ -1153,7 +1154,7 @@ async def cmd_confirm_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 match["match_id"], home_score, away_score, notify_fn=dm_admin
             )
             settlements = await sheet.settle_bets_for_match(
-                match["match_id"], result, ou_result, notify_fn=dm_admin
+                match["match_id"], result, ou_result, home_score, away_score, notify_fn=dm_admin
             )
             updated_match = await sheet.get_match_by_id(match["match_id"])
 

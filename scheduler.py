@@ -274,10 +274,11 @@ def format_result_message(match: dict, settlements: list, parlay_wins: list = No
         seen_uids.add(uid)
         name = _get_user_name(uid)
         user_picks = [g for g in goals_bets if g["user_id"] == uid]
-        pick_parts = " \u00b7 ".join(
-            f"{g['outcome']} {'\u2705' if g['status'] == 'won' else '\u274c'}"
-            for g in user_picks
-        )
+        pick_labels = []
+        for g in user_picks:
+            icon = "\u2705" if g["status"] == "won" else "\u274c"
+            pick_labels.append(f"{g['outcome']} {icon}")
+        pick_parts = " \u00b7 ".join(pick_labels)
         total_staked = sum(g["amount"] for g in user_picks)
         total_won = sum(g["amount"] * SCORE_BET_PAYOUT_MULTIPLIER for g in user_picks if g["status"] == "won")
         if total_won:
