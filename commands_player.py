@@ -953,9 +953,7 @@ async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         confirm_msg = (
             f"✅ Goal bet placed!\n"
-            f"{home} vs {away}\n"
-            f"⚽ {home} {home_score}-{away_score} {away}\n"
-            f"{amount:,}c\n"
+            f"{home} {home_score}-{away_score} {away}\n"
             f"Balance: {new_balance:,}c\n"
             f"({picks_used}/{MAX_GOALS_BETS_PER_MATCH} picks used for this match)"
         )
