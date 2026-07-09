@@ -330,6 +330,13 @@ async def _get_roast_data(target_uid: int) -> dict:
     ou_bets = len([b for b in all_bets if b["market"] == "ou"])
     ou_pct = round(ou_bets / total_bets * 100) if total_bets else 0
 
+    # Exact-score (/goals) record
+    goals_bets_all = [b for b in all_bets if b["market"] == "score"]
+    goals_attempted = len(goals_bets_all)
+    goals_hit = len([b for b in goals_bets_all if b["status"] == "won"])
+    goals_missed = len([b for b in goals_bets_all if b["status"] == "lost"])
+    goals_biggest_miss = max((b["amount"] for b in goals_bets_all if b["status"] == "lost"), default=0)
+
     # Parlay record
     all_user_bets = sheet.cache["bets"]
     parlay_ids = set(
@@ -382,6 +389,10 @@ async def _get_roast_data(target_uid: int) -> dict:
         "ou_pct": ou_pct,
         "parlays_attempted": parlays_attempted,
         "parlays_won": parlays_won,
+        "goals_attempted": goals_attempted,
+        "goals_hit": goals_hit,
+        "goals_missed": goals_missed,
+        "goals_biggest_miss": goals_biggest_miss,
         "streak": streak,
         "skipped_matches": skipped_matches,
         "all_time_pl": all_time_pl,
@@ -427,6 +438,7 @@ Generate a roast of a player based on their stats. Rules:
 - Average bet: {data['avg_bet']:,}c ({data['avg_bet_pct']}% of effective credits) — low % = playing it safe
 - OU market usage: {data['ou_pct']}% of bets are over/under
 - Parlay record: {data['parlays_attempted']} attempted, {data['parlays_won']} won
+- Exact-score (/goals) record: {data['goals_attempted']} attempted, {data['goals_hit']} hit, {data['goals_missed']} missed{f", biggest miss {data['goals_biggest_miss']:,}c" if data['goals_biggest_miss'] else ""}
 - Current streak: {streak_str}
 - Matches skipped (no bet placed): {data['skipped_matches']}
 - All-time net P&L from betting: {data['all_time_pl']:,}c

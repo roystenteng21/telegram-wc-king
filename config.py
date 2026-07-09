@@ -273,6 +273,10 @@ STATUS_ACTIVE_PLAY = ("IN_PLAY", "PAUSED", "HALFTIME", "EXTRA_TIME", "PENALTY_SH
 # Parlay multipliers by number of legs
 PARLAY_MULTIPLIERS = {2: 4.5, 3: 8.0, 4: 16.0}
 
+# Exact-score bet ("/goals") — 1:10 payout, total return on a win is 11x stake
+SCORE_BET_PAYOUT_MULTIPLIER = 11
+MAX_GOALS_BETS_PER_MATCH = 2
+
 # Display name overrides (Telegram first_name → short display name)
 NAME_OVERRIDES = {"Shunnnnnn": "Shun", "Shunnnnnn ☄️": "Shun", "Roysten": "Roy"}
 

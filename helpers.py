@@ -92,6 +92,11 @@ def format_outcome_label(outcome: str, match: dict) -> str:
         team = match["home"]
     elif outcome == "away":
         team = match["away"]
+    elif "-" in outcome and outcome.replace("-", "").isdigit():
+        h_score, a_score = outcome.split("-", 1)
+        home_code = TEAM_DISPLAY[match["home"]][0] if match["home"] in TEAM_DISPLAY else match["home"][:3].upper()
+        away_code = TEAM_DISPLAY[match["away"]][0] if match["away"] in TEAM_DISPLAY else match["away"][:3].upper()
+        return f"⚽ {home_code} {h_score}-{a_score} {away_code}"
     else:
         return outcome.capitalize()
     if team in TEAM_DISPLAY:

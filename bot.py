@@ -151,6 +151,7 @@ def setup_handlers():
     application.add_handler(CommandHandler("mybets", cp.cmd_mybets))
     application.add_handler(CommandHandler("bet", cp.cmd_bet))
     application.add_handler(CommandHandler("cancel", cp.cmd_cancelbet))
+    application.add_handler(CommandHandler("goals", cp.cmd_goals))
     application.add_handler(CommandHandler("parlay", cp.cmd_parlay))
     application.add_handler(CommandHandler("cancelparlay", cp.cmd_cancelparlay))
     application.add_handler(CommandHandler("predict", ca.cmd_predict))
@@ -192,10 +193,9 @@ async def post_init(app):
     player_commands = [
         BotCommand("matches", "Today's matches + kickoff times"),
         BotCommand("bet", "Place a bet"),
-        BotCommand("parlay", "Place a parlay bet"),
+        BotCommand("goals", "Bet on the exact score"),
         BotCommand("mybets", "Your open bets"),
         BotCommand("cancel", "Cancel an open bet"),
-        BotCommand("cancelparlay", "Cancel an active parlay"),
         BotCommand("balance", "Your current credits"),
         BotCommand("predict", "Free event prediction"),
         BotCommand("brackets", "WC 2026 knockout bracket"),
@@ -215,7 +215,6 @@ async def post_init(app):
         BotCommand("admin_poll", "Trigger result polling"),
         BotCommand("admin_credits", "Adjust player credits"),
         BotCommand("admin_cancel_match", "Void all bets for a match"),
-        BotCommand("admin_cancel_parlay", "Cancel a player's active parlay"),
         BotCommand("admin_announce", "Announce to group"),
         BotCommand("admin_event", "Manage ad hoc events"),
         BotCommand("admin_katerina_back", "Send Katerina back message"),

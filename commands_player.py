@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -7,7 +8,7 @@ from config import (
     ADMIN_TELEGRAM_ID, SGT, UTC, CT, TEAM_DISPLAY,
     ALL_OUTCOMES,
     SESSION_EXPIRY, BET_LOCK_BUFFER, PARLAY_MULTIPLIERS, NAME_OVERRIDES,
-    STATUS_ACTIVE_PLAY
+    STATUS_ACTIVE_PLAY, MAX_GOALS_BETS_PER_MATCH
 )
 import sheet
 import scheduler as sched
@@ -107,10 +108,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 Degen — WC Kings 2026\n\n"
         "/matches — Today's matches + kickoff times\n"
         "/bet [team] [win|loss|draw|over|under] [amount] — Place a bet\n"
-        "/parlay [amount], [team] [win|draw], ... — Place a parlay\n"
+        "/goals [amount], [team] [score] — Bet the exact score (e.g. /goals 100, fra 2-0), max 2 picks per match\n"
         "/mybets — Your open bets\n"
         "/cancel — Cancel an open bet\n"
-        "/cancelparlay — Cancel an active parlay\n"
         "/balance — Your current credits\n"
         "/brackets — WC 2026 knockout bracket\n"
         "/leaderboard — Full standings\n"
@@ -853,8 +853,123 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+# ── /goals — exact-score bet ──────────────────────────────────────────────────
+async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_group_message(update):
+        await update.message.reply_text("Please use this command in the group.")
+        return
+
+    user = update.effective_user
+    user_data = await ensure_registered(update)
+
+    # Reconstruct raw args and split on comma so "/goals 100, fra 2-0" and
+    # "/goals 100 fra 2-0" both work — comma is optional.
+    raw = " ".join(context.args)
+    parts = [p.strip() for p in raw.replace(",", " ").split() if p.strip()]
+
+    if len(parts) != 3:
+        await update.message.reply_text("Usage: /goals [amount], [team] [score]\nExample: /goals 100, fra 2-0")
+        return
+
+    amount_input, team_input, score_input = parts
+
+    # Validate amount
+    try:
+        amount = int(float(amount_input))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Please enter a valid amount (e.g. /goals 100, fra 2-0)")
+        return
+
+    if user_data["credits"] < amount:
+        await update.message.reply_text(f"Insufficient credits. Your balance: {user_data['credits']:,}c")
+        return
+
+    # Validate score format — two non-negative integers, no upper bound
+    if not re.fullmatch(r"\d+-\d+", score_input):
+        await update.message.reply_text("Invalid score format. Use e.g. 2-0, 1-1, 3-2.")
+        return
+    team_goals, opp_goals = score_input.split("-")
+    team_goals, opp_goals = int(team_goals), int(opp_goals)
+
+    # Resolve team
+    team_name, is_ambiguous = resolve_team(team_input)
+    if is_ambiguous:
+        await update.message.reply_text(
+            f"'{team_input}' could be multiple teams. Please be more specific (e.g. 'Guinea-Bissau' or 'Guinea')."
+        )
+        return
+    if not team_name:
+        await update.message.reply_text(f"Couldn't find '{team_input}'. Check /matches for today's teams.")
+        return
+
+    # Find match
+    match = find_match_for_team(team_name)
+    if not match:
+        await update.message.reply_text(f"No upcoming match found for {team_name}, or betting is already closed.")
+        return
+
+    # The number right after the team name is that team's goals — convert to
+    # home/away regardless of which side was named.
+    if team_name == match["home"]:
+        home_score, away_score = team_goals, opp_goals
+    else:
+        home_score, away_score = opp_goals, team_goals
+    normalized_outcome = f"{home_score}-{away_score}"
+
+    # Cap + duplicate check — compare against normalized outcome, not raw
+    # input, so "fra 2-0" and a later "mar 0-2" (same result, mirrored) are
+    # correctly caught as the same pick.
+    existing = await sheet.get_user_goals_bets_for_match(user.id, match["match_id"])
+    home = format_team(match["home"])
+    away = format_team(match["away"])
+    if any(b["outcome"] == normalized_outcome for b in existing):
+        await update.message.reply_text(
+            f"You've already got a pick on {home} {home_score}-{away_score} {away} for this match. "
+            f"Pick a different score, or /cancel to remove it first."
+        )
+        return
+    if len(existing) >= MAX_GOALS_BETS_PER_MATCH:
+        picks = ", ".join(b["outcome"] for b in existing)
+        await update.message.reply_text(
+            f"You've already used both your picks for {format_match_teams(match['home'], match['away'])} ({picks}). "
+            f"Cancel one via /cancel first if you want to change it."
+        )
+        return
+
+    try:
+        await sheet.place_bet(
+            user_id=user.id,
+            match_id=match["match_id"],
+            market="score",
+            outcome=normalized_outcome,
+            amount=amount,
+            notify_fn=dm_admin
+        )
+
+        new_balance = sheet.cache["users"][user.id]["credits"]
+        picks_used = len(existing) + 1
+
+        confirm_msg = (
+            f"✅ Goal bet placed!\n"
+            f"{home} vs {away}\n"
+            f"⚽ {home} {home_score}-{away_score} {away}\n"
+            f"{amount:,}c\n"
+            f"Balance: {new_balance:,}c\n"
+            f"({picks_used}/{MAX_GOALS_BETS_PER_MATCH} picks used for this match)"
+        )
+        await send_confirmation(update, confirm_msg)
+
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Failed to place bet: {e}")
+        await dm_admin(f"⚠️ /goals failed for user {user.id}: {e}")
+
+
 # ── /parlay ───────────────────────────────────────────────────────────────────
 async def cmd_parlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Parlays are disabled for this tournament. Use /goals for exact-score bets instead.")
+    return
     if not is_group_message(update):
         await update.message.reply_text("Please use this command in the group.")
         return
@@ -1025,6 +1140,8 @@ async def cmd_parlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── /cancelparlay ─────────────────────────────────────────────────────────────
 async def cmd_cancelparlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Parlays are disabled for this tournament.")
+    return
     await ensure_registered(update)
     user_id = update.effective_user.id
     args = context.args

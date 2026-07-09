@@ -935,6 +935,8 @@ async def _present_parlay_confirm(update: Update, user: dict, parlay: dict) -> b
 async def cmd_admin_cancel_parlay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
+    await update.message.reply_text("Parlays are disabled for this tournament.")
+    return
 
     args = context.args
 

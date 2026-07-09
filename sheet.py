@@ -7,7 +7,7 @@ from google.oauth2.service_account import Credentials
 from config import (
     SPREADSHEET_ID, GOOGLE_CREDENTIALS_JSON,
     SHEET_USERS, SHEET_MATCHES, SHEET_BETS, SHEET_LEDGER, SHEET_EVENTS,
-    STARTING_CREDITS, UTC, PARLAY_MULTIPLIERS, TEAM_DISPLAY
+    STARTING_CREDITS, UTC, PARLAY_MULTIPLIERS, SCORE_BET_PAYOUT_MULTIPLIER, TEAM_DISPLAY
 )
 
 logger = logging.getLogger(__name__)
@@ -576,6 +576,16 @@ async def get_user_open_bets(user_id: int) -> list:
 async def get_bets_for_match(match_id: str) -> list:
     return [b for b in cache["bets"] if b["match_id"] == str(match_id)]
 
+async def get_user_goals_bets_for_match(user_id: int, match_id: str) -> list:
+    """Open /goals (market=score) bets a user has on a specific match — used for the
+    max-2-per-match cap and duplicate-scoreline check."""
+    match_id = str(match_id)
+    return [
+        b for b in cache["bets"]
+        if b["user_id"] == user_id and b["match_id"] == match_id
+        and b["market"] == "score" and b["status"] == "open"
+    ]
+
 async def cancel_bet(bet_id: str, user_id: int, notify_fn=None):
     """Void bet and refund credits using cached row number."""
     async with get_user_lock(user_id):
@@ -604,12 +614,13 @@ async def cancel_bet(bet_id: str, user_id: int, notify_fn=None):
                 await notify_fn(f"⚠️ Failed to cancel bet {bet_id}: {e}")
             raise
 
-async def settle_bets_for_match(match_id: str, result: str, ou_result: str, notify_fn=None) -> list:
+async def settle_bets_for_match(match_id: str, result: str, ou_result: str, home_score, away_score, notify_fn=None) -> list:
     """Settle all open bets for a match using cached row numbers.
     Locked per-match so two concurrent settlement paths (e.g. a poll job and
     the stuck-match auto-settle sweep) can't both process the same bets."""
     match_id = str(match_id)
     settlements = []
+    exact_score = f"{home_score}-{away_score}"
 
     async with get_match_lock(match_id):
         # Re-read fresh inside the lock — if another caller already settled
@@ -623,14 +634,17 @@ async def settle_bets_for_match(match_id: str, result: str, ou_result: str, noti
 
             for bet in open_bets:
                 won = False
+                is_score_bet = bet["market"] == "score"
                 if bet["market"] == "result":
                     won = bet["outcome"] == result
                 elif bet["market"] == "ou":
                     won = bet["outcome"] == ou_result
+                elif is_score_bet:
+                    won = bet["outcome"] == exact_score
 
-                payout = bet["amount"] * 2 if won else 0
+                payout = bet["amount"] * (SCORE_BET_PAYOUT_MULTIPLIER if is_score_bet else 2) if won else 0
                 status = "won" if won else "lost"
-                pl = bet["amount"] if won else -bet["amount"]
+                pl = payout - bet["amount"] if won else -bet["amount"]
 
                 # Parlay legs: mark won/lost but DO NOT pay out here.
                 # Payout is handled at EOD via multiplier in job_post_standings.
@@ -826,7 +840,7 @@ def get_daily_pl(match_ids: list) -> dict:
     match_ids_str = [str(m) for m in match_ids]
     pl = {}
 
-    # Singles only — parlay legs handled separately
+    # Singles + goals bets — parlay legs handled separately below
     for bet in cache["bets"]:
         if bet["match_id"] not in match_ids_str:
             continue
@@ -835,7 +849,11 @@ def get_daily_pl(match_ids: list) -> dict:
         if str(bet.get("parlay_id", "")) not in ("", "0"):
             continue  # skip parlay legs here
         uid = bet["user_id"]
-        pl[uid] = pl.get(uid, 0) + (bet["amount"] if bet["status"] == "won" else -bet["amount"])
+        if bet["status"] == "won":
+            profit = bet["amount"] * (SCORE_BET_PAYOUT_MULTIPLIER - 1) if bet["market"] == "score" else bet["amount"]
+        else:
+            profit = -bet["amount"]
+        pl[uid] = pl.get(uid, 0) + profit
 
     # Parlays — find all valid parlay_ids with any leg in today's matches
     today_parlay_ids = set(

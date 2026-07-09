@@ -14,6 +14,7 @@ from config import (
     PREMATCH_SUMMARY_MINUTES, POLL_START_OFFSET, POLL_INTERVAL,
     KNOCKOUT_DURATION, ANTHROPIC_API_KEY,
     ADMIN_TELEGRAM_ID, BOT_VERSION, TEAM_DISPLAY, PARLAY_MULTIPLIERS,
+    SCORE_BET_PAYOUT_MULTIPLIER,
     DAILY_CREDIT_TIERS, TOURNAMENT_FINAL_DATE, NAME_OVERRIDES,
     STATUS_ACTIVE_PLAY
 )
@@ -144,6 +145,11 @@ def _outcome_label(outcome: str, match: dict) -> str:
         team = match["away"]
         code = TEAM_DISPLAY[team][0] if team in TEAM_DISPLAY else team[:3].upper()
         return f"{code} Win"
+    if "-" in outcome and outcome.replace("-", "").isdigit():
+        h_score, a_score = outcome.split("-", 1)
+        home_code = TEAM_DISPLAY[match["home"]][0] if match["home"] in TEAM_DISPLAY else match["home"][:3].upper()
+        away_code = TEAM_DISPLAY[match["away"]][0] if match["away"] in TEAM_DISPLAY else match["away"][:3].upper()
+        return f"{home_code} {h_score}-{a_score} {away_code}"
     return outcome.capitalize()
 
 
@@ -165,9 +171,15 @@ def _is_parlay_leg(s: dict) -> bool:
     return bool(pid) and str(pid) not in ("", "0")
 
 
+def _is_goals_bet(s: dict) -> bool:
+    """Returns True if this is a /goals exact-score bet."""
+    return s.get("market") == "score"
+
+
 def _format_bet_line(b: dict, match: dict) -> str:
     """Standard bet line for all pre-match listings.
     Singles: Name — outcome — amount c
+    Goals bets: Name — ⚽ outcome — amount c
     Parlay legs: Name — outcome — 🎰 N/M (leg number from cache, no amount)
     Bust parlay legs: Name — outcome — 🥀"""
     name = _get_user_name(b["user_id"])
@@ -180,6 +192,8 @@ def _format_bet_line(b: dict, match: dict) -> str:
         total = len(all_legs)
         leg_num = next((i + 1 for i, l in enumerate(all_legs) if l["bet_id"] == b["bet_id"]), "?")
         return f"• {name} — {outcome} — 🎰 {leg_num}/{total}"
+    if _is_goals_bet(b):
+        return f"• {name} — ⚽ {outcome} — {b['amount']:,}c"
     return f"• {name} — {outcome} — {b['amount']:,}c"
 
 
@@ -201,9 +215,10 @@ def format_result_message(match: dict, settlements: list, parlay_wins: list = No
     def sort_key(s):
         return _get_user_name(s["user_id"]).lower()
 
-    # Separate singles from parlay legs
-    singles = [s for s in settlements if not _is_parlay_leg(s)]
+    # Separate singles, parlay legs, and goals (exact-score) bets
+    singles = [s for s in settlements if not _is_parlay_leg(s) and not _is_goals_bet(s)]
     parlay_legs = [s for s in settlements if _is_parlay_leg(s)]
+    goals_bets = [s for s in settlements if _is_goals_bet(s)]
 
     for s in sorted(singles, key=sort_key):
         name = _get_user_name(s["user_id"])
@@ -247,6 +262,32 @@ def format_result_message(match: dict, settlements: list, parlay_wins: list = No
     if parlay_section:
         lines.append("")
         lines.extend(parlay_section)
+
+    # Goals (exact-score) display — consolidated per user, one line per player
+    # covering all their stacked scorelines on this match (max 2)
+    goals_section = []
+    seen_uids = set()
+    for s in sorted(goals_bets, key=sort_key):
+        uid = s["user_id"]
+        if uid in seen_uids:
+            continue
+        seen_uids.add(uid)
+        name = _get_user_name(uid)
+        user_picks = [g for g in goals_bets if g["user_id"] == uid]
+        pick_parts = " \u00b7 ".join(
+            f"{g['outcome']} {'\u2705' if g['status'] == 'won' else '\u274c'}"
+            for g in user_picks
+        )
+        total_staked = sum(g["amount"] for g in user_picks)
+        total_won = sum(g["amount"] * SCORE_BET_PAYOUT_MULTIPLIER for g in user_picks if g["status"] == "won")
+        if total_won:
+            goals_section.append(f"\u26bd {name} \u2014 {pick_parts} \u2014 {total_staked:,}c staked \u2192 {total_won:,}c back \U0001f525")
+        else:
+            goals_section.append(f"\u26bd {name} \u2014 {pick_parts} \u2014 {total_staked:,}c gone")
+
+    if goals_section:
+        lines.append("")
+        lines.extend(goals_section)
 
     return "\n".join(lines)
 
@@ -564,7 +605,7 @@ async def _auto_settle_stuck_match(match_id: str):
             return
 
         # Settle remaining open bets
-        settlements = await sheet.settle_bets_for_match(match_id, match["result"], match.get("ou_result", ""), notify_fn=dm_admin)
+        settlements = await sheet.settle_bets_for_match(match_id, match["result"], match.get("ou_result", ""), match.get("home_score"), match.get("away_score"), notify_fn=dm_admin)
         parlay_wins = await check_parlay_completions(match_id)
 
         if already_settled:
@@ -589,19 +630,27 @@ async def _auto_settle_stuck_match(match_id: str):
         if settlements or parlay_wins:
             home_score = match.get("home_score", "?")
             away_score = match.get("away_score", "?")
+            singles_on_match = [s for s in settlements if not _is_parlay_leg(s) and not _is_goals_bet(s)]
+            parlay_legs_on_match = [s for s in settlements if _is_parlay_leg(s)]
+            goals_on_match = [s for s in settlements if _is_goals_bet(s)]
             settled_summary = ", ".join(
                 f"{_get_user_name(s['user_id'])} {'won' if s['status'] == 'won' else 'lost'} {s['amount']:,}c on {_outcome_label(s['outcome'], match)}"
-                for s in settlements if not _is_parlay_leg(s)
+                for s in singles_on_match
+            )
+            goals_summary = ", ".join(
+                f"{_get_user_name(s['user_id'])} {'HIT' if s['status'] == 'won' else 'missed'} exact score {s['outcome']}"
+                for s in goals_on_match
             )
             context = f"Result: {format_match_teams(match['home'], match['away'])} {home_score}-{away_score}."
             if settled_summary:
                 context += f" Singles: {settled_summary}."
-            singles_on_match = [s for s in settlements if not _is_parlay_leg(s)]
-            parlay_legs_on_match = [s for s in settlements if _is_parlay_leg(s)]
+            if goals_summary:
+                context += f" Exact-score picks: {goals_summary}."
             everyone_lost = (
                 bool(settlements) and not parlay_wins and
                 all(s["status"] == "lost" for s in singles_on_match) and
-                all(s["status"] == "lost" for s in parlay_legs_on_match)
+                all(s["status"] == "lost" for s in parlay_legs_on_match) and
+                all(s["status"] == "lost" for s in goals_on_match)
             )
             if everyone_lost:
                 names = ", ".join(dict.fromkeys(_get_user_name(s["user_id"]) for s in settlements))
@@ -672,7 +721,7 @@ async def job_poll_result(match_id: str, attempt: int = 1):
             await check_all_matches_done(match_id)
             return
 
-        settlements = await sheet.settle_bets_for_match(match_id, result, ou_result, notify_fn=dm_admin)
+        settlements = await sheet.settle_bets_for_match(match_id, result, ou_result, home_score, away_score, notify_fn=dm_admin)
 
         # Check parlay completions after settlement
         parlay_wins = await check_parlay_completions(match_id)
@@ -695,28 +744,36 @@ async def job_poll_result(match_id: str, attempt: int = 1):
         result_msg = base_result_msg
 
         if settlements or parlay_wins:
+            singles_on_match = [s for s in settlements if not _is_parlay_leg(s) and not _is_goals_bet(s)]
+            parlay_legs_on_match = [s for s in settlements if _is_parlay_leg(s)]
+            goals_on_match = [s for s in settlements if _is_goals_bet(s)]
             settled_summary = ", ".join(
                 f"{_get_user_name(s['user_id'])} {'won' if s['status'] == 'won' else 'lost'} {s['amount']}c on {_outcome_label(s['outcome'], match)}"
-                for s in settlements if not (s.get("parlay_id") and str(s.get("parlay_id")) not in ("", "0"))
+                for s in singles_on_match
             )
             parlay_summary = ", ".join(
                 f"{_get_user_name(p['user_id'])} hit {p['legs']}-leg parlay {p['stake']}c→{p['payout']}c"
                 for _, p in (parlay_wins or [])
+            )
+            goals_summary = ", ".join(
+                f"{_get_user_name(s['user_id'])} {'HIT' if s['status'] == 'won' else 'missed'} exact score {s['outcome']}"
+                for s in goals_on_match
             )
             context = f"Result: {format_match_teams(match['home'], match['away'])} {home_score}-{away_score}."
             if settled_summary:
                 context += f" Singles: {settled_summary}."
             if parlay_summary:
                 context += f" Parlay wins: {parlay_summary}."
+            if goals_summary:
+                context += f" Exact-score picks: {goals_summary}."
 
-            # Detect if everyone lost — singles + all parlay legs on this match
-            singles_on_match = [s for s in settlements if not _is_parlay_leg(s)]
-            parlay_legs_on_match = [s for s in settlements if _is_parlay_leg(s)]
+            # Detect if everyone lost — singles + all parlay legs + all goals bets on this match
             everyone_lost = (
                 bool(settlements) and
                 not parlay_wins and
                 all(s["status"] == "lost" for s in singles_on_match) and
-                all(s["status"] == "lost" for s in parlay_legs_on_match)
+                all(s["status"] == "lost" for s in parlay_legs_on_match) and
+                all(s["status"] == "lost" for s in goals_on_match)
             )
 
             if everyone_lost:
@@ -1083,6 +1140,43 @@ async def job_post_standings(match_ids: list):
                 else:
                     lines.append(f"🥀 {name} — {info['count']} busts, {info['total_stake']:,}c gone")
 
+        # Goals (exact-score) section — wins shown individually since payout
+        # differs per line, losses aggregated per user. Unlike parlay, goals
+        # bets are already paid out at settlement time (not deferred to EOD) —
+        # this is a display-only pass over today's already-settled goals bets.
+        goals_wins_today = []
+        goals_losses_by_user = {}
+        for b in sheet.cache["bets"]:
+            if str(b["match_id"]) not in match_ids or b["market"] != "score":
+                continue
+            if b["status"] == "won":
+                m = sheet.cache["matches"].get(str(b["match_id"]), {})
+                payout = b["amount"] * SCORE_BET_PAYOUT_MULTIPLIER
+                goals_wins_today.append({
+                    "user_id": b["user_id"],
+                    "outcome": b["outcome"],
+                    "match": m,
+                    "stake": b["amount"],
+                    "payout": payout,
+                })
+            elif b["status"] == "lost":
+                uid = b["user_id"]
+                if uid not in goals_losses_by_user:
+                    goals_losses_by_user[uid] = {"count": 0, "total_stake": 0}
+                goals_losses_by_user[uid]["count"] += 1
+                goals_losses_by_user[uid]["total_stake"] += b["amount"]
+
+        if goals_wins_today or goals_losses_by_user:
+            lines.append("")
+            for w in sorted(goals_wins_today, key=lambda x: -x["payout"]):
+                name = _get_user_name(w["user_id"])
+                team_tag = format_match_teams(w["match"]["home"], w["match"]["away"]) if w["match"] else ""
+                lines.append(f"⚽ {name} — {team_tag} {w['outcome']} hit, {w['stake']:,}c → {w['payout']:,}c 🔥")
+            for uid, info in sorted(goals_losses_by_user.items(), key=lambda x: _get_user_name(x[0])):
+                name = _get_user_name(uid)
+                miss_word = "miss" if info["count"] == 1 else "misses"
+                lines.append(f"⚽ {name} — {info['count']} {miss_word}, {info['total_stake']:,}c gone")
+
         # Katerina — 1 punchy sentence, best stat angle
         # Build rich context for interesting stat hunting
         singles_stats = {}
@@ -1090,6 +1184,8 @@ async def job_post_standings(match_ids: list):
             if str(b["match_id"]) not in match_ids:
                 continue
             if str(b.get("parlay_id", "")) not in ("", "0"):
+                continue
+            if b["market"] == "score":
                 continue
             uid = b["user_id"]
             if uid not in singles_stats:
@@ -1101,7 +1197,8 @@ async def job_post_standings(match_ids: list):
                 singles_stats[uid]["lost"] += 1
                 singles_stats[uid]["biggest"] = max(singles_stats[uid]["biggest"], b["amount"])
 
-        all_bettors = set(singles_stats) | {p["user_id"] for p in list(parlay_losses.values()) + list(all_parlay_wins.values())}
+        goals_bettor_uids = {w["user_id"] for w in goals_wins_today} | set(goals_losses_by_user)
+        all_bettors = set(singles_stats) | goals_bettor_uids | {p["user_id"] for p in list(parlay_losses.values()) + list(all_parlay_wins.values())}
         skipped_uids = set(sheet.cache["users"]) - all_bettors
         skipped_str = ", ".join(_get_user_name(uid) for uid in skipped_uids) if skipped_uids else ""
 
@@ -1124,6 +1221,15 @@ async def job_post_standings(match_ids: list):
             for uid, info in bust_by_user.items()
         ) if bust_by_user else ""
 
+        goals_win_str = ", ".join(
+            f"{_get_user_name(w['user_id'])} hit {w['outcome']} for {w['stake']:,}c\u2192{w['payout']:,}c"
+            for w in goals_wins_today
+        ) if goals_wins_today else ""
+        goals_miss_str = ", ".join(
+            f"{_get_user_name(uid)} missed {info['count']} exact-score pick(s) worth {info['total_stake']:,}c"
+            for uid, info in goals_losses_by_user.items()
+        ) if goals_losses_by_user else ""
+
         gap_str = ""
         if len(standings_after) >= 2:
             gap = standings_after[0]["credits"] - standings_after[1]["credits"]
@@ -1142,7 +1248,7 @@ async def job_post_standings(match_ids: list):
             f"End of day for WC Kings 2026 ({days_to_final} days to Final). "
             f"Write EXACTLY 3 punchy sentences as Katerina the house bookie. "
             f"Vary the focus across the 3 sentences — pick 3 different angles from: biggest swing, tightest race, "
-            f"most reckless bet, worst collapse, who skipped, most dominant singles day, parlay hero or villain. "
+            f"most reckless bet, worst collapse, who skipped, most dominant singles day, exact-score hero or zero. "
             f"Be specific, name names, no fluff. No markdown, no hashtags.\n"
             f"Standings:\n{standings_str}\n"
             + (f"Biggest daily gain: {top_winner_str}\n" if top_winner_str else "")
@@ -1151,6 +1257,8 @@ async def job_post_standings(match_ids: list):
             + (f"Singles records today:\n" + "\n".join(singles_lines) + "\n" if singles_lines else "")
             + (f"Parlay wins: {parlay_win_str}\n" if parlay_win_str else "")
             + (f"Parlay busts: {bust_str}\n" if bust_str else "")
+            + (f"Exact-score wins: {goals_win_str}\n" if goals_win_str else "")
+            + (f"Exact-score misses: {goals_miss_str}\n" if goals_miss_str else "")
             + (f"Skipped betting entirely: {skipped_str}\n" if skipped_str else "")
         )
 
