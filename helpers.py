@@ -3,6 +3,7 @@ Shared state, helpers, and the Application object.
 Imported by bot.py, commands_player.py, commands_admin.py, katerina.py.
 """
 import logging
+import asyncio
 import pytz
 from collections import deque
 from datetime import datetime, timedelta
@@ -10,7 +11,7 @@ from telegram import Update
 from telegram.ext import Application
 
 from config import (
-    BOT_TOKEN, ADMIN_TELEGRAM_ID, SGT, UTC,
+    BOT_TOKEN, ADMIN_TELEGRAM_ID, UTC,
     TEAM_ALIASES, FUZZY_THRESHOLD, TEAM_DISPLAY,
     SESSION_EXPIRY, BET_LOCK_BUFFER, PRIZE_PLAYER_COUNT
 )
@@ -41,33 +42,24 @@ def set_group_chat_id(gid: int):
 
 # ── Admin DM ──────────────────────────────────────────────────────────────────
 async def dm_admin(message: str):
-    try:
-        await application.bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message)
-    except Exception as e:
-        logger.error(f"Failed to DM admin: {e}")
-
-
-# ── Silent hours ──────────────────────────────────────────────────────────────
-def is_silent_hours() -> bool:
-    """Returns True if current SGT time is in silent hours AND toggle is on."""
-    if sheet.cache.get("silent_hours_disabled", False):
-        return False
-    now_sgt = datetime.now(SGT)
-    start = now_sgt.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = now_sgt.replace(hour=7, minute=30, second=0, microsecond=0)
-    return start <= now_sgt < end
-
-
-# ── Send confirmation (DM during silent hours) ────────────────────────────────
-async def send_confirmation(update, message: str):
-    user = update.effective_user
-    if is_silent_hours():
+    """DM the admin with retry — this is the sole alerting channel for every
+    other failure in the bot, so a single transient failure must not silently
+    drop the alert."""
+    last_error = None
+    for attempt in range(1, 4):
         try:
-            dm_message = message + "\n\n🔕 Sent here to minimise group notifications (12AM–7:30AM SGT)."
-            await application.bot.send_message(chat_id=user.id, text=dm_message)
+            await application.bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message)
             return
-        except Exception:
-            pass
+        except Exception as e:
+            last_error = e
+            logger.warning(f"dm_admin attempt {attempt} failed: {e}")
+            if attempt < 3:
+                await asyncio.sleep(2 * attempt)
+    logger.error(f"dm_admin failed after 3 attempts, alert lost: {last_error}\nMessage was: {message}")
+
+
+# ── Send confirmation ──────────────────────────────────────────────────────────
+async def send_confirmation(update, message: str):
     await update.message.reply_text(message)
 
 

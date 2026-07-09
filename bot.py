@@ -108,6 +108,25 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=gid, text=welcome)
 
 
+# ── Global error handler ───────────────────────────────────────────────────────
+async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Catches any exception not already handled inside a command/message handler.
+    Without this, an unhandled error (e.g. in cmd_brackets, or any future command)
+    fails completely silently — the user gets no reply, and nobody is alerted."""
+    logger.error(f"Unhandled exception: {context.error}", exc_info=context.error)
+    try:
+        await dm_admin(f"⚠️ Unhandled error: {context.error}")
+    except Exception:
+        pass
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "Something went wrong on my end. Try again, or let the admin know if it keeps happening."
+            )
+        except Exception:
+            pass
+
+
 # ── Handler registration ──────────────────────────────────────────────────────
 def setup_handlers():
     # Katerina mention handler
@@ -155,6 +174,8 @@ def setup_handlers():
     application.add_handler(CommandHandler("admin_event", ca.cmd_admin_event))
     application.add_handler(CommandHandler("confirm_admin", ca.cmd_confirm_admin))
     application.add_handler(CommandHandler("cancel_admin", ca.cmd_cancel_admin))
+
+    application.add_error_handler(handle_error)
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────

@@ -584,6 +584,8 @@ async def cmd_admin_credits_announcement(update: Update, context: ContextTypes.D
 # ── Admin: /admin_announce ────────────────────────────────────────────────────
 async def cmd_admin_katerina_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send Katerina's 'I'm back' message to the group."""
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
     gid = get_group_chat_id()
     if not gid:
         await update.message.reply_text("Group chat ID not set yet.")
@@ -741,7 +743,9 @@ async def cmd_admin_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Step 1: /admin_result — list pending matches
     if not args:
         all_matches = await sched.get_today_ct_matches()
-        pending = [m for m in all_matches if m["status"] != "FINISHED"]
+        # A FINISHED match with no result is stuck (ET/penalty score never
+        # backfilled) and still needs action — don't hide it from the picker.
+        pending = [m for m in all_matches if m["status"] != "FINISHED" or not m.get("result")]
         if not pending:
             await update.message.reply_text("No pending matches today.")
             return
@@ -750,7 +754,8 @@ async def cmd_admin_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for i, m in enumerate(pending, 1):
             home = format_team(m["home"])
             away = format_team(m["away"])
-            lines.append(f"{i}. {home} vs {away} — {m['status']}")
+            label = f"{m['status']} — no result yet" if m["status"] == "FINISHED" else m["status"]
+            lines.append(f"{i}. {home} vs {away} — {label}")
         lines.append("\nReply /admin_result [number]")
 
         _admin_pending[ADMIN_TELEGRAM_ID] = {

@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.cron import CronTrigger
+from telegram.error import RetryAfter, TimedOut, NetworkError
 
 from config import (
     SGT, UTC, CT, MATCH_CREDITS,
@@ -46,11 +47,27 @@ async def dm_admin(message: str):
 
 # ── Group message ─────────────────────────────────────────────────────────────
 async def send_group(message: str, parse_mode: str = None):
-    try:
-        await _bot.send_message(chat_id=_group_chat_id, text=message, parse_mode=parse_mode)
-    except Exception as e:
-        logger.error(f"Failed to send group message: {e}")
-        await dm_admin(f"⚠️ Failed to send group message: {e}")
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            await _bot.send_message(chat_id=_group_chat_id, text=message, parse_mode=parse_mode)
+            return
+        except RetryAfter as e:
+            last_error = e
+            logger.warning(f"send_group rate-limited, waiting {e.retry_after}s (attempt {attempt})")
+            await asyncio.sleep(e.retry_after + 1)
+        except (TimedOut, NetworkError) as e:
+            last_error = e
+            logger.warning(f"send_group attempt {attempt} failed: {e}")
+            if attempt < 3:
+                await asyncio.sleep(2 * attempt)
+        except Exception as e:
+            # Non-transient (e.g. bad request, forbidden) — retrying won't help
+            logger.error(f"Failed to send group message: {e}")
+            await dm_admin(f"⚠️ Failed to send group message: {e}")
+            return
+    logger.error(f"send_group failed after 3 attempts, message dropped: {last_error}")
+    await dm_admin(f"⚠️ Failed to send group message after 3 attempts: {last_error}\nMessage was: {message[:200]}")
 
 
 def format_match_line(match: dict) -> str:
@@ -236,36 +253,44 @@ def format_result_message(match: dict, settlements: list, parlay_wins: list = No
 
 
 
+def _katerina_line_sync(prompt: str, max_tokens: int) -> str | None:
+    """Blocking network call — run via asyncio.to_thread, never called directly."""
+    payload = json.dumps({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": max_tokens,
+        "system": (
+            "You are Katerina, the sharp, witty, confident house bookie for WC Kings 2026. "
+            "Light banter is your default — warm or playfully cheeky depending on the moment. "
+            "Savage mode only when the context clearly calls for it (e.g. everyone just lost). "
+            "Pure English. No markdown. No swearing. Short, punchy, personality-driven."
+        ),
+        "messages": [{"role": "user", "content": prompt}]
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=payload,
+        headers={
+            "content-type": "application/json",
+            "anthropic-version": "2023-06-01",
+            "x-api-key": ANTHROPIC_API_KEY
+        }
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read())
+        texts = [b["text"].strip() for b in data.get("content", []) if b.get("type") == "text" and b.get("text", "").strip()]
+        return " ".join(texts) if texts else None
+
+
 async def _katerina_line(prompt: str, fallback: str, max_tokens: int = 120) -> str:
-    """Call Katerina API for a short scheduled message line. Returns fallback on failure."""
+    """Call Katerina API for a short scheduled message line. Returns fallback on failure.
+    Runs the blocking HTTP call in a thread so it doesn't freeze the event loop —
+    every other scheduled job and every Telegram command was previously blocked
+    for up to 15s during this call."""
     if not ANTHROPIC_API_KEY:
         return fallback
     try:
-        payload = json.dumps({
-            "model": "claude-sonnet-4-6",
-            "max_tokens": max_tokens,
-            "system": (
-                "You are Katerina, the sharp, witty, confident house bookie for WC Kings 2026. "
-                "Light banter is your default — warm or playfully cheeky depending on the moment. "
-                "Savage mode only when the context clearly calls for it (e.g. everyone just lost). "
-                "Pure English. No markdown. No swearing. Short, punchy, personality-driven."
-            ),
-            "messages": [{"role": "user", "content": prompt}]
-        }).encode()
-        req = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
-            data=payload,
-            headers={
-                "content-type": "application/json",
-                "anthropic-version": "2023-06-01",
-                "x-api-key": ANTHROPIC_API_KEY
-            }
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
-            texts = [b["text"].strip() for b in data.get("content", []) if b.get("type") == "text" and b.get("text", "").strip()]
-            result = " ".join(texts) if texts else ""
-            return result if result else fallback
+        result = await asyncio.to_thread(_katerina_line_sync, prompt, max_tokens)
+        return result if result else fallback
     except Exception as e:
         logger.error(f"Katerina API call failed in scheduler: {e}")
         return fallback
@@ -274,6 +299,11 @@ async def _katerina_line(prompt: str, fallback: str, max_tokens: int = 120) -> s
 # ── Night reminder (11PM SGT) ────────────────────────────────────────────────
 async def job_night_reminder():
     try:
+        today_sgt_key = datetime.now(SGT).strftime("%Y-%m-%d")
+        if sheet.cache.get("night_reminder_date") == today_sgt_key:
+            logger.info(f"Night reminder already sent for {today_sgt_key}, skipping")
+            return
+
         today_ct = datetime.now(CT).strftime("%Y-%m-%d")
         now_utc = datetime.now(UTC)
         yesterday_utc = (now_utc - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -327,6 +357,7 @@ async def job_night_reminder():
 
         if not matches:
             logger.info("Night reminder: no upcoming matches today CT, skipping")
+            sheet.cache["night_reminder_date"] = today_sgt_key
             return
 
         lines = ["🌙 Good evening gents! Matches tonight:\n"]
@@ -362,6 +393,7 @@ async def job_night_reminder():
 
         lines.append(closing)
         await send_group("\n".join(lines))
+        sheet.cache["night_reminder_date"] = today_sgt_key
         logger.info("Night reminder sent")
     except Exception as e:
         logger.error(f"Night reminder job failed: {e}")
@@ -824,11 +856,13 @@ async def check_all_matches_done(match_id: str = None):
             logger.info(f"EOD already fired for CT {target_ct_date}, skipping")
             return
 
-        # EOD fires only when ALL active CT-day matches are finished
+        # EOD fires only when ALL active CT-day matches are finished AND have a
+        # populated result. A match can show status=FINISHED before its 90-min
+        # score backfills (ET/penalty matches) — that is NOT done yet.
         active = [m for m in today_matches if m.get("status") not in ("CANCELLED", "POSTPONED")]
         if not active:
             return
-        if not all(m["status"] in ("FINISHED", "CANCELLED", "POSTPONED") for m in active):
+        if not all(m["status"] == "FINISHED" and m.get("result") for m in active):
             return
 
         sheet.cache["eod_date"] = target_ct_date
@@ -863,6 +897,7 @@ def _stage_of(matches: list) -> str:
 
 
 async def job_post_standings(match_ids: list):
+    ct_date = None
     try:
         # Force fresh data before P&L and credit calculations
         await sheet.refresh_cache(notify_fn=dm_admin)
@@ -1164,7 +1199,13 @@ async def job_post_standings(match_ids: list):
 
     except Exception as e:
         logger.error(f"Post standings job failed: {e}")
-        await dm_admin(f"⚠️ Post standings job failed: {e}")
+        # eod_date was set optimistically before this job ran (see
+        # check_all_matches_done) — if we failed partway through, undo that
+        # so a retry (manual or via the health-monitor recovery check) isn't
+        # permanently blocked by the dedup guard.
+        if ct_date and sheet.cache.get("eod_date") == ct_date:
+            sheet.cache["eod_date"] = None
+        await dm_admin(f"⚠️ Post standings job failed: {e}\nEOD for {ct_date or 'today'} was NOT completed — will retry automatically, or run /admin_eod_push.")
 
 
 # ── Finished-match settlement guard ──────────────────────────────────────────
@@ -1268,6 +1309,20 @@ async def job_health_monitor():
         if _group_chat_id is None:
             issues.append("Group chat ID not set — bot may not be connected to group")
 
+        # 6. EOD overdue — all of today's CT-day matches are done but EOD never fired.
+        # Nothing else independently retries this; check_all_matches_done is normally
+        # only invoked as a side effect of the last match's own settlement.
+        try:
+            today_ct_date = datetime.now(CT).strftime("%Y-%m-%d")
+            today_ct_matches = await get_ct_date_matches(today_ct_date)
+            active = [m for m in today_ct_matches if m.get("status") not in ("CANCELLED", "POSTPONED")]
+            all_settled = active and all(m["status"] == "FINISHED" and m.get("result") for m in active)
+            if all_settled and sheet.cache.get("eod_date") != today_ct_date:
+                issues.append(f"EOD overdue for CT {today_ct_date} — all matches done, retrying now")
+                await check_all_matches_done()
+        except Exception as e:
+            logger.warning(f"Health monitor EOD-overdue check failed: {e}")
+
         if issues:
             header = "⚠️ Health monitor:"
             msg = header + "\n" + "\n".join(f"• {i}" for i in issues)
@@ -1326,17 +1381,25 @@ def register_match_jobs(matches: list):
 
         if status in ("FINISHED", "CANCELLED", "POSTPONED"):
             if status == "FINISHED":
-                # Match marked FINISHED but bets may still be open (e.g. force-synced via /admin_refresh)
-                open_bets = [b for b in sheet.cache["bets"] if b["match_id"] == match_id and b["status"] == "open"]
-                if open_bets and m.get("result"):
-                    scheduler.add_job(
-                        _auto_settle_stuck_match,
-                        trigger=DateTrigger(run_date=datetime.now(UTC) + timedelta(seconds=5)),
-                        args=[match_id],
-                        id=f"auto_settle_{match_id}",
-                        replace_existing=True
-                    )
-                    logger.info(f"Match {match_id} FINISHED with open bets — scheduled auto-settle")
+                if not m.get("result"):
+                    # Marked FINISHED but the 90-min score never populated (ET/penalty
+                    # match). Nothing else will resume polling this on its own —
+                    # without this, it sits stuck until someone notices and runs
+                    # /admin_result manually.
+                    _schedule_poll(match_id, delay_seconds=10, attempt=1)
+                    logger.info(f"Match {match_id} FINISHED with no result — resuming poll after restart")
+                else:
+                    # Match marked FINISHED but bets may still be open (e.g. force-synced via /admin_refresh)
+                    open_bets = [b for b in sheet.cache["bets"] if b["match_id"] == match_id and b["status"] == "open"]
+                    if open_bets:
+                        scheduler.add_job(
+                            _auto_settle_stuck_match,
+                            trigger=DateTrigger(run_date=datetime.now(UTC) + timedelta(seconds=5)),
+                            args=[match_id],
+                            id=f"auto_settle_{match_id}",
+                            replace_existing=True
+                        )
+                        logger.info(f"Match {match_id} FINISHED with open bets — scheduled auto-settle")
             continue
 
         if status in STATUS_ACTIVE_PLAY:
@@ -1365,6 +1428,17 @@ def register_match_jobs(matches: list):
                 misfire_grace_time=60
             )
             logger.info(f"Scheduled pre-match summary for {match_id} at {summary_time}")
+        elif kickoff_utc > now_utc:
+            # Restarted after the summary should've fired but before kickoff —
+            # otherwise this match's pre-match summary is silently lost forever.
+            scheduler.add_job(
+                job_prematch_summary,
+                trigger=DateTrigger(run_date=datetime.now(UTC) + timedelta(seconds=10)),
+                args=[match_id],
+                id=f"prematch_{match_id}",
+                replace_existing=True
+            )
+            logger.info(f"Restart recovery: firing pre-match summary immediately for {match_id}")
 
         # Kickoff message — at exact kickoff time
         if kickoff_utc > now_utc:
@@ -1376,6 +1450,18 @@ def register_match_jobs(matches: list):
                 replace_existing=True
             )
             logger.info(f"Scheduled kickoff message for {match_id} at {kickoff_utc}")
+        elif now_utc < kickoff_utc + timedelta(minutes=15):
+            # Restarted shortly after kickoff. Beyond ~15 min it's too stale to
+            # be meaningful ("just kicked off!" well into the match), so only
+            # catch up within a short window.
+            scheduler.add_job(
+                job_kickoff_message,
+                trigger=DateTrigger(run_date=datetime.now(UTC) + timedelta(seconds=10)),
+                args=[match_id],
+                id=f"kickoff_{match_id}",
+                replace_existing=True
+            )
+            logger.info(f"Restart recovery: firing kickoff message immediately for {match_id}")
 
         # Result polling — starts kickoff + 120 min
         is_knockout = m.get("round", "").upper() not in ("GROUP_STAGE", "")
@@ -1433,10 +1519,21 @@ async def on_startup(notify_fn=None):
 
         scheduler.start()
 
-        # Startup recovery — fire night reminder if bot restarted during 11PM hour
+        # Startup recovery — fire night reminder if bot restarted within a
+        # bounded window after 11PM SGT (23:00-02:00), not just the exact same
+        # clock hour as before. Note: night_reminder_date has no ledger backing
+        # (unlike eod_date), so it can't be reconstructed after a restart —
+        # this can't fully rule out a rare duplicate reminder if the bot
+        # restarts shortly after a legitimate send later the same night. That's
+        # an acceptable tradeoff (one extra "good evening" message) against the
+        # alternative of silently dropping the reminder if downtime spans the
+        # whole 23:00 hour.
         now_sgt = datetime.now(SGT)
-        if now_sgt.hour == NIGHT_REMINDER_HOUR:
-            logger.info("Startup during 11PM hour — firing night reminder immediately")
+        reminder_due_today = now_sgt.replace(hour=NIGHT_REMINDER_HOUR, minute=NIGHT_REMINDER_MINUTE, second=0, microsecond=0)
+        catchup_deadline = reminder_due_today + timedelta(hours=3)
+        today_sgt_key = now_sgt.strftime("%Y-%m-%d")
+        if reminder_due_today <= now_sgt <= catchup_deadline and sheet.cache.get("night_reminder_date") != today_sgt_key:
+            logger.info("Startup recovery — night reminder due tonight and not yet sent this session, firing now")
             scheduler.add_job(job_night_reminder, trigger=DateTrigger(run_date=datetime.now(UTC) + timedelta(seconds=5)), id="night_reminder_recovery", replace_existing=True)
 
         if _bot is not None:

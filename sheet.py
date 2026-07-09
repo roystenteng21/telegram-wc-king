@@ -43,6 +43,17 @@ def get_user_lock(user_id: int) -> asyncio.Lock:
         _user_locks[user_id] = asyncio.Lock()
     return _user_locks[user_id]
 
+# Per-match asyncio locks — prevents two independent settlement paths
+# (e.g. job_poll_result and _auto_settle_stuck_match) from both processing
+# the same match's bets concurrently if one is paused mid-loop on a retry.
+_match_locks: dict[str, asyncio.Lock] = {}
+
+def get_match_lock(match_id: str) -> asyncio.Lock:
+    match_id = str(match_id)
+    if match_id not in _match_locks:
+        _match_locks[match_id] = asyncio.Lock()
+    return _match_locks[match_id]
+
 # ── Sheet client — cached to avoid open_by_key() on every write ──────────────
 _cached_client = None
 _cached_spreadsheet = None
@@ -594,68 +605,73 @@ async def cancel_bet(bet_id: str, user_id: int, notify_fn=None):
             raise
 
 async def settle_bets_for_match(match_id: str, result: str, ou_result: str, notify_fn=None) -> list:
-    """Settle all open bets for a match using cached row numbers."""
+    """Settle all open bets for a match using cached row numbers.
+    Locked per-match so two concurrent settlement paths (e.g. a poll job and
+    the stuck-match auto-settle sweep) can't both process the same bets."""
     match_id = str(match_id)
     settlements = []
 
-    open_bets = [b for b in cache["bets"] if b["match_id"] == match_id and b["status"] == "open"]
-    if not open_bets:
-        return settlements
+    async with get_match_lock(match_id):
+        # Re-read fresh inside the lock — if another caller already settled
+        # this match while we were waiting, this will correctly come back empty.
+        open_bets = [b for b in cache["bets"] if b["match_id"] == match_id and b["status"] == "open"]
+        if not open_bets:
+            return settlements
 
-    try:
-        ws = get_sheet(SHEET_BETS)
+        try:
+            ws = get_sheet(SHEET_BETS)
 
-        for bet in open_bets:
-            won = False
-            if bet["market"] == "result":
-                won = bet["outcome"] == result
-            elif bet["market"] == "ou":
-                won = bet["outcome"] == ou_result
+            for bet in open_bets:
+                won = False
+                if bet["market"] == "result":
+                    won = bet["outcome"] == result
+                elif bet["market"] == "ou":
+                    won = bet["outcome"] == ou_result
 
-            payout = bet["amount"] * 2 if won else 0
-            status = "won" if won else "lost"
-            pl = bet["amount"] if won else -bet["amount"]
+                payout = bet["amount"] * 2 if won else 0
+                status = "won" if won else "lost"
+                pl = bet["amount"] if won else -bet["amount"]
 
-            # Parlay legs: mark won/lost but DO NOT pay out here.
-            # Payout is handled at EOD via multiplier in job_post_standings.
-            is_parlay_leg = str(bet.get("parlay_id", "")) not in ("", "0")
+                # Parlay legs: mark won/lost but DO NOT pay out here.
+                # Payout is handled at EOD via multiplier in job_post_standings.
+                is_parlay_leg = str(bet.get("parlay_id", "")) not in ("", "0")
 
-            row_num = _bet_rows.get(bet["bet_id"])
-            if row_num:
-                await with_retry(ws.update_cell, row_num, 7, status)
-                await with_retry(ws.update_cell, row_num, 8, 0 if is_parlay_leg else payout)
-            else:
-                logger.warning(f"Bet {bet['bet_id']} row not in cache — sheet not updated, memory only")
-                if notify_fn:
-                    await notify_fn(f"⚠️ Bet {bet['bet_id']} row missing from cache — status set in memory only, sheet NOT updated. Run /admin_refresh and re-settle if needed.")
-            bet["status"] = status
-            bet["payout"] = 0 if is_parlay_leg else payout
+                row_num = _bet_rows.get(bet["bet_id"])
+                if row_num:
+                    await with_retry(ws.update_cell, row_num, 7, status)
+                    await with_retry(ws.update_cell, row_num, 8, 0 if is_parlay_leg else payout)
+                else:
+                    logger.warning(f"Bet {bet['bet_id']} row not in cache — sheet not updated, memory only")
+                    if notify_fn:
+                        await notify_fn(f"⚠️ Bet {bet['bet_id']} row missing from cache — status set in memory only, sheet NOT updated. Run /admin_refresh and re-settle if needed.")
+                bet["status"] = status
+                bet["payout"] = 0 if is_parlay_leg else payout
 
-            if won and not is_parlay_leg:
-                async with get_user_lock(bet["user_id"]):
-                    user = cache["users"].get(bet["user_id"])
-                    if user:
-                        new_credits = user["credits"] + payout
-                        await update_user_credits(bet["user_id"], new_credits, notify_fn)
-                        await append_ledger(bet["user_id"], "payout", payout, new_credits, f"Won bet {bet['bet_id']}", notify_fn)
+                if won and not is_parlay_leg:
+                    async with get_user_lock(bet["user_id"]):
+                        user = cache["users"].get(bet["user_id"])
+                        if user:
+                            new_credits = user["credits"] + payout
+                            await update_user_credits(bet["user_id"], new_credits, notify_fn)
+                            await append_ledger(bet["user_id"], "payout", payout, new_credits, f"Won bet {bet['bet_id']}", notify_fn)
 
-            settlements.append({
-                "user_id": bet["user_id"],
-                "market": bet["market"],
-                "outcome": bet["outcome"],
-                "amount": bet["amount"],
-                "status": status,
-                "pl": pl,
-                "parlay_id": bet.get("parlay_id", "")
-            })
+                settlements.append({
+                    "user_id": bet["user_id"],
+                    "market": bet["market"],
+                    "outcome": bet["outcome"],
+                    "amount": bet["amount"],
+                    "status": status,
+                    "pl": pl,
+                    "parlay_id": bet.get("parlay_id", "")
+                })
 
-        return settlements
+            return settlements
 
-    except Exception as e:
-        logger.error(f"Failed to settle bets for match {match_id}: {e}")
-        if notify_fn:
-            await notify_fn(f"⚠️ Failed to settle bets for match {match_id} after retries: {e}")
-        raise
+        except Exception as e:
+            logger.error(f"Failed to settle bets for match {match_id}: {e}")
+            if notify_fn:
+                await notify_fn(f"⚠️ Failed to settle bets for match {match_id} after retries: {e}")
+            raise
 
 async def void_all_bets_for_match(match_id: str, notify_fn=None):
     """Void and refund all open bets for a match using cached row numbers."""
@@ -688,28 +704,38 @@ async def void_all_bets_for_match(match_id: str, notify_fn=None):
 
 async def void_parlay_bets(parlay_id: str, user_id: int, notify_fn=None) -> int:
     """Void all open bets for a parlay and refund the stake. Returns count voided."""
-    parlay_bets = [b for b in cache["bets"] if b.get("parlay_id") == parlay_id and b["status"] == "open"]
-    if not parlay_bets:
+    all_legs = [b for b in cache["bets"] if b.get("parlay_id") == parlay_id]
+    if not all_legs:
         return 0
 
+    voided = []
     try:
         async with get_user_lock(user_id):
             ws = get_sheet(SHEET_BETS)
-            for bet in parlay_bets:
-                row_num = _bet_rows.get(bet["bet_id"])
-                if row_num:
-                    ws.update_cell(row_num, 7, "void")
-                bet["status"] = "void"
+            for bet in all_legs:
+                # Per-match lock — a leg being settled by settle_bets_for_match
+                # right now (or already settled) must not be overwritten to void.
+                async with get_match_lock(bet["match_id"]):
+                    if bet["status"] != "open":
+                        continue
+                    row_num = _bet_rows.get(bet["bet_id"])
+                    if row_num:
+                        await with_retry(ws.update_cell, row_num, 7, "void")
+                    bet["status"] = "void"
+                    voided.append(bet)
+
+            if not voided:
+                return 0
 
             # Refund total stake once — amount is the same on all legs, deducted only once
-            stake = parlay_bets[0]["amount"]
+            stake = voided[0]["amount"]
             user = cache["users"].get(user_id)
             if user:
                 new_credits = user["credits"] + stake
                 await update_user_credits(user_id, new_credits, notify_fn)
                 await append_ledger(user_id, "refund", stake, new_credits, f"Cancelled parlay {parlay_id}", notify_fn)
 
-        return len(parlay_bets)
+        return len(voided)
     except Exception as e:
         logger.error(f"Failed to void parlay {parlay_id}: {e}")
         if notify_fn:
