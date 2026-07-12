@@ -112,3 +112,28 @@ BRACKET = [
         ],
     },
 ]
+
+# ── Semifinals, Third Place, Final ────────────────────────────────────────────
+# Filled in as each stage's matchups become known. home/away as None means
+# "not yet determined" (e.g. Third Place/Final depend on semifinal results).
+SEMIFINALS = {
+    "stage_label": "Semi-finals",
+    "matches": [
+        {"label": "Dallas SF", "date": "Jul 14", "home": "France", "away": "Spain", "match_id": None},
+        {"label": "Atlanta SF", "date": "Jul 15", "home": "England", "away": "Argentina", "match_id": None},
+    ],
+}
+
+THIRD_PLACE = {
+    "stage_label": "Third Place",
+    "matches": [
+        {"label": "Miami — Third Place", "date": "Jul 18", "home": None, "away": None, "match_id": None},
+    ],
+}
+
+FINAL = {
+    "stage_label": "Final",
+    "matches": [
+        {"label": "New Jersey — Final", "date": "Jul 19", "home": None, "away": None, "match_id": None},
+    ],
+}

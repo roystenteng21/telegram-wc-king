@@ -108,7 +108,7 @@ async def refresh_cache(notify_fn=None):
 
         # Users
         users_ws = spreadsheet.worksheet(SHEET_USERS)
-        users_data = users_ws.get_all_records()
+        users_data = await with_retry(users_ws.get_all_records)
         cache["users"] = {}
         _user_rows.clear()
         for i, row in enumerate(users_data):
@@ -126,7 +126,7 @@ async def refresh_cache(notify_fn=None):
 
         # Matches
         matches_ws = spreadsheet.worksheet(SHEET_MATCHES)
-        matches_data = matches_ws.get_all_records()
+        matches_data = await with_retry(matches_ws.get_all_records)
         cache["matches"] = {}
         _match_rows.clear()
         for i, row in enumerate(matches_data):
@@ -150,7 +150,7 @@ async def refresh_cache(notify_fn=None):
 
         # Bets
         bets_ws = spreadsheet.worksheet(SHEET_BETS)
-        bets_data = bets_ws.get_all_records()
+        bets_data = await with_retry(bets_ws.get_all_records)
         cache["bets"] = []
         _bet_rows.clear()
         for i, row in enumerate(bets_data):
@@ -176,7 +176,7 @@ async def refresh_cache(notify_fn=None):
         # ledger entry was already credited. Prevents double-payout on restart.
         try:
             ledger_ws = spreadsheet.worksheet(SHEET_LEDGER)
-            ledger_data = ledger_ws.get_all_records()
+            ledger_data = await with_retry(ledger_ws.get_all_records)
             paid = set()
             for row in ledger_data:
                 notes = str(row.get("notes", ""))
@@ -259,7 +259,7 @@ async def refresh_cache(notify_fn=None):
         # Load events
         try:
             events_ws = spreadsheet.worksheet(SHEET_EVENTS)
-            events_data = events_ws.get_all_records()
+            events_data = await with_retry(events_ws.get_all_records)
             cache["events"] = {}
             for row in events_data:
                 if not row.get("event_id"):
@@ -380,7 +380,7 @@ async def upsert_match(match: dict, notify_fn=None):
         ws = get_sheet(SHEET_MATCHES)
         if match_id in _match_rows:
             row_num = _match_rows[match_id]
-            ws.update(f"A{row_num}:K{row_num}", [row])
+            await with_retry(ws.update, f"A{row_num}:K{row_num}", [row])
         else:
             await with_retry(ws.append_row, row)
             _match_rows[match_id] = len(cache["matches"]) + 2
@@ -409,7 +409,7 @@ async def update_match_result(match_id: str, home_score: int, away_score: int, n
         if not row_num:
             raise ValueError(f"Match {match_id} row not in cache")
         ws = get_sheet(SHEET_MATCHES)
-        ws.update(f"E{row_num}:I{row_num}", [["FINISHED", home_score, away_score, result, ou_result]])
+        await with_retry(ws.update, f"E{row_num}:I{row_num}", [["FINISHED", home_score, away_score, result, ou_result]])
         if match_id in cache["matches"]:
             cache["matches"][match_id].update({
                 "home_score": home_score,
@@ -600,7 +600,7 @@ async def cancel_bet(bet_id: str, user_id: int, notify_fn=None):
             if not row_num:
                 raise ValueError(f"Bet {bet_id} row not in cache")
             ws = get_sheet(SHEET_BETS)
-            ws.update_cell(row_num, 7, "void")
+            await with_retry(ws.update_cell, row_num, 7, "void")
             bet["status"] = "void"
 
             user = cache["users"][user_id]
@@ -1007,8 +1007,8 @@ async def settle_event_bets(event_id: str, winner_option: str, notify_fn=None) -
 
             row_num = _bet_rows.get(bet["bet_id"])
             if row_num:
-                ws.update_cell(row_num, 7, status)
-                ws.update_cell(row_num, 8, payout)
+                await with_retry(ws.update_cell, row_num, 7, status)
+                await with_retry(ws.update_cell, row_num, 8, payout)
             bet["status"] = status
             bet["payout"] = payout
 

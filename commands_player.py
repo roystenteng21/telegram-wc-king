@@ -365,7 +365,7 @@ async def cmd_brackets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_registered(update)
 
     from config import TOURNAMENT_STAGES
-    from brackets import BRACKET
+    from brackets import BRACKET, SEMIFINALS, THIRD_PLACE, FINAL
 
     today_date = datetime.now(UTC).date()
     group_stage = next((s for s in TOURNAMENT_STAGES if s["name"] == "Group Stage"), None)
@@ -377,12 +377,11 @@ async def cmd_brackets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     today_ct = datetime.now(CT).strftime("%Y-%m-%d")
 
-    # Show groups with matches today
+    # R32 stage — only relevant while any R32 match is still upcoming/today.
+    # This is the original bracket view; still used if queried during that window.
     active_groups = [g for g in BRACKET if _group_has_match_on(g, today_ct)]
     active_ct = today_ct
-
     if not active_groups:
-        # No matches today — find next upcoming CT date across all groups
         upcoming = []
         for group in BRACKET:
             for pair in group["pairs"]:
@@ -399,31 +398,47 @@ async def cmd_brackets(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             upcoming.append(ct_date)
                     except Exception:
                         pass
+        if upcoming:
+            active_ct = min(upcoming)
+            active_groups = [g for g in BRACKET if _group_has_match_on(g, active_ct)]
 
-        if not upcoming:
-            await update.message.reply_text("No upcoming bracket matches found.")
-            return
-
-        active_ct = min(upcoming)
-        active_groups = [g for g in BRACKET if _group_has_match_on(g, active_ct)]
-
-    if not active_groups:
-        await update.message.reply_text("No upcoming bracket matches found.")
+    if active_groups:
+        lines = ["⚽ WC 2026 Bracket"]
+        for group in active_groups:
+            lines.append("")
+            lines.append(f"🟠 {group['qf_label']} · {group['qf_date']}")
+            lines.append("")
+            lines.append("🔵 Round of 32")
+            for pair in group["pairs"]:
+                lines.append("")
+                for r32 in pair["r32"]:
+                    lines.append(_format_r32_line(r32, active_ct))
+                lines.append(f"→ {pair['r16_label']} · {pair['r16_date']}")
+        await update.message.reply_text("\n".join(lines))
         return
 
-    lines = ["⚽ WC 2026 Bracket"]
-    for group in active_groups:
-        lines.append("")
-        lines.append(f"🟠 {group['qf_label']} · {group['qf_date']}")
-        lines.append("")
-        lines.append("🔵 Round of 32")
-        for pair in group["pairs"]:
-            lines.append("")
-            for r32 in pair["r32"]:
-                lines.append(_format_r32_line(r32, active_ct))
-            lines.append(f"→ {pair['r16_label']} · {pair['r16_date']}")
+    # Past R32 — show whichever later stage is current or next: Semifinals,
+    # Third Place, or Final. Generic over any stage block shaped like
+    # {"stage_label": str, "matches": [{"label", "date", "home", "away", "match_id"}]}.
+    for stage in (SEMIFINALS, THIRD_PLACE, FINAL):
+        any_unfinished = False
+        lines = [f"⚽ WC 2026 — {stage['stage_label']}", ""]
+        for m in stage["matches"]:
+            if not m.get("home") or not m.get("away"):
+                lines.append(f"{m['label']} · {m['date']} — TBD vs TBD")
+                any_unfinished = True
+                continue
+            line = _format_r32_line(m, today_ct)
+            lines.append(f"{line}")
+            lines.append(f"({m['label']} · {m['date']})")
+            match = _find_bracket_match(m)
+            if not match or match.get("status") != "FINISHED":
+                any_unfinished = True
+        if any_unfinished or stage is FINAL:
+            await update.message.reply_text("\n".join(lines))
+            return
 
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("No upcoming bracket matches found.")
 
 
 # ── /leaderboard ──────────────────────────────────────────────────────────────

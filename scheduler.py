@@ -679,6 +679,7 @@ async def _auto_settle_stuck_match(match_id: str):
 
 async def job_poll_result(match_id: str, attempt: int = 1):
     MAX_POLL_ATTEMPTS = 36  # 36 x 5min = 3 hours max
+    match_confirmed_finished = False
     try:
         logger.info(f"Polling result for match {match_id} (attempt {attempt})")
         try:
@@ -688,13 +689,15 @@ async def job_poll_result(match_id: str, attempt: int = 1):
             if "429" in error_msg or "rate limit" in error_msg.lower():
                 if attempt < MAX_POLL_ATTEMPTS:
                     await dm_admin(f"⚠️ API rate limit hit polling match {match_id} — retrying in 10 minutes.")
-                    _schedule_poll(match_id, delay_seconds=10 * 60, attempt=attempt + 1)
+                    if not _schedule_poll(match_id, delay_seconds=10 * 60, attempt=attempt + 1):
+                        await dm_admin(f"⚠️ Could not reschedule poll for match {match_id} after rate limit — polling has stopped. Use /admin_result to settle manually if the match has finished.")
                 else:
                     await dm_admin(f"⚠️ Match {match_id} polling gave up after {MAX_POLL_ATTEMPTS} attempts. Use /admin_result to settle manually.")
                 return
             await dm_admin(f"⚠️ API error polling match {match_id}: {e}")
             if attempt < MAX_POLL_ATTEMPTS:
-                _schedule_poll(match_id, delay_seconds=POLL_INTERVAL, attempt=attempt + 1)
+                if not _schedule_poll(match_id, delay_seconds=POLL_INTERVAL, attempt=attempt + 1):
+                    await dm_admin(f"⚠️ Could not reschedule poll for match {match_id} — polling has stopped. Use /admin_result to settle manually if the match has finished.")
             else:
                 await dm_admin(f"⚠️ Match {match_id} polling gave up after {MAX_POLL_ATTEMPTS} attempts. Use /admin_result to settle manually.")
             return
@@ -702,12 +705,16 @@ async def job_poll_result(match_id: str, attempt: int = 1):
         if not result_data:
             logger.info(f"Match {match_id} not finished yet, rescheduling poll")
             if attempt < MAX_POLL_ATTEMPTS:
-                _schedule_poll(match_id, delay_seconds=POLL_INTERVAL, attempt=attempt + 1)
+                if not _schedule_poll(match_id, delay_seconds=POLL_INTERVAL, attempt=attempt + 1):
+                    await dm_admin(f"⚠️ Could not reschedule poll for match {match_id} — polling has stopped. Use /admin_result to settle manually if the match has finished.")
             else:
                 await dm_admin(f"⚠️ Match {match_id} still not finished after {MAX_POLL_ATTEMPTS} attempts. Use /admin_result to settle manually.")
             return
 
-        # Result confirmed — settle bets
+        # Result confirmed — settle bets. From here on, the match is done;
+        # any failure below is a settlement/messaging problem, not a reason
+        # to keep polling.
+        match_confirmed_finished = True
         home_score = result_data["home_score"]
         away_score = result_data["away_score"]
         result, ou_result = await sheet.update_match_result(match_id, home_score, away_score, notify_fn=dm_admin)
@@ -804,7 +811,19 @@ async def job_poll_result(match_id: str, attempt: int = 1):
 
     except Exception as e:
         logger.error(f"Poll result job failed for {match_id}: {e}")
-        await dm_admin(f"⚠️ Poll result job failed for match {match_id}: {e}")
+        if not match_confirmed_finished and attempt < MAX_POLL_ATTEMPTS:
+            # Whatever failed above, we don't know the match is done — the poll
+            # chain must not silently die here. Last-resort reschedule.
+            try:
+                rescheduled = _schedule_poll(match_id, delay_seconds=POLL_INTERVAL, attempt=attempt + 1)
+            except Exception:
+                rescheduled = False
+            if rescheduled:
+                await dm_admin(f"⚠️ Poll result job failed for match {match_id}: {e}\nRescheduled next attempt automatically.")
+            else:
+                await dm_admin(f"⚠️ Poll result job failed for match {match_id}: {e}\nCould NOT reschedule — polling has stopped. Use /admin_result to settle manually if the match has finished.")
+        else:
+            await dm_admin(f"⚠️ Poll result job failed for match {match_id}: {e}")
 
 
 async def _send_coming_up_today():
@@ -876,18 +895,30 @@ def trigger_poll(match_id: str):
     logger.info(f"Admin triggered poll for match {match_id}")
 
 
-def _schedule_poll(match_id: str, delay_seconds: int, attempt: int):
-    # Add 30s offset to avoid colliding with cache refresh jobs at :00
+def _schedule_poll(match_id: str, delay_seconds: int, attempt: int) -> bool:
+    """Schedule the next poll attempt. Returns True on success, False if it
+    couldn't be scheduled even after retrying — this is the single point of
+    failure for the entire self-sustaining poll chain, so it gets its own
+    retry rather than relying on the caller to notice and recover."""
     run_time = datetime.now(UTC) + timedelta(seconds=delay_seconds + 30)
     job_id = f"poll_{match_id}_attempt_{attempt}"
-    scheduler.add_job(
-        job_poll_result,
-        trigger=DateTrigger(run_date=run_time),
-        args=[match_id, attempt],
-        id=job_id,
-        replace_existing=True
-    )
-    logger.info(f"Scheduled poll for match {match_id} at {run_time} (attempt {attempt})")
+    last_error = None
+    for try_num in range(1, 3):
+        try:
+            scheduler.add_job(
+                job_poll_result,
+                trigger=DateTrigger(run_date=run_time),
+                args=[match_id, attempt],
+                id=job_id,
+                replace_existing=True
+            )
+            logger.info(f"Scheduled poll for match {match_id} at {run_time} (attempt {attempt})")
+            return True
+        except Exception as e:
+            last_error = e
+            logger.warning(f"_schedule_poll try {try_num} failed for match {match_id}: {e}")
+    logger.error(f"_schedule_poll failed twice for match {match_id}, attempt {attempt}: {last_error}")
+    return False
 
 
 # ── Check all matches done → fire standings ───────────────────────────────────
@@ -1378,8 +1409,8 @@ async def job_refresh_cache():
 # ── Health monitor job ────────────────────────────────────────────────────────
 async def job_health_monitor():
     """
-    Periodic health check. Runs every 15min during peak (9PM-1AM SGT),
-    every 1h outside peak. DMs admin only if something looks wrong.
+    Periodic health check. Runs every 10 minutes, all day.
+    DMs admin only if something looks wrong.
     """
     try:
         issues = []
@@ -1406,8 +1437,10 @@ async def job_health_monitor():
                 mid = str(m["match_id"])
                 has_poll = any(mid in job.id and "poll" in job.id for job in scheduler.get_jobs())
                 if not has_poll:
-                    _schedule_poll(mid, delay_seconds=10, attempt=1)
-                    issues.append(f"Match {mid} is {m['status']} — no poll job found, scheduled emergency poll")
+                    if _schedule_poll(mid, delay_seconds=10, attempt=1):
+                        issues.append(f"Match {mid} is {m['status']} — no poll job found, scheduled emergency poll")
+                    else:
+                        issues.append(f"Match {mid} is {m['status']} — no poll job found, and emergency poll scheduling ALSO failed. Needs manual attention.")
 
         # 4. Any FINISHED match with open bets and no settlement job
         settled = await _check_finished_matches_need_settlement()
@@ -1495,7 +1528,8 @@ def register_match_jobs(matches: list):
                     # match). Nothing else will resume polling this on its own —
                     # without this, it sits stuck until someone notices and runs
                     # /admin_result manually.
-                    _schedule_poll(match_id, delay_seconds=10, attempt=1)
+                    if not _schedule_poll(match_id, delay_seconds=10, attempt=1):
+                        logger.error(f"Match {match_id} FINISHED with no result — resuming poll after restart FAILED")
                     logger.info(f"Match {match_id} FINISHED with no result — resuming poll after restart")
                 else:
                     # Match marked FINISHED but bets may still be open (e.g. force-synced via /admin_refresh)
@@ -1513,7 +1547,8 @@ def register_match_jobs(matches: list):
 
         if status in STATUS_ACTIVE_PLAY:
             # Bot restarted mid-match — schedule immediate poll
-            _schedule_poll(match_id, delay_seconds=10, attempt=1)
+            if not _schedule_poll(match_id, delay_seconds=10, attempt=1):
+                logger.error(f"Bot restarted mid-match {match_id} — scheduling immediate poll FAILED")
             logger.info(f"Bot restarted mid-match {match_id} ({status}) — scheduling immediate poll")
             continue
 
@@ -1578,11 +1613,13 @@ def register_match_jobs(matches: list):
         poll_start = kickoff_utc + timedelta(seconds=offset)
 
         if poll_start > now_utc:
-            _schedule_poll(match_id, delay_seconds=int((poll_start - now_utc).total_seconds()), attempt=1)
+            if not _schedule_poll(match_id, delay_seconds=int((poll_start - now_utc).total_seconds()), attempt=1):
+                logger.error(f"Failed to schedule initial poll for match {match_id}")
         else:
             # Kickoff already passed and poll start is in the past — poll immediately
             if status != "FINISHED":
-                _schedule_poll(match_id, delay_seconds=10, attempt=1)
+                if not _schedule_poll(match_id, delay_seconds=10, attempt=1):
+                    logger.error(f"Failed to schedule immediate poll for match {match_id}")
 
     logger.info(f"Match jobs registered for {len(matches)} matches")
 
