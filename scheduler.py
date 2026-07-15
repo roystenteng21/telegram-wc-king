@@ -1382,8 +1382,24 @@ async def _check_finished_matches_need_settlement() -> list:
 
 
 # ── Cache refresh job ─────────────────────────────────────────────────────────
+CACHE_REFRESH_ALERT_THRESHOLD = 3  # consecutive failures before DMing admin
+_cache_refresh_fail_streak = 0
+
 async def job_refresh_cache():
-    await sheet.refresh_cache(notify_fn=dm_admin)
+    global _cache_refresh_fail_streak
+
+    async def _streak_aware_notify(msg: str):
+        global _cache_refresh_fail_streak
+        _cache_refresh_fail_streak += 1
+        if _cache_refresh_fail_streak >= CACHE_REFRESH_ALERT_THRESHOLD:
+            await dm_admin(f"{msg}\n(Failed {_cache_refresh_fail_streak}x in a row — this looks sustained, not a blip)")
+        else:
+            logger.warning(f"{msg} (streak {_cache_refresh_fail_streak}/{CACHE_REFRESH_ALERT_THRESHOLD}, suppressed)")
+
+    success = await sheet.refresh_cache(notify_fn=_streak_aware_notify)
+    if success:
+        _cache_refresh_fail_streak = 0
+
     # Re-fetch yesterday/today/tomorrow from API to catch UTC boundary matches
     try:
         yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")

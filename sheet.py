@@ -280,10 +280,13 @@ async def refresh_cache(notify_fn=None):
             logger.warning(f"Could not load events tab: {e}")
             cache["events"] = {}
 
+        return True
+
     except Exception as e:
         logger.error(f"Cache refresh failed: {e}")
         if notify_fn:
             await notify_fn(f"⚠️ Cache refresh failed: {e}")
+        return False
 
 # ── User operations ──────────────────────────────────────────────────────────
 async def get_user(user_id: int) -> dict | None:
