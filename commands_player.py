@@ -107,8 +107,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🤖 Degen — WC Kings 2026\n\n"
         "/matches — Today's matches + kickoff times\n"
-        "/bet [team] [win|loss|draw|over|under] [amount] — Place a bet\n"
-        "/goals [amount], [team] [score] — Bet the exact score (e.g. /goals 100, fra 2-0), max 2 picks per match\n"
+        "/bet [team] [win|loss|draw|over|under] [amount] — Place a bet (DM me, not the group)\n"
+        "/goals [amount], [team] [score] — Bet the exact score (e.g. /goals 100, fra 2-0), max 2 picks per match (DM me, not the group)\n"
         "/mybets — Your open bets\n"
         "/cancel — Cancel an open bet\n"
         "/balance — Your current credits\n"
@@ -569,8 +569,8 @@ async def cmd_mybets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── /bet ──────────────────────────────────────────────────────────────────────
 async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_group_message(update):
-        await update.message.reply_text("Please use this command in the group.")
+    if is_group_message(update):
+        await update.message.reply_text("For privacy, place bets by DMing me directly — tap my name above → Start if you haven't already.")
         return
 
     user = update.effective_user
@@ -871,8 +871,8 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── /goals — exact-score bet ──────────────────────────────────────────────────
 async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_group_message(update):
-        await update.message.reply_text("Please use this command in the group.")
+    if is_group_message(update):
+        await update.message.reply_text("For privacy, place bets by DMing me directly — tap my name above → Start if you haven't already.")
         return
 
     user = update.effective_user
