@@ -472,26 +472,20 @@ async def job_prematch_summary(match_id: str):
         open_bets = [b for b in bets if b["status"] == "open"]
         match_label = format_match_teams(match["home"], match["away"])
 
-        sorted_bets = sorted(open_bets, key=_get_sort_name)
-
+        bet_count = len(open_bets)
         lines = [f"⚽ {match_label} kicks off in 15 mins!\n"]
-        if sorted_bets:
-            lines.append("Current bets:")
-            for b in sorted_bets:
-                lines.append(f"{_format_bet_line(b, match)}")
+        if bet_count:
+            lines.append(f"{bet_count} bet{'s' if bet_count != 1 else ''} locked in so far — picks reveal at kickoff.")
         else:
             lines.append("No bets placed yet.")
 
-        # Katerina last-call line
-        if sorted_bets:
-            bet_summary = ", ".join(
-                f"{_get_user_name(b['user_id'])} on {_outcome_label(b['outcome'], match)}"
-                for b in sorted_bets
-            )
+        # Katerina last-call line — only given a count, never picks, so she
+        # can't leak anyone's bet ahead of kickoff either.
+        if bet_count:
             prompt = (
-                f"{match_label} kicks off in 15 minutes. Bets so far: {bet_summary}. "
-                + _parlay_context_for_bets(sorted_bets)
-                + "Write one short last-call line — light banter, encourage anyone sitting out to get in. 1 sentence."
+                f"{match_label} kicks off in 15 minutes. {bet_count} bet{'s' if bet_count != 1 else ''} placed so far, "
+                f"but picks are hidden until kickoff — don't reveal or guess at who bet what. "
+                f"Write one short last-call line — light banter, encourage anyone sitting out to get in. 1 sentence."
             )
             closing = await _katerina_line(prompt, "Last chance — get your bets in before kickoff! ⚽")
         else:

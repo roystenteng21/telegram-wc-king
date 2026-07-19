@@ -564,7 +564,7 @@ async def cmd_mybets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.warning(f"Katerina /mybets commentary failed: {e}")
 
-    await update.message.reply_text("\n".join(lines))
+    await send_confirmation(update, "\n".join(lines))
 
 
 # ── /bet ──────────────────────────────────────────────────────────────────────
@@ -828,7 +828,8 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 outcome_label = bet["outcome"].capitalize()
                 match_line = f"Match {bet['match_id']} — {outcome_label}"
-            await update.message.reply_text(
+            await send_confirmation(
+                update,
                 f"✅ Bet cancelled.\n"
                 f"{match_line} — {bet['amount']:,}c refunded.\n"
                 f"Balance: {new_balance:,}c"
@@ -865,7 +866,7 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "expires": datetime.now(UTC) + timedelta(seconds=SESSION_EXPIRY)
     }
 
-    await update.message.reply_text("\n".join(lines))
+    await send_confirmation(update, "\n".join(lines))
 
 
 # ── /goals — exact-score bet ──────────────────────────────────────────────────

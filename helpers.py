@@ -60,7 +60,18 @@ async def dm_admin(message: str):
 
 # ── Send confirmation ──────────────────────────────────────────────────────────
 async def send_confirmation(update, message: str):
-    await update.message.reply_text(message)
+    """DMs the bet confirmation to the user directly, so other players can't
+    see picks in real time. Falls back to a generic (non-revealing) group
+    reply if the DM fails — most commonly because the user has never started
+    a private chat with the bot."""
+    user = update.effective_user
+    try:
+        await application.bot.send_message(chat_id=user.id, text=message)
+    except Exception:
+        await update.message.reply_text(
+            "✅ Done — but I couldn't DM you the details. "
+            "Tap my name above → Start, so future confirmations stay private."
+        )
 
 
 # ── Group check ───────────────────────────────────────────────────────────────
