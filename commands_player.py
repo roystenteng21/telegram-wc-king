@@ -197,45 +197,49 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{format_match_teams(m['home'], m['away'])}")
         lines.append(f"🕙 {time_str} • {status_str}")
 
-        # Bets for this match
+        # Bets for this match — hidden until kickoff, same rule as everywhere else
+        not_kicked_off = status in ("SCHEDULED", "TIMED")
         match_bets = await sheet.get_bets_for_match(m["match_id"])
         open_or_settled = [b for b in match_bets if b["status"] in ("open", "won", "lost")]
         if open_or_settled:
-            lines.append("Bets:")
-            for b in open_or_settled:
-                user = sheet.cache["users"].get(b["user_id"])
-                name = _display_name(user) if user else "?"
-                outcome_label = format_outcome_label(b["outcome"], m)
-                if b["status"] == "won":
-                    icon = " ✅"
-                elif b["status"] == "lost":
-                    icon = " ❌"
-                else:
-                    icon = ""
+            if not_kicked_off:
+                lines.append(f"Bets: {len(open_or_settled)} locked in — reveals at kickoff")
+            else:
+                lines.append("Bets:")
+                for b in open_or_settled:
+                    user = sheet.cache["users"].get(b["user_id"])
+                    name = _display_name(user) if user else "?"
+                    outcome_label = format_outcome_label(b["outcome"], m)
+                    if b["status"] == "won":
+                        icon = " ✅"
+                    elif b["status"] == "lost":
+                        icon = " ❌"
+                    else:
+                        icon = ""
 
-                pid = b.get("parlay_id", "")
-                if pid and str(pid) not in ("", "0"):
-                    # Skip legs whose parlay is already dead (a leg lost)
-                    if not sheet.is_parlay_alive(pid):
-                        continue
-                    # Collect parlay info for summary
-                    if pid not in parlay_summary:
-                        all_legs = sheet.get_parlay_bets(pid)
-                        total_legs = len(all_legs)
-                        multiplier = PARLAY_MULTIPLIERS.get(total_legs, min(PARLAY_MULTIPLIERS.values()))
-                        parlay_summary[pid] = {
-                            "name": name,
-                            "total_legs": total_legs,
-                            "stake": b["amount"],
-                            "multiplier": multiplier,
-                            "legs_seen": 0
-                        }
-                    parlay_summary[pid]["legs_seen"] += 1
-                    leg_num = parlay_summary[pid]["legs_seen"]
-                    total = parlay_summary[pid]["total_legs"]
-                    lines.append(f"• {name} — {outcome_label}{icon} — 🎰 {leg_num}/{total}")
-                else:
-                    lines.append(f"• {name} — {outcome_label} — {b['amount']:,}c{icon}")
+                    pid = b.get("parlay_id", "")
+                    if pid and str(pid) not in ("", "0"):
+                        # Skip legs whose parlay is already dead (a leg lost)
+                        if not sheet.is_parlay_alive(pid):
+                            continue
+                        # Collect parlay info for summary
+                        if pid not in parlay_summary:
+                            all_legs = sheet.get_parlay_bets(pid)
+                            total_legs = len(all_legs)
+                            multiplier = PARLAY_MULTIPLIERS.get(total_legs, min(PARLAY_MULTIPLIERS.values()))
+                            parlay_summary[pid] = {
+                                "name": name,
+                                "total_legs": total_legs,
+                                "stake": b["amount"],
+                                "multiplier": multiplier,
+                                "legs_seen": 0
+                            }
+                        parlay_summary[pid]["legs_seen"] += 1
+                        leg_num = parlay_summary[pid]["legs_seen"]
+                        total = parlay_summary[pid]["total_legs"]
+                        lines.append(f"• {name} — {outcome_label}{icon} — 🎰 {leg_num}/{total}")
+                    else:
+                        lines.append(f"• {name} — {outcome_label} — {b['amount']:,}c{icon}")
 
         lines.append("")  # blank line between matches
 
@@ -247,12 +251,15 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"• {p['name']} — {p['total_legs']}-leg · {p['stake']:,}c → {potential:,}c if all win")
         lines.append("")
 
-    # Katerina commentary — day overview, light banter
+    # Katerina commentary — day overview, light banter. Only built from matches
+    # that have already kicked off — picks on upcoming matches stay hidden,
+    # so they must never reach the prompt either.
     try:
         all_open_bets = [b for b in sheet.cache["bets"] if b["status"] == "open"]
-        if all_open_bets and day_matches:
+        started_matches = [m for m in day_matches if m.get("status") not in ("SCHEDULED", "TIMED")]
+        if all_open_bets and started_matches:
             bet_parts = []
-            for m in sorted(day_matches, key=lambda x: x["kickoff_utc"]):
+            for m in sorted(started_matches, key=lambda x: x["kickoff_utc"]):
                 match_bets = [b for b in all_open_bets if b["match_id"] == str(m["match_id"])]
                 for b in match_bets:
                     user = sheet.cache["users"].get(b["user_id"], {})

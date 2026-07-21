@@ -404,26 +404,23 @@ async def job_night_reminder():
 
         lines = ["🌙 Good evening gents! Matches tonight:\n"]
 
-        bet_context_parts = []
+        bet_count_total = 0
         for m in sorted(matches, key=lambda x: x["kickoff_utc"]):
             lines.append(f"  {format_match_line(m)}")
             open_bets = [b for b in sheet.cache["bets"] if b["match_id"] == str(m["match_id"]) and b["status"] == "open"]
             if open_bets:
-                for b in sorted(open_bets, key=_get_sort_name):
-                    name = _get_user_name(b["user_id"])
-                    lines.append(f"  {_format_bet_line(b, m)}")
-                    bet_context_parts.append(f"{name} on {_outcome_label(b['outcome'], m)} for {format_match_teams(m['home'], m['away'])}")
+                bet_count_total += len(open_bets)
+                lines.append(f"  {len(open_bets)} bet(s) locked in — reveals at kickoff")
             else:
                 lines.append("  No bets yet.")
             lines.append("")
 
-        # Katerina closing line
-        if bet_context_parts:
-            bet_summary = ", ".join(bet_context_parts)
+        # Katerina closing line — count only, never picks, so it can't leak them either
+        if bet_count_total:
             prompt = (
-                f"It's 11PM. Tonight's WC matches are set. Current bets placed: {bet_summary}. "
-                f"Write one short punchy good night line — acknowledge who's bet, maybe a light dig. "
-                f"1 sentence max. No hashtags."
+                f"It's 11PM. Tonight's WC matches are set. {bet_count_total} bet(s) placed across tonight's "
+                f"matches so far, but picks are hidden until kickoff — don't reveal or guess at who bet what. "
+                f"Write one short punchy good night line. 1 sentence max. No hashtags."
             )
             closing = await _katerina_line(prompt, "Get your bets in before kickoff. Good night! 🌛")
         else:
@@ -841,8 +838,11 @@ async def _send_coming_up_today():
 
             open_bets = [b for b in sheet.cache["bets"] if b["match_id"] == str(m["match_id"]) and b["status"] == "open"]
             if open_bets:
-                for b in sorted(open_bets, key=_get_sort_name):
-                    lines.append(f"  {_format_bet_line(b, m)}")
+                if m["status"] in STATUS_ACTIVE_PLAY:
+                    for b in sorted(open_bets, key=_get_sort_name):
+                        lines.append(f"  {_format_bet_line(b, m)}")
+                else:
+                    lines.append(f"  {len(open_bets)} bet(s) locked in — reveals at kickoff")
 
         await send_group("\n".join(lines))
         logger.info("Coming up today sent")
@@ -873,8 +873,8 @@ async def _send_coming_up_next_day(ct_date: str = None):
             time_str = kickoff_utc.astimezone(SGT).strftime("%-I:%M %p SGT")
             lines.append(f"\n{home_d} vs {away_d} — {time_str}")
             open_bets = [b for b in sheet.cache["bets"] if b["match_id"] == str(m["match_id"]) and b["status"] == "open"]
-            for b in sorted(open_bets, key=_get_sort_name):
-                lines.append(f"  {_format_bet_line(b, m)}")
+            if open_bets:
+                lines.append(f"  {len(open_bets)} bet(s) locked in — reveals at kickoff")
 
         await send_group("\n".join(lines))
         logger.info("Coming up tomorrow sent after EOD")
